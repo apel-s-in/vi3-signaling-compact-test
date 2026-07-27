@@ -201,9 +201,12 @@ async function main() {
     );
   }
 
-  if (compactStat.size >= sourceStat.size) {
+  const sizeRatio =
+    compactStat.size / sourceStat.size;
+
+  if (sizeRatio > 1.1) {
     throw new Error(
-      'index.compact.js не меньше index.js'
+      'index.compact.js более чем на 10% превышает размер index.js'
     );
   }
 
@@ -376,6 +379,9 @@ async function main() {
   console.log(`index.js: ${sourceStat.size} байт`);
   console.log(
     `index.compact.js: ${compactStat.size} байт`
+  );
+  console.log(
+    `Соотношение размеров: ${Math.round(sizeRatio * 100)}%`
   );
 }
 

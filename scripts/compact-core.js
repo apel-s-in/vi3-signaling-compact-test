@@ -177,7 +177,7 @@ async function formatReadableCompact({
       useTabs: false,
       semi: true,
       singleQuote: true,
-      quoteProps: 'as-needed',
+      quoteProps: 'preserve',
       jsxSingleQuote: false,
       trailingComma: 'none',
       bracketSpacing: true,
@@ -410,6 +410,29 @@ const REMOVED_AST_KEYS = new Set([
   'errors'
 ]);
 
+function staticPropertyKeyValue(node) {
+  if (
+    !node ||
+    typeof node !== 'object'
+  ) {
+    return null;
+  }
+
+  if (node.computed === true) {
+    return null;
+  }
+
+  if (node.key?.type === 'Identifier') {
+    return node.key.name;
+  }
+
+  if (node.key?.type === 'StringLiteral') {
+    return node.key.value;
+  }
+
+  return null;
+}
+
 function normalizeAstValue(value) {
   if (Array.isArray(value)) {
     return value.map(normalizeAstValue);
@@ -423,11 +446,26 @@ function normalizeAstValue(value) {
   }
 
   const normalized = {};
+  const propertyKey = (
+    value.type === 'ObjectProperty' ||
+    value.type === 'ObjectMethod'
+  )
+    ? staticPropertyKeyValue(value)
+    : null;
 
-  for (
-    const key of Object.keys(value).sort()
-  ) {
+  for (const key of Object.keys(value).sort()) {
     if (REMOVED_AST_KEYS.has(key)) {
+      continue;
+    }
+
+    if (
+      key === 'key' &&
+      propertyKey !== null
+    ) {
+      normalized.key = {
+        type: 'StaticPropertyKey',
+        value: propertyKey
+      };
       continue;
     }
 

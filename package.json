@@ -22,7 +22,8 @@
     "ydb-sdk": "^5.9.0",
     "@yandex-cloud/nodejs-sdk": "^2.6.0"
   },
-  "devDependencies": {
-    "prettier": "3.6.2"
-  }
+"devDependencies": {
+  "@babel/parser": "7.28.0",
+  "prettier": "3.6.2"
+}
 }

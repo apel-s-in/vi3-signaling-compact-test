@@ -12,6 +12,7 @@ node_modules/
 *.rej
 
 index.compact.js.tmp
+output.compact.js.tmp
 
 .meta/*
 !.meta/repository-full.txt

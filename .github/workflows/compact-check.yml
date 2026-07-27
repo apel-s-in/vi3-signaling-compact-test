@@ -1,0 +1,53 @@
+name: Compact build check
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compact-check:
+    name: Build and verify index.compact.js
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate and verify compact file
+        run: npm run compact:verify
+
+      - name: Check that generated file is committed
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain -- index.compact.js)" ]; then
+            echo "index.compact.js не соответствует index.js."
+            echo "Выполните локально: npm run compact:verify"
+            echo "После этого добавьте index.compact.js в коммит."
+            git status --short -- index.compact.js
+            git diff -- index.compact.js || true
+            exit 1
+          fi
+
+      - name: Upload compact file
+        uses: actions/upload-artifact@v4
+        with:
+          name: index-compact
+          path: index.compact.js
+          if-no-files-found: error
+          retention-days: 14

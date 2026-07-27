@@ -8,9 +8,10 @@
 vi3-signaling-compact-test/
 ├── .git/
 ├── .github/
-│   └── workflows/
-│       ├── compact-check.yml
-│       └── generate-context.yml
+│   ├── workflows/
+│   │   ├── compact-check.yml
+│   │   └── generate-context.yml
+│   └── copilot-instructions.md
 ├── .meta/
 ├── scripts/
 │   ├── build-compact.js
@@ -21,9 +22,9 @@ vi3-signaling-compact-test/
 ├── generate-context.js
 ├── index.js
 ├── package.json
-└── Добавь README.md
+└── README.md
 
-Сгенерировано: 2026-07-27 17:52:40 UTC
+Сгенерировано: 2026-07-27 18:20:33 UTC
 
 //=================================================
 // FILE: /.github/workflows/generate-context.yml
@@ -329,80 +330,251 @@ try {
 }
 
 //=================================================
+// FILE: /README.md
+# vi3-signaling-compact-test
+
+Тестовый репозиторий для безопасной автоматической генерации компактной версии Yandex Cloud Function `vi3-signaling`.
+
+## Основные файлы
+
+- `index.js` — исходная версия функции;
+- `index.compact.js` — автоматически сгенерированная компактная версия;
+- `scripts/build-compact.js` — генератор;
+- `scripts/check-compact.js` — защитные проверки;
+- `generate-context.js` — генератор контекста;
+- `.meta/project-signaling-compact-full.txt` — контекст без файлов функции.
+
+## Важно
+
+Нельзя вручную редактировать:
+
+- `index.compact.js`;
+- `.meta/project-signaling-compact-full.txt`.
+
+Все функциональные изменения вносятся в `index.js`.
+
+## Локальная установка
+
+```bash
+npm install
+
+//=================================================
 // FILE: /.github/workflows/compact-check.yml
-name: Compact build check
+name: Build and verify compact function
 
 on:
   push:
     branches:
       - main
       - master
+    paths-ignore:
+      - 'index.compact.js'
+      - '.meta/**'
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: compact-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  compact-check:
-    name: Build and verify index.compact.js
+  compact:
+    name: Generate, verify and save compact function
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
+          node-version: '20'
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install --package-lock=false --no-audit --no-fund
 
-      - name: Generate and verify compact file
-        run: npm run compact:verify
+      - name: Check utility scripts syntax
+        run: npm run check:tools
 
-      - name: Check that generated file is committed
+      - name: Check source syntax
+        run: npm run check:source
+
+      - name: Generate compact function
+        run: npm run compact:build
+
+      - name: Verify compact function
+        run: npm run compact:check
+
+      - name: Ensure source was not modified
         shell: bash
         run: |
-          if [ -n "$(git status --porcelain -- index.compact.js)" ]; then
-            echo "index.compact.js не соответствует index.js."
-            echo "Выполните локально: npm run compact:verify"
-            echo "После этого добавьте index.compact.js в коммит."
-            git status --short -- index.compact.js
-            git diff -- index.compact.js || true
+          set -euo pipefail
+
+          if [ -n "$(git status --porcelain -- index.js)" ]; then
+            echo "Ошибка: генератор изменил index.js"
+            git diff -- index.js || true
             exit 1
           fi
 
-      - name: Upload compact file
+      - name: Generate repository context
+        run: npm run context:build
+
+      - name: Validate generated context
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          context=".meta/project-signaling-compact-full.txt"
+
+          test -s "$context"
+
+          grep -Fq "Название репозитория:" "$context"
+          grep -Fq "СТРУКТУРА ПРОЕКТА:" "$context"
+
+          if grep -Fq "// FILE: /index.js" "$context"; then
+            echo "Ошибка: index.js попал в контекст"
+            exit 1
+          fi
+
+          if grep -Fq "// FILE: /index.compact.js" "$context"; then
+            echo "Ошибка: index.compact.js попал в контекст"
+            exit 1
+          fi
+
+          if grep -Fq "project-friends-adaptive" "$context"; then
+            echo "Ошибка: в контексте осталось старое adaptive-имя"
+            exit 1
+          fi
+
+          echo "Контекст проверен:"
+          ls -lh "$context"
+
+      - name: Check generated files in pull request
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "$(git status --porcelain -- index.compact.js .meta/project-signaling-compact-full.txt)" ]; then
+            echo "Сгенерированные файлы не соответствуют исходникам."
+            echo "Запустите npm run verify и добавьте результат в pull request."
+            git status --short -- index.compact.js .meta/project-signaling-compact-full.txt
+            exit 1
+          fi
+
+      - name: Commit generated files
+        if: github.event_name != 'pull_request'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'CI: update compact function and repository context'
+          branch: ${{ github.ref_name }}
+          file_pattern: 'index.compact.js .meta/project-signaling-compact-full.txt'
+          commit_user_name: github-actions[bot]
+          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
+
+      - name: Upload compact function
         uses: actions/upload-artifact@v4
         with:
-          name: index-compact
+          name: vi3-signaling-index-compact
           path: index.compact.js
           if-no-files-found: error
           retention-days: 14
 
+      - name: Upload repository context
+        uses: actions/upload-artifact@v4
+        with:
+          name: vi3-signaling-repository-context
+          path: .meta/project-signaling-compact-full.txt
+          if-no-files-found: error
+          retention-days: 14
+
+//=================================================
+// FILE: /.github/copilot-instructions.md
+
+
 //=================================================
 // FILE: /AGENTS.md
-# Правила работы с репозиторием
+# Правила репозитория vi3-signaling-compact-test
 
-## Назначение файлов
+## Назначение
 
-- `index.js` — единственный редактируемый исходный файл Cloud Function.
-- `index.compact.js` — автоматически сгенерированная компактная версия `index.js`.
-- `scripts/build-compact.js` — генератор компактной версии.
-- `scripts/check-compact.js` — проверка результата.
+Репозиторий используется для безопасной автоматической генерации компактной версии Yandex Cloud Function `vi3-signaling`.
+
+## Основные файлы
+
+- `index.js` — единственный редактируемый исходник Cloud Function.
+- `index.compact.js` — автоматически сгенерированный файл.
+- `scripts/build-compact.js` — генератор compact-файла.
+- `scripts/check-compact.js` — защитные и поведенческие проверки.
+- `generate-context.js` — генератор контекста репозитория.
+- `.meta/project-signaling-compact-full.txt` — автоматически сгенерированный контекст.
 
 ## Запрет ручного редактирования
 
-Никогда не редактировать `index.compact.js` вручную.
+Нельзя вручную редактировать:
 
-Любые функциональные изменения необходимо вносить только в `index.js`, после чего выполнять:
+- `index.compact.js`;
+- `.meta/project-signaling-compact-full.txt`.
+
+Функциональные изменения разрешено вносить только в:
+
+- `index.js`;
+- служебные скрипты, если задача относится к процессу генерации.
+
+## Ограничения Terser
+
+Генератор обязан сохранять следующие настройки:
+
+- `compress: false`;
+- `mangle: false`;
+- `toplevel: false`;
+- `keep_fnames: true`;
+- `keep_classnames: true`;
+- `module: false`;
+- `sourceMap: false`.
+
+Нельзя включать оптимизацию логики или переименование идентификаторов без отдельного запроса.
+
+## Обязательная проверка
+
+После изменения `index.js` необходимо выполнить:
 
 ```bash
 npm run compact:verify
+
+Для полной локальной проверки:
+
+bash
+
+npm run verify
+Требования к compact-файлу
+index.compact.js должен:
+
+иметь корректный синтаксис;
+сохранять CommonJS;
+экспортировать handler;
+иметь тот же набор экспортов, что и index.js;
+содержать SHA-256 исходного файла;
+быть меньше исходного файла;
+не содержать source map;
+давать такие же ответы на безопасные проверки ping, неизвестного action и OPTIONS.
+Контекст репозитория
+В контекст запрещено включать:
+
+содержимое index.js;
+содержимое index.compact.js;
+названия этих файлов в дереве контекста;
+.git;
+.meta;
+node_modules;
+временные и сгенерированные вспомогательные файлы.
 
 //=================================================
 // FILE: /index.js
@@ -13551,7 +13723,7 @@ exports.handler = async event => {
   "name": "vi3-signaling-compact-test",
   "version": "1.0.0",
   "private": true,
-  "description": "Автоматическая генерация index.compact.js из index.js",
+  "description": "Безопасная генерация и проверка index.compact.js для Yandex Cloud Function vi3-signaling",
   "main": "index.js",
   "type": "commonjs",
   "engines": {
@@ -13559,9 +13731,12 @@ exports.handler = async event => {
   },
   "scripts": {
     "check:source": "node --check index.js",
+    "check:tools": "node --check generate-context.js && node --check scripts/build-compact.js && node --check scripts/check-compact.js",
+    "context:build": "node generate-context.js",
     "compact:build": "node scripts/build-compact.js",
     "compact:check": "node scripts/check-compact.js",
-    "compact:verify": "npm run check:source && npm run compact:build && npm run compact:check",
+    "compact:verify": "npm run check:tools && npm run check:source && npm run compact:build && npm run compact:check",
+    "verify": "npm run compact:verify && npm run context:build",
     "build": "npm run compact:verify"
   },
   "dependencies": {
@@ -13569,7 +13744,7 @@ exports.handler = async event => {
     "@yandex-cloud/nodejs-sdk": "^2.6.0"
   },
   "devDependencies": {
-    "terser": "^5.31.6"
+    "terser": "5.31.6"
   }
 }
 
@@ -13577,21 +13752,60 @@ exports.handler = async event => {
 // FILE: /scripts/build-compact.js
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs/promises');
 const path = require('path');
 const { minify } = require('terser');
 
 const ROOT = path.resolve(__dirname, '..');
 const SOURCE_FILE = path.join(ROOT, 'index.js');
-const OUTPUT_FILE = path.join(ROOT, 'index.compact.js');
-const TEMP_FILE = path.join(ROOT, 'index.compact.js.tmp');
+const OUTPUT_FILE = path.join(
+  ROOT,
+  'index.compact.js'
+);
+const TEMP_FILE = path.join(
+  ROOT,
+  'index.compact.js.tmp'
+);
+
+function sha256(value) {
+  return crypto
+    .createHash('sha256')
+    .update(value)
+    .digest('hex');
+}
+
+async function removeTemporaryFile() {
+  await fs.rm(TEMP_FILE, {
+    force: true
+  }).catch(() => null);
+}
 
 async function main() {
-  const source = await fs.readFile(SOURCE_FILE, 'utf8');
+  await removeTemporaryFile();
+
+  const source = await fs.readFile(
+    SOURCE_FILE,
+    'utf8'
+  );
 
   if (!source.trim()) {
     throw new Error('Исходный файл index.js пуст');
   }
+
+  if (source.charCodeAt(0) === 0xfeff) {
+    throw new Error(
+      'index.js содержит нежелательный UTF-8 BOM'
+    );
+  }
+
+  if (!source.includes('exports.handler')) {
+    throw new Error(
+      'В index.js не найден экспорт exports.handler'
+    );
+  }
+
+  const sourceHash = sha256(source);
 
   const result = await minify(
     {
@@ -13605,38 +13819,95 @@ async function main() {
       toplevel: false,
       keep_fnames: true,
       keep_classnames: true,
+      sourceMap: false,
       format: {
         beautify: false,
         comments: 'all',
         semicolons: true,
         ascii_only: false,
-        preamble: '/* АВТОМАТИЧЕСКИ СОЗДАНО ИЗ index.js. НЕ РЕДАКТИРОВАТЬ ВРУЧНУЮ. */'
+        braces: false,
+        preamble:
+          `/* GENERATED_FROM=index.js SOURCE_SHA256=${sourceHash} DO_NOT_EDIT */`
       }
     }
   );
 
-  if (!result.code) {
-    throw new Error('Terser не вернул сгенерированный код');
+  if (!result || typeof result.code !== 'string') {
+    throw new Error(
+      'Terser не вернул сгенерированный код'
+    );
   }
 
-  await fs.writeFile(TEMP_FILE, `${result.code}\n`, 'utf8');
-  await fs.rename(TEMP_FILE, OUTPUT_FILE);
+  const compact = `${result.code.trim()}\n`;
 
-  const sourceBytes = Buffer.byteLength(source, 'utf8');
-  const compactBytes = Buffer.byteLength(result.code, 'utf8');
-  const reduction = sourceBytes > 0
-    ? Math.round((1 - compactBytes / sourceBytes) * 100)
-    : 0;
+  if (!compact.includes('exports.handler')) {
+    throw new Error(
+      'В компактной версии исчез exports.handler'
+    );
+  }
 
-  console.log(`Создан: ${path.relative(ROOT, OUTPUT_FILE)}`);
-  console.log(`Исходный размер: ${sourceBytes} байт`);
-  console.log(`Компактный размер: ${compactBytes} байт`);
+  if (
+    !compact.includes(
+      `SOURCE_SHA256=${sourceHash}`
+    )
+  ) {
+    throw new Error(
+      'В компактной версии отсутствует SHA-256 исходника'
+    );
+  }
+
+  if (/sourceMappingURL/i.test(compact)) {
+    throw new Error(
+      'Компактный файл содержит sourceMappingURL'
+    );
+  }
+
+  if (Buffer.byteLength(compact) >= Buffer.byteLength(source)) {
+    throw new Error(
+      'Компактный файл не меньше исходного'
+    );
+  }
+
+  await fs.writeFile(
+    TEMP_FILE,
+    compact,
+    'utf8'
+  );
+
+  await fs.rename(
+    TEMP_FILE,
+    OUTPUT_FILE
+  );
+
+  const sourceBytes = Buffer.byteLength(
+    source,
+    'utf8'
+  );
+  const compactBytes = Buffer.byteLength(
+    compact,
+    'utf8'
+  );
+  const reduction = Math.round(
+    (1 - compactBytes / sourceBytes) * 100
+  );
+
+  console.log('✅ Компактная версия создана');
+  console.log(`Исходник: index.js`);
+  console.log(`Результат: index.compact.js`);
+  console.log(`SHA-256 исходника: ${sourceHash}`);
+  console.log(`Размер исходника: ${sourceBytes} байт`);
+  console.log(`Размер результата: ${compactBytes} байт`);
   console.log(`Уменьшение: ${reduction}%`);
 }
 
 main().catch(async error => {
-  await fs.rm(TEMP_FILE, { force: true }).catch(() => null);
-  console.error('[compact:build]', error);
+  await removeTemporaryFile();
+
+  console.error(
+    '❌ Ошибка создания компактной версии:',
+    error?.stack || error
+  );
+
   process.exitCode = 1;
 });
 
@@ -13645,13 +13916,52 @@ main().catch(async error => {
 'use strict';
 
 const assert = require('assert');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const SOURCE_FILE = path.join(ROOT, 'index.js');
-const COMPACT_FILE = path.join(ROOT, 'index.compact.js');
+const COMPACT_FILE = path.join(
+  ROOT,
+  'index.compact.js'
+);
+const PACKAGE_FILE = path.join(
+  ROOT,
+  'package.json'
+);
+
+function sha256(value) {
+  return crypto
+    .createHash('sha256')
+    .update(value)
+    .digest('hex');
+}
+
+function assertFileExists(file) {
+  if (!fs.existsSync(file)) {
+    throw new Error(
+      `Не найден ${path.relative(ROOT, file)}`
+    );
+  }
+
+  const stat = fs.statSync(file);
+
+  if (!stat.isFile()) {
+    throw new Error(
+      `${path.relative(ROOT, file)} не является файлом`
+    );
+  }
+
+  if (!stat.size) {
+    throw new Error(
+      `${path.relative(ROOT, file)} пуст`
+    );
+  }
+
+  return stat;
+}
 
 function checkSyntax(file) {
   const result = spawnSync(
@@ -13659,9 +13969,14 @@ function checkSyntax(file) {
     ['--check', file],
     {
       cwd: ROOT,
-      encoding: 'utf8'
+      encoding: 'utf8',
+      timeout: 30000
     }
   );
+
+  if (result.error) {
+    throw result.error;
+  }
 
   if (result.status !== 0) {
     throw new Error(
@@ -13669,7 +13984,9 @@ function checkSyntax(file) {
         `Синтаксическая ошибка в ${path.basename(file)}`,
         result.stdout,
         result.stderr
-      ].filter(Boolean).join('\n')
+      ]
+        .filter(Boolean)
+        .join('\n')
     );
   }
 }
@@ -13680,138 +13997,309 @@ function loadFresh(file) {
   return require(resolved);
 }
 
-function normalizePingResponse(response) {
+function normalizeDynamicValues(value) {
+  if (Array.isArray(value)) {
+    return value.map(normalizeDynamicValues);
+  }
+
+  if (
+    value &&
+    typeof value === 'object'
+  ) {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([key]) =>
+          !['ts'].includes(key)
+        )
+        .map(([key, item]) => [
+          key,
+          normalizeDynamicValues(item)
+        ])
+    );
+  }
+
+  return value;
+}
+
+function parseResponse(response) {
   const normalized = {
     ...response
   };
 
-  if (typeof normalized.body === 'string' && normalized.body) {
-    const body = JSON.parse(normalized.body);
-    delete body.ts;
-    normalized.body = body;
-  }
-
-  return normalized;
-}
-
-async function main() {
-  if (!fs.existsSync(SOURCE_FILE)) {
-    throw new Error('Не найден index.js');
-  }
-
-  if (!fs.existsSync(COMPACT_FILE)) {
-    throw new Error(
-      'Не найден index.compact.js. Выполните npm run compact:build'
+  if (
+    typeof normalized.body === 'string' &&
+    normalized.body
+  ) {
+    normalized.body = JSON.parse(
+      normalized.body
     );
   }
 
-  const sourceStat = fs.statSync(SOURCE_FILE);
-  const compactStat = fs.statSync(COMPACT_FILE);
+  return normalizeDynamicValues(normalized);
+}
 
-  if (sourceStat.size === 0) {
-    throw new Error('index.js пуст');
-  }
+async function callHandler(module, event) {
+  const result = await module.handler(
+    JSON.parse(JSON.stringify(event))
+  );
 
-  if (compactStat.size === 0) {
-    throw new Error('index.compact.js пуст');
-  }
+  return parseResponse(result);
+}
+
+async function compareEvent({
+  name,
+  sourceModule,
+  compactModule,
+  event
+}) {
+  const [sourceResponse, compactResponse] =
+    await Promise.all([
+      callHandler(sourceModule, event),
+      callHandler(compactModule, event)
+    ]);
+
+  assert.deepStrictEqual(
+    compactResponse,
+    sourceResponse,
+    `Ответы не совпадают для проверки: ${name}`
+  );
+
+  console.log(`✅ Совпадает: ${name}`);
+}
+
+async function main() {
+  const sourceStat = assertFileExists(
+    SOURCE_FILE
+  );
+  const compactStat = assertFileExists(
+    COMPACT_FILE
+  );
+  assertFileExists(PACKAGE_FILE);
 
   checkSyntax(SOURCE_FILE);
   checkSyntax(COMPACT_FILE);
 
+  const sourceText = fs.readFileSync(
+    SOURCE_FILE,
+    'utf8'
+  );
+  const compactText = fs.readFileSync(
+    COMPACT_FILE,
+    'utf8'
+  );
+
+  if (sourceText.charCodeAt(0) === 0xfeff) {
+    throw new Error('index.js содержит UTF-8 BOM');
+  }
+
+  if (compactText.charCodeAt(0) === 0xfeff) {
+    throw new Error(
+      'index.compact.js содержит UTF-8 BOM'
+    );
+  }
+
+  if (/\r/.test(compactText)) {
+    throw new Error(
+      'index.compact.js содержит CRLF или CR'
+    );
+  }
+
+  if (/sourceMappingURL/i.test(compactText)) {
+    throw new Error(
+      'index.compact.js содержит sourceMappingURL'
+    );
+  }
+
+  if (/\beval\s*\(/.test(compactText)) {
+    throw new Error(
+      'index.compact.js неожиданно содержит eval()'
+    );
+  }
+
+  if (compactStat.size >= sourceStat.size) {
+    throw new Error(
+      'index.compact.js не меньше index.js'
+    );
+  }
+
+  const sourceHash = sha256(sourceText);
+  const marker = `SOURCE_SHA256=${sourceHash}`;
+
+  assert.ok(
+    compactText.includes(marker),
+    'SHA-256 исходника в заголовке compact-файла не совпадает'
+  );
+
+  assert.ok(
+    compactText.includes('exports.handler'),
+    'В compact-файле отсутствует exports.handler'
+  );
+
+  const packageJson = JSON.parse(
+    fs.readFileSync(PACKAGE_FILE, 'utf8')
+  );
+
+  assert.strictEqual(
+    packageJson.type,
+    'commonjs',
+    'package.json должен сохранять type=commonjs'
+  );
+
+  assert.strictEqual(
+    packageJson.main,
+    'index.js',
+    'Главным исходным файлом должен оставаться index.js'
+  );
+
   const sourceModule = loadFresh(SOURCE_FILE);
   const compactModule = loadFresh(COMPACT_FILE);
 
-  const sourceExports = Object.keys(sourceModule).sort();
-  const compactExports = Object.keys(compactModule).sort();
+  const sourceExports = Object
+    .keys(sourceModule)
+    .sort();
+
+  const compactExports = Object
+    .keys(compactModule)
+    .sort();
 
   assert.deepStrictEqual(
     compactExports,
     sourceExports,
-    'Наборы экспортов index.js и index.compact.js различаются'
+    'Наборы экспортов исходной и компактной версий различаются'
+  );
+
+  assert.deepStrictEqual(
+    sourceExports,
+    ['handler'],
+    'Ожидался единственный экспорт handler'
   );
 
   assert.strictEqual(
     typeof sourceModule.handler,
     'function',
-    'index.js не экспортирует функцию handler'
+    'index.js не экспортирует handler'
   );
 
   assert.strictEqual(
     typeof compactModule.handler,
     'function',
-    'index.compact.js не экспортирует функцию handler'
+    'index.compact.js не экспортирует handler'
   );
 
-  const pingEvent = {
-    httpMethod: 'GET',
-    headers: {},
-    queryStringParameters: {
-      action: 'ping'
+  const events = [
+    {
+      name: 'GET ping через query string',
+      event: {
+        httpMethod: 'GET',
+        headers: {},
+        queryStringParameters: {
+          action: 'ping'
+        }
+      }
+    },
+    {
+      name: 'POST ping через JSON body',
+      event: {
+        httpMethod: 'POST',
+        headers: {
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          action: 'ping'
+        }),
+        isBase64Encoded: false
+      }
+    },
+    {
+      name: 'POST ping через base64 body',
+      event: {
+        httpMethod: 'POST',
+        headers: {
+          'content-type': 'application/json'
+        },
+        body: Buffer
+          .from(
+            JSON.stringify({
+              action: 'ping'
+            }),
+            'utf8'
+          )
+          .toString('base64'),
+        isBase64Encoded: true
+      }
+    },
+    {
+      name: 'прямой event action=ping',
+      event: {
+        action: 'ping',
+        headers: {}
+      }
+    },
+    {
+      name: 'неизвестное действие',
+      event: {
+        httpMethod: 'POST',
+        headers: {},
+        body: JSON.stringify({
+          action: '__compact_test_unknown__'
+        })
+      }
+    },
+    {
+      name: 'OPTIONS с разрешённым origin',
+      event: {
+        httpMethod: 'OPTIONS',
+        headers: {
+          origin: 'https://apel-s-in.github.io'
+        }
+      }
+    },
+    {
+      name: 'OPTIONS с null origin',
+      event: {
+        httpMethod: 'OPTIONS',
+        headers: {
+          origin: 'null'
+        }
+      }
+    },
+    {
+      name: 'OPTIONS с custom request headers',
+      event: {
+        httpMethod: 'OPTIONS',
+        headers: {
+          origin: 'https://apel-s-in.github.io',
+          'access-control-request-headers':
+            'Content-Type, X-Vi3-Session'
+        }
+      }
     }
-  };
+  ];
 
-  const sourcePing = normalizePingResponse(
-    await sourceModule.handler(pingEvent)
+  for (const test of events) {
+    await compareEvent({
+      ...test,
+      sourceModule,
+      compactModule
+    });
+  }
+
+  console.log('');
+  console.log('✅ Все проверки завершены');
+  console.log(`Экспорты: ${sourceExports.join(', ')}`);
+  console.log(`SHA-256: ${sourceHash}`);
+  console.log(`index.js: ${sourceStat.size} байт`);
+  console.log(
+    `index.compact.js: ${compactStat.size} байт`
   );
-
-  const compactPing = normalizePingResponse(
-    await compactModule.handler(pingEvent)
-  );
-
-  assert.deepStrictEqual(
-    compactPing,
-    sourcePing,
-    'Ответ ping компактной версии отличается от исходной'
-  );
-
-  const optionsEvent = {
-    httpMethod: 'OPTIONS',
-    headers: {
-      origin: 'https://apel-s-in.github.io'
-    }
-  };
-
-  const sourceOptions = await sourceModule.handler(optionsEvent);
-  const compactOptions = await compactModule.handler(optionsEvent);
-
-  assert.deepStrictEqual(
-    compactOptions,
-    sourceOptions,
-    'Ответ OPTIONS компактной версии отличается от исходной'
-  );
-
-  console.log('Проверка успешно завершена:');
-  console.log(`- синтаксис ${path.basename(SOURCE_FILE)} корректен`);
-  console.log(`- синтаксис ${path.basename(COMPACT_FILE)} корректен`);
-  console.log('- экспорты совпадают');
-  console.log('- handler присутствует в обеих версиях');
-  console.log('- ответы ping совпадают');
-  console.log('- ответы OPTIONS совпадают');
-  console.log(`- размер index.js: ${sourceStat.size} байт`);
-  console.log(`- размер index.compact.js: ${compactStat.size} байт`);
 }
 
 main().catch(error => {
-  console.error('[compact:check]', error);
+  console.error(
+    '❌ Проверка compact-файла завершилась ошибкой:',
+    error?.stack || error
+  );
+
   process.exitCode = 1;
 });
-
-//=================================================
-// FILE: /Добавь README.md
-# vi3-signaling compact test
-
-Тестовый репозиторий для автоматического создания компактной версии Yandex Cloud Function.
-
-## Файлы
-
-- `index.js` — исходная версия;
-- `index.compact.js` — автоматически созданная компактная версия;
-- `scripts/build-compact.js` — генератор;
-- `scripts/check-compact.js` — проверка.
-
-## Установка
-
-```bash
-npm install
 

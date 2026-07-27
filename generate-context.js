@@ -56,8 +56,6 @@ const EXCLUDE_RAW = [
   '**/*.map',
   '**/*.min.js',
   '**/*.min.css',
-  'index.js',
-  'index.compact.js',
   'yarn.lock',
   'pnpm-lock.yaml',
   'project-friends-full*.txt',

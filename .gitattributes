@@ -1,6 +1,11 @@
 * text=auto
+
 *.js text eol=lf
 *.json text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+
 index.compact.js linguist-generated=true
+.meta/project-signaling-compact-full.txt linguist-generated=true

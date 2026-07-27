@@ -1,357 +1,257 @@
 /* eslint-disable no-console */
 'use strict';
 
-const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
 
-const ROOT = __dirname;
-const META_DIR = path.join(ROOT, '.meta');
-const OUTPUT_FILE = path.join(META_DIR, 'repository-full.txt');
+const argv = Object.fromEntries(process.argv.slice(2).map(a => {
+  const [k, ...r] = a.replace(/^--/, '').split('=');
+  return [k, r.join('=') === '' ? true : r.join('=')];
+}));
 
-const EXCLUDED_FILES = new Set([
-  'index.js',
-  'index.compact.js'
+const ROOT = path.resolve(argv.root || __dirname);
+const META_DIR = path.resolve(argv['out-dir'] || path.join(ROOT, '.meta'));
+const MODE = String(argv.mode || 'both').toLowerCase();
+const MAX_LINES = Number(argv['max-lines'] || 22000);
+
+if (!fs.existsSync(META_DIR)) fs.mkdirSync(META_DIR, { recursive: true });
+
+const FULL_FILE = path.join(META_DIR, 'project-friends-full.txt');
+const ADAPTIVE_FILE = path.join(META_DIR, 'project-friends-adaptive.txt');
+
+const toUnix = p => String(p || '').replace(/\\/g, '/');
+const SELF_FULL_REL = toUnix(path.relative(ROOT, FULL_FILE));
+const SELF_ADAPT_REL = toUnix(path.relative(ROOT, ADAPTIVE_FILE));
+
+const TEXT_EXTS = new Set([
+  '.html', '.htm', '.css', '.js', '.mjs', '.cjs', '.ts', '.tsx',
+  '.json', '.webmanifest', '.md', '.txt', '.yml', '.yaml', '.svg'
 ]);
 
-const EXCLUDED_DIRECTORIES = new Set([
-  '.git',
-  '.meta',
-  'node_modules'
+const BINARY_EXTS = new Set([
+  '.png', '.jpg', '.jpeg', '.webp', '.avif', '.gif', '.ico',
+  '.mp3', '.wav', '.ogg', '.m4a', '.mp4', '.webm',
+  '.woff', '.woff2', '.ttf', '.otf',
+  '.zip', '.7z', '.rar', '.gz', '.pdf'
 ]);
 
-function toUnix(value) {
-  return String(value || '').replace(/\\/g, '/');
-}
+const EXCLUDE_RAW = [
+  '.git/**',
+  '.meta/**',
+  'node_modules/**',
+  'dist/**',
+  'build/**',
+  'out/**',
+  'coverage/**',
+  '.cache/**',
+  '.vscode/**',
+  '.idea/**',
+  '.DS_Store',
+  '**/*.log',
+  '**/*.tmp',
+  '**/*.temp',
+  '**/*.bak',
+  '**/*.orig',
+  '**/*.rej',
+  '**/*.map',
+  '**/*.min.js',
+  '**/*.min.css',
+  'package-lock.json',
+  'yarn.lock',
+  'pnpm-lock.yaml',
+  'project-friends-full*.txt',
+  'project-friends-adaptive*.txt'
+];
 
-function sha256(buffer) {
-  return crypto
-    .createHash('sha256')
-    .update(buffer)
-    .digest('hex');
-}
+const PRIORITY = {
+  critical: [
+    /^index\.html?$/i,
+    /^styles\.css$/i,
+    /^src\/app\.js$/i,
+    /^\.github\/workflows\/deploy\.ya?ml$/i,
+    /^\.github\/workflows\/generate-context\.ya?ml$/i,
+    /^generate-context\.js$/i,
+    /^ai-rules\.txt$/i,
+    /^README\.md$/i
+  ],
+  high: [
+    /^src\/.*\.(js|mjs|ts)$/i,
+    /^.*\.(css|html?)$/i,
+    /^\.github\/workflows\/.*\.ya?ml$/i
+  ],
+  medium: [
+    /^.*\.(js|mjs|cjs|ts|tsx|json|md|txt|ya?ml|css|html?|svg)$/i
+  ]
+};
 
-function isExcluded(relative) {
-  const normalized = toUnix(relative);
-  const parts = normalized.split('/');
+const globToRegExp = p => {
+  const hasPath = p.includes('/') || p.includes('**');
+  const esc = p
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '___GLOBSTAR___')
+    .replace(/\*/g, '[^/]*')
+    .replace(/___GLOBSTAR___/g, '.*');
+  return hasPath ? new RegExp(`^${esc}$`) : new RegExp(`(^|/)${esc}(/|$)`);
+};
 
-  if (!normalized) return true;
-  if (EXCLUDED_FILES.has(normalized)) return true;
+const EXCLUDES = EXCLUDE_RAW.map(globToRegExp);
 
-  return parts.some(part =>
-    EXCLUDED_DIRECTORIES.has(part)
-  );
-}
+const isExcluded = rel => {
+  const u = toUnix(rel);
+  if (!u || u === SELF_FULL_REL || u === SELF_ADAPT_REL) return true;
+  return EXCLUDES.some(re => re.test(u));
+};
 
-function listTrackedFiles() {
+const isTextFile = rel => {
+  const ext = path.extname(rel).toLowerCase();
+  if (BINARY_EXTS.has(ext)) return false;
+  return TEXT_EXTS.has(ext);
+};
+
+const readText = rel => {
   try {
-    const result = execFileSync(
-      'git',
-      ['ls-files', '-z'],
-      {
-        cwd: ROOT,
-        encoding: 'buffer',
-        maxBuffer: 64 * 1024 * 1024
-      }
-    );
-
-    return result
-      .toString('utf8')
-      .split('\0')
-      .map(toUnix)
-      .filter(Boolean)
-      .filter(relative => !isExcluded(relative))
-      .sort((left, right) =>
-        left.localeCompare(right, 'en')
-      );
-  } catch (error) {
-    console.warn(
-      'Не удалось выполнить git ls-files, используется обход каталогов:',
-      error.message
-    );
-
-    return listFilesFromDisk();
+    return fs.readFileSync(path.join(ROOT, rel), 'utf8');
+  } catch (e) {
+    return `// read error: ${e.message}`;
   }
-}
+};
 
-function listFilesFromDisk() {
-  const files = [];
+const countLines = s => (String(s || '').match(/\n/g) || []).length + (String(s || '').length ? 1 : 0);
+
+const listAllEntries = includeFiles => {
+  const out = [];
   const stack = [ROOT];
 
   while (stack.length) {
-    const directory = stack.pop();
+    const dir = stack.pop();
     let entries = [];
-
     try {
-      entries = fs.readdirSync(directory, {
-        withFileTypes: true
-      });
-    } catch (error) {
-      console.warn(
-        `Не удалось прочитать каталог ${directory}:`,
-        error.message
-      );
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
       continue;
     }
 
-    for (const entry of entries) {
-      const absolute = path.join(directory, entry.name);
-      const relative = toUnix(
-        path.relative(ROOT, absolute)
-      );
+    for (const item of entries) {
+      const full = path.join(dir, item.name);
+      const rel = toUnix(path.relative(ROOT, full)) || '.';
+      if (isExcluded(rel)) continue;
 
-      if (isExcluded(relative)) continue;
-
-      if (entry.isDirectory()) {
-        stack.push(absolute);
-      } else if (entry.isFile()) {
-        files.push(relative);
+      if (item.isDirectory()) {
+        out.push({ rel, full, dir: true });
+        stack.push(full);
+      } else if (item.isFile() && includeFiles) {
+        out.push({ rel, full, dir: false });
       }
     }
   }
 
-  return files.sort((left, right) =>
-    left.localeCompare(right, 'en')
-  );
-}
+  return out.sort((a, b) => a.dir !== b.dir ? (a.dir ? -1 : 1) : a.rel.localeCompare(b.rel));
+};
 
-function isTextBuffer(buffer) {
-  if (!buffer.length) return true;
+const getPriority = rel => {
+  const u = toUnix(rel);
+  return Object.keys(PRIORITY).find(level => PRIORITY[level].some(re => re.test(u))) || 'low';
+};
 
-  const sample = buffer.subarray(
-    0,
-    Math.min(buffer.length, 16384)
-  );
-
-  if (sample.includes(0)) return false;
-
-  let controlCharacters = 0;
-
-  for (const byte of sample) {
-    const allowed =
-      byte === 9 ||
-      byte === 10 ||
-      byte === 13;
-
-    if (byte < 32 && !allowed) {
-      controlCharacters++;
-    }
-  }
-
-  return controlCharacters / sample.length < 0.01;
-}
-
-function buildTree(files) {
-  const root = {
-    directories: new Map(),
-    files: []
-  };
-
-  for (const relative of files) {
-    const parts = relative.split('/');
-    const fileName = parts.pop();
-    let current = root;
-
-    for (const directoryName of parts) {
-      if (!current.directories.has(directoryName)) {
-        current.directories.set(directoryName, {
-          directories: new Map(),
-          files: []
-        });
-      }
-
-      current = current.directories.get(directoryName);
-    }
-
-    current.files.push(fileName);
-  }
-
-  const lines = [
-    'СТРУКТУРА РЕПОЗИТОРИЯ:',
-    `${path.basename(ROOT)}/`
-  ];
-
-  function render(node, prefix = '') {
-    const directories = [...node.directories.entries()]
-      .sort(([left], [right]) =>
-        left.localeCompare(right, 'en')
-      )
-      .map(([name, child]) => ({
-        name,
-        child,
-        directory: true
-      }));
-
-    const files = [...node.files]
-      .sort((left, right) =>
-        left.localeCompare(right, 'en')
-      )
-      .map(name => ({
-        name,
-        child: null,
-        directory: false
-      }));
-
-    const entries = [
-      ...directories,
-      ...files
-    ];
-
-    entries.forEach((entry, index) => {
-      const last = index === entries.length - 1;
-      const branch = last ? '└── ' : '├── ';
-
-      lines.push(
-        `${prefix}${branch}${entry.name}${entry.directory ? '/' : ''}`
-      );
-
-      if (entry.directory) {
-        render(
-          entry.child,
-          `${prefix}${last ? '    ' : '│   '}`
-        );
-      }
-    });
-  }
-
-  render(root);
-  return lines.join('\n');
-}
-
-function repositoryName() {
-  return String(
-    process.env.GITHUB_REPOSITORY ||
-    path.basename(ROOT)
-  );
-}
-
-function repositoryUrl() {
-  const githubRepository = String(
-    process.env.GITHUB_REPOSITORY || ''
-  ).trim();
-
-  if (githubRepository) {
-    return `https://github.com/${githubRepository}`;
-  }
-
+const readRepoUrl = () => {
   try {
-    const remote = execFileSync(
-      'git',
-      ['config', '--get', 'remote.origin.url'],
-      {
-        cwd: ROOT,
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore']
-      }
-    ).trim();
-
-    if (remote.startsWith('git@github.com:')) {
-      return remote
-        .replace(
-          'git@github.com:',
-          'https://github.com/'
-        )
-        .replace(/\.git$/, '');
-    }
-
-    return remote.replace(/\.git$/, '');
+    const cfg = path.join(ROOT, '.git', 'config');
+    if (!fs.existsSync(cfg)) return '';
+    return (fs.readFileSync(cfg, 'utf8').match(/url\s*=\s*(.+)\n/) || [])[1]?.trim() || '';
   } catch {
     return '';
   }
-}
+};
 
-function buildFileBlock(relative) {
-  const absolute = path.join(ROOT, relative);
+const renderTree = () => {
+  const lines = ['СТРУКТУРА ПРОЕКТА:', `${path.basename(ROOT)}/`];
 
-  try {
-    const buffer = fs.readFileSync(absolute);
-
-    if (!isTextBuffer(buffer)) {
-      return `//=================================================
-// FILE: /${relative}
-// BINARY FILE
-// Размер: ${buffer.length} байт
-// SHA-256: ${sha256(buffer)}
-
-`;
+  const walk = (dir, prefix = '') => {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
     }
 
-    const text = buffer
-      .toString('utf8')
-      .replace(/\r\n/g, '\n')
-      .replace(/\r/g, '\n');
+    const visible = entries
+      .filter(x => !isExcluded(toUnix(path.relative(ROOT, path.join(dir, x.name)))))
+      .sort((a, b) => a.isDirectory() !== b.isDirectory() ? (a.isDirectory() ? -1 : 1) : a.name.localeCompare(b.name));
 
-    return `//=================================================
-// FILE: /${relative}
-${text}${text.endsWith('\n') ? '' : '\n'}
-`;
-  } catch (error) {
-    return `//=================================================
-// FILE: /${relative}
-// Не удалось прочитать файл: ${error.message}
+    visible.forEach((x, i) => {
+      const last = i === visible.length - 1;
+      lines.push(`${prefix}${last ? '└── ' : '├── '}${x.name}${x.isDirectory() ? '/' : ''}`);
+      if (x.isDirectory()) walk(path.join(dir, x.name), `${prefix}${last ? '    ' : '│   '}`);
+    });
+  };
+
+  walk(ROOT);
+  return lines.join('\n');
+};
+
+const headerBlock = () => {
+  const rulesPath = path.join(ROOT, 'ai-rules.txt');
+  const rules = fs.existsSync(rulesPath) ? `${fs.readFileSync(rulesPath, 'utf8').trim()}\n\n` : '';
+  const repoName = String(argv['repo-name'] || path.basename(ROOT));
+  const repoUrl = String(argv['repo-url'] || readRepoUrl() || 'https://github.com/apel-s-in/vi3na1bita-friends');
+
+  return `${rules}Название репозитория: ${repoName}
+Адрес репозитория: ${repoUrl}
+Назначение: отдельный сетевой модуль Друзья для vi3na1bita-music.
+Публичный путь после деплоя: https://vi3na1bita.website.yandexcloud.net/Friends/
+Проект делается и обслуживается средствами https://github.com/ + GitHub Actions + Yandex Object Storage.
+
+${renderTree()}
+
+Сгенерировано: ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC
 
 `;
+};
+
+const fileBlock = rel => `//=================================================
+// FILE: /${toUnix(rel)}
+${readText(rel)}
+`;
+
+const generate = mode => {
+  let out = headerBlock();
+  let lines = countLines(out);
+
+  const groups = listAllEntries(true)
+    .filter(e => !e.dir && isTextFile(e.rel))
+    .reduce((acc, e) => {
+      acc[getPriority(e.rel)].push(e.rel);
+      return acc;
+    }, { critical: [], high: [], medium: [], low: [] });
+
+  const order = mode === 'adaptive' ? ['critical', 'high', 'medium'] : ['critical', 'high', 'medium', 'low'];
+
+  for (const level of order) {
+    for (const rel of groups[level]) {
+      const block = fileBlock(rel);
+      const blockLines = countLines(block);
+      if (mode === 'adaptive' && lines + blockLines > MAX_LINES) {
+        return `${out}\n// ... adaptive context truncated by --max-lines=${MAX_LINES}\n`;
+      }
+      out += block;
+      lines += blockLines;
+    }
   }
-}
 
-function main() {
-  const files = listTrackedFiles();
-
-  fs.mkdirSync(META_DIR, {
-    recursive: true
-  });
-
-  let output = `Название репозитория: ${repositoryName()}
-Адрес репозитория: ${repositoryUrl()}
-Назначение: генерация полного контекста тестового репозитория vi3-signaling-compact-test.
-
-ИСКЛЮЧЕНО ИЗ КОНТЕКСТА:
-- index.js
-- index.compact.js
-- .git
-- .meta
-- node_modules
-
-Все остальные отслеживаемые файлы включаются без проверки их синтаксиса или корректности.
-Файлы .gitignore и .gitattributes включаются как обычные текстовые файлы.
-
-${buildTree(files)}
-
-Сгенерировано: ${new Date().toISOString()}
-
-`;
-
-  for (const relative of files) {
-    output += buildFileBlock(relative);
-  }
-
-  const temporaryFile = `${OUTPUT_FILE}.tmp`;
-
-  fs.writeFileSync(
-    temporaryFile,
-    output,
-    'utf8'
-  );
-
-  fs.renameSync(
-    temporaryFile,
-    OUTPUT_FILE
-  );
-
-  console.log(`Создан файл: ${OUTPUT_FILE}`);
-  console.log(`Включено файлов: ${files.length}`);
-  console.log(
-    `Размер: ${fs.statSync(OUTPUT_FILE).size} байт`
-  );
-}
+  return out;
+};
 
 try {
-  main();
-} catch (error) {
-  console.error(
-    'Ошибка генерации контекста:',
-    error?.stack || error
-  );
-  process.exitCode = 1;
+  if (MODE === 'full' || MODE === 'both') {
+    fs.writeFileSync(FULL_FILE, generate('full'), 'utf8');
+    console.log(`✅ ${FULL_FILE}`);
+  }
+
+  if (MODE === 'adaptive' || MODE === 'both') {
+    fs.writeFileSync(ADAPTIVE_FILE, generate('adaptive'), 'utf8');
+    console.log(`✅ ${ADAPTIVE_FILE}`);
+  }
+} catch (e) {
+  console.error('❌ context generation failed:', e);
+  process.exit(1);
 }

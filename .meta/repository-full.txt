@@ -1,0 +1,1155 @@
+Название репозитория: apel-s-in/vi3-signaling-compact-test
+Адрес репозитория: https://github.com/apel-s-in/vi3-signaling-compact-test
+Назначение: генерация полного контекста тестового репозитория vi3-signaling-compact-test.
+
+ИСКЛЮЧЕНО ИЗ КОНТЕКСТА:
+- index.js
+- index.compact.js
+- .git
+- .meta
+- node_modules
+
+Все остальные отслеживаемые файлы включаются без проверки их синтаксиса или корректности.
+Файлы .gitignore и .gitattributes включаются как обычные текстовые файлы.
+
+СТРУКТУРА РЕПОЗИТОРИЯ:
+vi3-signaling-compact-test/
+├── .github/
+│   ├── workflows/
+│   │   ├── compact-check.yml
+│   │   └── generate-context.yml
+│   └── copilot-instructions.md
+├── scripts/
+│   ├── build-compact.js
+│   └── check-compact.js
+├── .gitattributes
+├── .gitignore
+├── ai-rules.txt
+├── generate-context.js
+└── package.json
+
+Сгенерировано: 2026-07-27T19:05:10.865Z
+
+//=================================================
+// FILE: /.gitattributes
+* text=auto
+
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+index.compact.js linguist-generated=true
+.meta/repository-full.txt linguist-generated=true
+
+//=================================================
+// FILE: /.github/copilot-instructions.md
+
+
+//=================================================
+// FILE: /.github/workflows/compact-check.yml
+name: Generate compact function
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - 'index.compact.js'
+      - '.meta/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: compact-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Terser
+        run: npm install --package-lock=false --no-audit --no-fund
+
+      - name: Generate index.compact.js
+        run: node scripts/build-compact.js
+
+      - name: Commit index.compact.js
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'CI: update index.compact.js'
+          branch: ${{ github.ref_name }}
+          file_pattern: 'index.compact.js'
+          commit_user_name: github-actions[bot]
+          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
+
+      - name: Upload index.compact.js
+        uses: actions/upload-artifact@v4
+        with:
+          name: index-compact
+          path: index.compact.js
+          if-no-files-found: error
+          retention-days: 14
+
+//=================================================
+// FILE: /.github/workflows/generate-context.yml
+name: Generate repository context
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '.meta/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: repository-context-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate context
+        run: node generate-context.js
+
+      - name: Commit context
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'CI: update repository context'
+          branch: ${{ github.ref_name }}
+          file_pattern: '.meta/repository-full.txt'
+          commit_user_name: github-actions[bot]
+          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
+
+//=================================================
+// FILE: /.gitignore
+node_modules/
+
+.env
+.env.*
+!.env.example
+
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+
+index.compact.js.tmp
+
+.meta/*
+!.meta/repository-full.txt
+
+.DS_Store
+Thumbs.db
+
+//=================================================
+// FILE: /ai-rules.txt
+ПРАВИЛА ДЛЯ НЕЙРОСЕТЕЙ ПО РЕПОЗИТОРИЮ vi3na1bita-friends:
+
+- Ты — Senior Lead Architect и Code Optimizer (JS ESM, iframe sandbox, postMessage, privacy, cost-aware networking).
+- Язык ответов: RU по умолчанию.
+- Всегда начинай с полного анализа приложения.
+- Всегда указывай точные пути файлов.
+- Любой код — только в тройных бэктиках с языком.
+- Проект редактируется через web-интерфейс github.com.
+- Формат изменений: -> ФАЙЛ -> НАЙТИ -> ЗАМЕНИТЬ НА.
+- Стиль: vanilla JS ESM, 2 пробела, без зависимостей.
+
+АРХИТЕКТУРА FRIENDS:
+
+- vi3na1bita-friends — социальный слой (друзья/чат/пуш/приглашения в игры).
+- Деплой: корень репозитория в bucket prefix /Friends/.
+- Публичный путь: https://vi3na1bita.website.yandexcloud.net/Friends/
+- Два слоя: friends-core.js (data, без DOM) и friends-ui.js (рендер).
+- friendId назначается только Cloud Function vi3-signaling после серверной проверки Яндекс OAuth. Клиент не вычисляет и не выбирает friendId.
+- Основное приложение получает короткоживущую подписанную social session и передаёт внешнему FriendsCore только friendId, профиль устройства и socialSession. OAuth token во внешний модуль не передаётся.
+- FriendsCore не читает OAuth token, localStorage/IndexedDB основного приложения и parent.window.
+- Identity всегда приходит сверху через setIdentity() или postMessage. Без действующей socialSession сетевые действия запрещены.
+- Presence heartbeat и push polling разрешены только пока открыт раздел Friends и страница видима. Polling чата и звонка разрешён только пока открыто соответствующее окно.
+- Любой polling обязан останавливаться при document.hidden, закрытии окна или уходе из раздела Friends.
+- ALLOW_LEGACY_AUTH=0 является целевым production-режимом. clientSecret, X-Vi3-Player и X-Vi3-Secret запрещены.
+- Список приглашаемых игр — единый, в games-registry.js.
+- Standalone-preview обязателен: без parent должен работать UI-каркас.
+
+//=================================================
+// FILE: /generate-context.js
+/* eslint-disable no-console */
+'use strict';
+
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const { execFileSync } = require('child_process');
+
+const ROOT = __dirname;
+const META_DIR = path.join(ROOT, '.meta');
+const OUTPUT_FILE = path.join(META_DIR, 'repository-full.txt');
+
+const EXCLUDED_FILES = new Set([
+  'index.js',
+  'index.compact.js'
+]);
+
+const EXCLUDED_DIRECTORIES = new Set([
+  '.git',
+  '.meta',
+  'node_modules'
+]);
+
+function toUnix(value) {
+  return String(value || '').replace(/\\/g, '/');
+}
+
+function sha256(buffer) {
+  return crypto
+    .createHash('sha256')
+    .update(buffer)
+    .digest('hex');
+}
+
+function isExcluded(relative) {
+  const normalized = toUnix(relative);
+  const parts = normalized.split('/');
+
+  if (!normalized) return true;
+  if (EXCLUDED_FILES.has(normalized)) return true;
+
+  return parts.some(part =>
+    EXCLUDED_DIRECTORIES.has(part)
+  );
+}
+
+function listTrackedFiles() {
+  try {
+    const result = execFileSync(
+      'git',
+      ['ls-files', '-z'],
+      {
+        cwd: ROOT,
+        encoding: 'buffer',
+        maxBuffer: 64 * 1024 * 1024
+      }
+    );
+
+    return result
+      .toString('utf8')
+      .split('\0')
+      .map(toUnix)
+      .filter(Boolean)
+      .filter(relative => !isExcluded(relative))
+      .sort((left, right) =>
+        left.localeCompare(right, 'en')
+      );
+  } catch (error) {
+    console.warn(
+      'Не удалось выполнить git ls-files, используется обход каталогов:',
+      error.message
+    );
+
+    return listFilesFromDisk();
+  }
+}
+
+function listFilesFromDisk() {
+  const files = [];
+  const stack = [ROOT];
+
+  while (stack.length) {
+    const directory = stack.pop();
+    let entries = [];
+
+    try {
+      entries = fs.readdirSync(directory, {
+        withFileTypes: true
+      });
+    } catch (error) {
+      console.warn(
+        `Не удалось прочитать каталог ${directory}:`,
+        error.message
+      );
+      continue;
+    }
+
+    for (const entry of entries) {
+      const absolute = path.join(directory, entry.name);
+      const relative = toUnix(
+        path.relative(ROOT, absolute)
+      );
+
+      if (isExcluded(relative)) continue;
+
+      if (entry.isDirectory()) {
+        stack.push(absolute);
+      } else if (entry.isFile()) {
+        files.push(relative);
+      }
+    }
+  }
+
+  return files.sort((left, right) =>
+    left.localeCompare(right, 'en')
+  );
+}
+
+function isTextBuffer(buffer) {
+  if (!buffer.length) return true;
+
+  const sample = buffer.subarray(
+    0,
+    Math.min(buffer.length, 16384)
+  );
+
+  if (sample.includes(0)) return false;
+
+  let controlCharacters = 0;
+
+  for (const byte of sample) {
+    const allowed =
+      byte === 9 ||
+      byte === 10 ||
+      byte === 13;
+
+    if (byte < 32 && !allowed) {
+      controlCharacters++;
+    }
+  }
+
+  return controlCharacters / sample.length < 0.01;
+}
+
+function buildTree(files) {
+  const root = {
+    directories: new Map(),
+    files: []
+  };
+
+  for (const relative of files) {
+    const parts = relative.split('/');
+    const fileName = parts.pop();
+    let current = root;
+
+    for (const directoryName of parts) {
+      if (!current.directories.has(directoryName)) {
+        current.directories.set(directoryName, {
+          directories: new Map(),
+          files: []
+        });
+      }
+
+      current = current.directories.get(directoryName);
+    }
+
+    current.files.push(fileName);
+  }
+
+  const lines = [
+    'СТРУКТУРА РЕПОЗИТОРИЯ:',
+    `${path.basename(ROOT)}/`
+  ];
+
+  function render(node, prefix = '') {
+    const directories = [...node.directories.entries()]
+      .sort(([left], [right]) =>
+        left.localeCompare(right, 'en')
+      )
+      .map(([name, child]) => ({
+        name,
+        child,
+        directory: true
+      }));
+
+    const files = [...node.files]
+      .sort((left, right) =>
+        left.localeCompare(right, 'en')
+      )
+      .map(name => ({
+        name,
+        child: null,
+        directory: false
+      }));
+
+    const entries = [
+      ...directories,
+      ...files
+    ];
+
+    entries.forEach((entry, index) => {
+      const last = index === entries.length - 1;
+      const branch = last ? '└── ' : '├── ';
+
+      lines.push(
+        `${prefix}${branch}${entry.name}${entry.directory ? '/' : ''}`
+      );
+
+      if (entry.directory) {
+        render(
+          entry.child,
+          `${prefix}${last ? '    ' : '│   '}`
+        );
+      }
+    });
+  }
+
+  render(root);
+  return lines.join('\n');
+}
+
+function repositoryName() {
+  return String(
+    process.env.GITHUB_REPOSITORY ||
+    path.basename(ROOT)
+  );
+}
+
+function repositoryUrl() {
+  const githubRepository = String(
+    process.env.GITHUB_REPOSITORY || ''
+  ).trim();
+
+  if (githubRepository) {
+    return `https://github.com/${githubRepository}`;
+  }
+
+  try {
+    const remote = execFileSync(
+      'git',
+      ['config', '--get', 'remote.origin.url'],
+      {
+        cwd: ROOT,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore']
+      }
+    ).trim();
+
+    if (remote.startsWith('git@github.com:')) {
+      return remote
+        .replace(
+          'git@github.com:',
+          'https://github.com/'
+        )
+        .replace(/\.git$/, '');
+    }
+
+    return remote.replace(/\.git$/, '');
+  } catch {
+    return '';
+  }
+}
+
+function buildFileBlock(relative) {
+  const absolute = path.join(ROOT, relative);
+
+  try {
+    const buffer = fs.readFileSync(absolute);
+
+    if (!isTextBuffer(buffer)) {
+      return `//=================================================
+// FILE: /${relative}
+// BINARY FILE
+// Размер: ${buffer.length} байт
+// SHA-256: ${sha256(buffer)}
+
+`;
+    }
+
+    const text = buffer
+      .toString('utf8')
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n');
+
+    return `//=================================================
+// FILE: /${relative}
+${text}${text.endsWith('\n') ? '' : '\n'}
+`;
+  } catch (error) {
+    return `//=================================================
+// FILE: /${relative}
+// Не удалось прочитать файл: ${error.message}
+
+`;
+  }
+}
+
+function main() {
+  const files = listTrackedFiles();
+
+  fs.mkdirSync(META_DIR, {
+    recursive: true
+  });
+
+  let output = `Название репозитория: ${repositoryName()}
+Адрес репозитория: ${repositoryUrl()}
+Назначение: генерация полного контекста тестового репозитория vi3-signaling-compact-test.
+
+ИСКЛЮЧЕНО ИЗ КОНТЕКСТА:
+- index.js
+- index.compact.js
+- .git
+- .meta
+- node_modules
+
+Все остальные отслеживаемые файлы включаются без проверки их синтаксиса или корректности.
+Файлы .gitignore и .gitattributes включаются как обычные текстовые файлы.
+
+${buildTree(files)}
+
+Сгенерировано: ${new Date().toISOString()}
+
+`;
+
+  for (const relative of files) {
+    output += buildFileBlock(relative);
+  }
+
+  const temporaryFile = `${OUTPUT_FILE}.tmp`;
+
+  fs.writeFileSync(
+    temporaryFile,
+    output,
+    'utf8'
+  );
+
+  fs.renameSync(
+    temporaryFile,
+    OUTPUT_FILE
+  );
+
+  console.log(`Создан файл: ${OUTPUT_FILE}`);
+  console.log(`Включено файлов: ${files.length}`);
+  console.log(
+    `Размер: ${fs.statSync(OUTPUT_FILE).size} байт`
+  );
+}
+
+try {
+  main();
+} catch (error) {
+  console.error(
+    'Ошибка генерации контекста:',
+    error?.stack || error
+  );
+  process.exitCode = 1;
+}
+
+//=================================================
+// FILE: /package.json
+{
+  "name": "vi3-signaling-compact-test",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Безопасная генерация и проверка index.compact.js для Yandex Cloud Function vi3-signaling",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check:source": "node --check index.js",
+    "check:tools": "node --check generate-context.js && node --check scripts/build-compact.js && node --check scripts/check-compact.js",
+    "context:build": "node generate-context.js",
+    "compact:build": "node scripts/build-compact.js",
+    "compact:check": "node scripts/check-compact.js",
+    "compact:verify": "npm run check:tools && npm run check:source && npm run compact:build && npm run compact:check",
+    "verify": "npm run compact:verify && npm run context:build",
+    "build": "npm run compact:verify"
+  },
+  "dependencies": {
+    "ydb-sdk": "^5.9.0",
+    "@yandex-cloud/nodejs-sdk": "^2.6.0"
+  },
+  "devDependencies": {
+    "terser": "5.31.6"
+  }
+}
+
+//=================================================
+// FILE: /scripts/build-compact.js
+'use strict';
+
+const crypto = require('crypto');
+const fs = require('fs/promises');
+const path = require('path');
+const { minify } = require('terser');
+
+const ROOT = path.resolve(__dirname, '..');
+const SOURCE_FILE = path.join(ROOT, 'index.js');
+const OUTPUT_FILE = path.join(
+  ROOT,
+  'index.compact.js'
+);
+const TEMP_FILE = path.join(
+  ROOT,
+  'index.compact.js.tmp'
+);
+
+function sha256(value) {
+  return crypto
+    .createHash('sha256')
+    .update(value)
+    .digest('hex');
+}
+
+async function removeTemporaryFile() {
+  await fs.rm(TEMP_FILE, {
+    force: true
+  }).catch(() => null);
+}
+
+async function main() {
+  await removeTemporaryFile();
+
+  const source = await fs.readFile(
+    SOURCE_FILE,
+    'utf8'
+  );
+
+  if (!source.trim()) {
+    throw new Error('Исходный файл index.js пуст');
+  }
+
+  if (source.charCodeAt(0) === 0xfeff) {
+    throw new Error(
+      'index.js содержит нежелательный UTF-8 BOM'
+    );
+  }
+
+  if (!source.includes('exports.handler')) {
+    throw new Error(
+      'В index.js не найден экспорт exports.handler'
+    );
+  }
+
+  const sourceHash = sha256(source);
+
+  const result = await minify(
+    {
+      'index.js': source
+    },
+    {
+      ecma: 2022,
+      module: false,
+      compress: false,
+      mangle: false,
+      toplevel: false,
+      keep_fnames: true,
+      keep_classnames: true,
+      sourceMap: false,
+      format: {
+        beautify: false,
+        comments: 'all',
+        semicolons: true,
+        ascii_only: false,
+        braces: false,
+        preamble:
+          `/* GENERATED_FROM=index.js SOURCE_SHA256=${sourceHash} DO_NOT_EDIT */`
+      }
+    }
+  );
+
+  if (!result || typeof result.code !== 'string') {
+    throw new Error(
+      'Terser не вернул сгенерированный код'
+    );
+  }
+
+  const compact = `${result.code.trim()}\n`;
+
+  if (!compact.includes('exports.handler')) {
+    throw new Error(
+      'В компактной версии исчез exports.handler'
+    );
+  }
+
+  if (
+    !compact.includes(
+      `SOURCE_SHA256=${sourceHash}`
+    )
+  ) {
+    throw new Error(
+      'В компактной версии отсутствует SHA-256 исходника'
+    );
+  }
+
+  if (/sourceMappingURL/i.test(compact)) {
+    throw new Error(
+      'Компактный файл содержит sourceMappingURL'
+    );
+  }
+
+  if (Buffer.byteLength(compact) >= Buffer.byteLength(source)) {
+    throw new Error(
+      'Компактный файл не меньше исходного'
+    );
+  }
+
+  await fs.writeFile(
+    TEMP_FILE,
+    compact,
+    'utf8'
+  );
+
+  await fs.rename(
+    TEMP_FILE,
+    OUTPUT_FILE
+  );
+
+  const sourceBytes = Buffer.byteLength(
+    source,
+    'utf8'
+  );
+  const compactBytes = Buffer.byteLength(
+    compact,
+    'utf8'
+  );
+  const reduction = Math.round(
+    (1 - compactBytes / sourceBytes) * 100
+  );
+
+  console.log('✅ Компактная версия создана');
+  console.log(`Исходник: index.js`);
+  console.log(`Результат: index.compact.js`);
+  console.log(`SHA-256 исходника: ${sourceHash}`);
+  console.log(`Размер исходника: ${sourceBytes} байт`);
+  console.log(`Размер результата: ${compactBytes} байт`);
+  console.log(`Уменьшение: ${reduction}%`);
+}
+
+main().catch(async error => {
+  await removeTemporaryFile();
+
+  console.error(
+    '❌ Ошибка создания компактной версии:',
+    error?.stack || error
+  );
+
+  process.exitCode = 1;
+});
+
+//=================================================
+// FILE: /scripts/check-compact.js
+'use strict';
+
+const assert = require('assert');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+
+const ROOT = path.resolve(__dirname, '..');
+const SOURCE_FILE = path.join(ROOT, 'index.js');
+const COMPACT_FILE = path.join(
+  ROOT,
+  'index.compact.js'
+);
+const PACKAGE_FILE = path.join(
+  ROOT,
+  'package.json'
+);
+
+function sha256(value) {
+  return crypto
+    .createHash('sha256')
+    .update(value)
+    .digest('hex');
+}
+
+function assertFileExists(file) {
+  if (!fs.existsSync(file)) {
+    throw new Error(
+      `Не найден ${path.relative(ROOT, file)}`
+    );
+  }
+
+  const stat = fs.statSync(file);
+
+  if (!stat.isFile()) {
+    throw new Error(
+      `${path.relative(ROOT, file)} не является файлом`
+    );
+  }
+
+  if (!stat.size) {
+    throw new Error(
+      `${path.relative(ROOT, file)} пуст`
+    );
+  }
+
+  return stat;
+}
+
+function checkSyntax(file) {
+  const result = spawnSync(
+    process.execPath,
+    ['--check', file],
+    {
+      cwd: ROOT,
+      encoding: 'utf8',
+      timeout: 30000
+    }
+  );
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  if (result.status !== 0) {
+    throw new Error(
+      [
+        `Синтаксическая ошибка в ${path.basename(file)}`,
+        result.stdout,
+        result.stderr
+      ]
+        .filter(Boolean)
+        .join('\n')
+    );
+  }
+}
+
+function loadFresh(file) {
+  const resolved = require.resolve(file);
+  delete require.cache[resolved];
+  return require(resolved);
+}
+
+function normalizeDynamicValues(value) {
+  if (Array.isArray(value)) {
+    return value.map(normalizeDynamicValues);
+  }
+
+  if (
+    value &&
+    typeof value === 'object'
+  ) {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([key]) =>
+          !['ts'].includes(key)
+        )
+        .map(([key, item]) => [
+          key,
+          normalizeDynamicValues(item)
+        ])
+    );
+  }
+
+  return value;
+}
+
+function parseResponse(response) {
+  const normalized = {
+    ...response
+  };
+
+  if (
+    typeof normalized.body === 'string' &&
+    normalized.body
+  ) {
+    normalized.body = JSON.parse(
+      normalized.body
+    );
+  }
+
+  return normalizeDynamicValues(normalized);
+}
+
+async function callHandler(module, event) {
+  const result = await module.handler(
+    JSON.parse(JSON.stringify(event))
+  );
+
+  return parseResponse(result);
+}
+
+async function compareEvent({
+  name,
+  sourceModule,
+  compactModule,
+  event
+}) {
+  const [sourceResponse, compactResponse] =
+    await Promise.all([
+      callHandler(sourceModule, event),
+      callHandler(compactModule, event)
+    ]);
+
+  assert.deepStrictEqual(
+    compactResponse,
+    sourceResponse,
+    `Ответы не совпадают для проверки: ${name}`
+  );
+
+  console.log(`✅ Совпадает: ${name}`);
+}
+
+async function main() {
+  const sourceStat = assertFileExists(
+    SOURCE_FILE
+  );
+  const compactStat = assertFileExists(
+    COMPACT_FILE
+  );
+  assertFileExists(PACKAGE_FILE);
+
+  checkSyntax(SOURCE_FILE);
+  checkSyntax(COMPACT_FILE);
+
+  const sourceText = fs.readFileSync(
+    SOURCE_FILE,
+    'utf8'
+  );
+  const compactText = fs.readFileSync(
+    COMPACT_FILE,
+    'utf8'
+  );
+
+  if (sourceText.charCodeAt(0) === 0xfeff) {
+    throw new Error('index.js содержит UTF-8 BOM');
+  }
+
+  if (compactText.charCodeAt(0) === 0xfeff) {
+    throw new Error(
+      'index.compact.js содержит UTF-8 BOM'
+    );
+  }
+
+  if (/\r/.test(compactText)) {
+    throw new Error(
+      'index.compact.js содержит CRLF или CR'
+    );
+  }
+
+  if (/sourceMappingURL/i.test(compactText)) {
+    throw new Error(
+      'index.compact.js содержит sourceMappingURL'
+    );
+  }
+
+  if (/\beval\s*\(/.test(compactText)) {
+    throw new Error(
+      'index.compact.js неожиданно содержит eval()'
+    );
+  }
+
+  if (compactStat.size >= sourceStat.size) {
+    throw new Error(
+      'index.compact.js не меньше index.js'
+    );
+  }
+
+  const sourceHash = sha256(sourceText);
+  const marker = `SOURCE_SHA256=${sourceHash}`;
+
+  assert.ok(
+    compactText.includes(marker),
+    'SHA-256 исходника в заголовке compact-файла не совпадает'
+  );
+
+  assert.ok(
+    compactText.includes('exports.handler'),
+    'В compact-файле отсутствует exports.handler'
+  );
+
+  const packageJson = JSON.parse(
+    fs.readFileSync(PACKAGE_FILE, 'utf8')
+  );
+
+  assert.strictEqual(
+    packageJson.type,
+    'commonjs',
+    'package.json должен сохранять type=commonjs'
+  );
+
+  assert.strictEqual(
+    packageJson.main,
+    'index.js',
+    'Главным исходным файлом должен оставаться index.js'
+  );
+
+  const sourceModule = loadFresh(SOURCE_FILE);
+  const compactModule = loadFresh(COMPACT_FILE);
+
+  const sourceExports = Object
+    .keys(sourceModule)
+    .sort();
+
+  const compactExports = Object
+    .keys(compactModule)
+    .sort();
+
+  assert.deepStrictEqual(
+    compactExports,
+    sourceExports,
+    'Наборы экспортов исходной и компактной версий различаются'
+  );
+
+  assert.deepStrictEqual(
+    sourceExports,
+    ['handler'],
+    'Ожидался единственный экспорт handler'
+  );
+
+  assert.strictEqual(
+    typeof sourceModule.handler,
+    'function',
+    'index.js не экспортирует handler'
+  );
+
+  assert.strictEqual(
+    typeof compactModule.handler,
+    'function',
+    'index.compact.js не экспортирует handler'
+  );
+
+  const events = [
+    {
+      name: 'GET ping через query string',
+      event: {
+        httpMethod: 'GET',
+        headers: {},
+        queryStringParameters: {
+          action: 'ping'
+        }
+      }
+    },
+    {
+      name: 'POST ping через JSON body',
+      event: {
+        httpMethod: 'POST',
+        headers: {
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          action: 'ping'
+        }),
+        isBase64Encoded: false
+      }
+    },
+    {
+      name: 'POST ping через base64 body',
+      event: {
+        httpMethod: 'POST',
+        headers: {
+          'content-type': 'application/json'
+        },
+        body: Buffer
+          .from(
+            JSON.stringify({
+              action: 'ping'
+            }),
+            'utf8'
+          )
+          .toString('base64'),
+        isBase64Encoded: true
+      }
+    },
+    {
+      name: 'прямой event action=ping',
+      event: {
+        action: 'ping',
+        headers: {}
+      }
+    },
+    {
+      name: 'неизвестное действие',
+      event: {
+        httpMethod: 'POST',
+        headers: {},
+        body: JSON.stringify({
+          action: '__compact_test_unknown__'
+        })
+      }
+    },
+    {
+      name: 'OPTIONS с разрешённым origin',
+      event: {
+        httpMethod: 'OPTIONS',
+        headers: {
+          origin: 'https://apel-s-in.github.io'
+        }
+      }
+    },
+    {
+      name: 'OPTIONS с null origin',
+      event: {
+        httpMethod: 'OPTIONS',
+        headers: {
+          origin: 'null'
+        }
+      }
+    },
+    {
+      name: 'OPTIONS с custom request headers',
+      event: {
+        httpMethod: 'OPTIONS',
+        headers: {
+          origin: 'https://apel-s-in.github.io',
+          'access-control-request-headers':
+            'Content-Type, X-Vi3-Session'
+        }
+      }
+    }
+  ];
+
+  for (const test of events) {
+    await compareEvent({
+      ...test,
+      sourceModule,
+      compactModule
+    });
+  }
+
+  console.log('');
+  console.log('✅ Все проверки завершены');
+  console.log(`Экспорты: ${sourceExports.join(', ')}`);
+  console.log(`SHA-256: ${sourceHash}`);
+  console.log(`index.js: ${sourceStat.size} байт`);
+  console.log(
+    `index.compact.js: ${compactStat.size} байт`
+  );
+}
+
+main().catch(error => {
+  console.error(
+    '❌ Проверка compact-файла завершилась ошибкой:',
+    error?.stack || error
+  );
+
+  process.exitCode = 1;
+});
+

@@ -78,6 +78,7 @@ jobs:
             echo "Ошибка: генератор изменил index.js"
             git diff -- index.js || true
             exit 1
+          fi
 
       - name: Check generated compact file in pull request
         if: github.event_name == 'pull_request'

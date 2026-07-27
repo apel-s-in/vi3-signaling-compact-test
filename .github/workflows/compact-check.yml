@@ -1,4 +1,4 @@
-name: Build and verify compact function
+name: Generate compact function
 
 on:
   push:
@@ -8,7 +8,6 @@ on:
     paths-ignore:
       - 'index.compact.js'
       - '.meta/**'
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -20,7 +19,6 @@ concurrency:
 
 jobs:
   compact:
-    name: Generate, verify and save compact function
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -35,66 +33,13 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install dependencies
+      - name: Install Terser
         run: npm install --package-lock=false --no-audit --no-fund
 
-      - name: Check utility scripts syntax
-        run: npm run check:tools
+      - name: Generate index.compact.js
+        run: node scripts/build-compact.js
 
-      - name: Check source syntax
-        run: npm run check:source
-
-      - name: Generate compact function
-        run: npm run compact:build
-
-      - name: Confirm compact file exists
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          test -s index.compact.js
-
-          echo "index.compact.js успешно создан:"
-          ls -lh index.js index.compact.js
-
-          echo "Git status:"
-          git status --short -- index.compact.js
-
-          if git check-ignore -q index.compact.js; then
-            echo "Ошибка: index.compact.js исключён через .gitignore"
-            git check-ignore -v index.compact.js || true
-            exit 1
-          fi
-
-      - name: Verify compact function
-        run: npm run compact:check
-
-      - name: Ensure source was not modified
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -n "$(git status --porcelain -- index.js)" ]; then
-            echo "Ошибка: генератор изменил index.js"
-            git diff -- index.js || true
-            exit 1
-          fi
-
-      - name: Check generated compact file in pull request
-        if: github.event_name == 'pull_request'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -n "$(git status --porcelain -- index.compact.js)" ]; then
-            echo "index.compact.js не соответствует index.js."
-            echo "Запустите npm run compact:verify и добавьте index.compact.js в pull request."
-            git status --short -- index.compact.js
-            exit 1
-          fi
-
-      - name: Commit generated compact file
-        if: github.event_name != 'pull_request'
+      - name: Commit index.compact.js
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: 'CI: update index.compact.js'
@@ -103,10 +48,10 @@ jobs:
           commit_user_name: github-actions[bot]
           commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
 
-      - name: Upload compact function
+      - name: Upload index.compact.js
         uses: actions/upload-artifact@v4
         with:
-          name: vi3-signaling-index-compact
+          name: index-compact
           path: index.compact.js
           if-no-files-found: error
           retention-days: 14

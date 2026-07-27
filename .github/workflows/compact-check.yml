@@ -1,4 +1,4 @@
-name: Generate compact function
+name: Generate readable compact function
 
 on:
   push:
@@ -33,16 +33,44 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install Terser
+      - name: Install dependencies
         run: npm install --package-lock=false --no-audit --no-fund
 
-      - name: Generate index.compact.js
+      - name: Check source syntax
+        run: node --check index.js
+
+      - name: Generate readable index.compact.js
         run: node scripts/build-compact.js
+
+      - name: Check compact syntax
+        run: node --check index.compact.js
+
+      - name: Verify compact function
+        run: node scripts/check-compact.js
+
+      - name: Ensure source was not modified
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "$(git status --porcelain -- index.js)" ]; then
+            echo "Ошибка: генератор изменил index.js"
+            git diff -- index.js || true
+            exit 1
+          fi
+
+      - name: Show generated file information
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ls -lh index.js index.compact.js
+          head -n 5 index.compact.js
 
       - name: Commit index.compact.js
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: 'CI: update index.compact.js'
+          commit_message: 'CI: update readable index.compact.js'
           branch: ${{ github.ref_name }}
           file_pattern: 'index.compact.js'
           commit_user_name: github-actions[bot]
@@ -51,7 +79,7 @@ jobs:
       - name: Upload index.compact.js
         uses: actions/upload-artifact@v4
         with:
-          name: index-compact
+          name: index-readable-compact
           path: index.compact.js
           if-no-files-found: error
           retention-days: 14

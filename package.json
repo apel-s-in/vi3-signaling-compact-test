@@ -2,7 +2,7 @@
   "name": "vi3-signaling-compact-test",
   "version": "1.0.0",
   "private": true,
-  "description": "Автоматическая генерация index.compact.js из index.js",
+  "description": "Безопасная генерация и проверка index.compact.js для Yandex Cloud Function vi3-signaling",
   "main": "index.js",
   "type": "commonjs",
   "engines": {
@@ -10,9 +10,12 @@
   },
   "scripts": {
     "check:source": "node --check index.js",
+    "check:tools": "node --check generate-context.js && node --check scripts/build-compact.js && node --check scripts/check-compact.js",
+    "context:build": "node generate-context.js",
     "compact:build": "node scripts/build-compact.js",
     "compact:check": "node scripts/check-compact.js",
-    "compact:verify": "npm run check:source && npm run compact:build && npm run compact:check",
+    "compact:verify": "npm run check:tools && npm run check:source && npm run compact:build && npm run compact:check",
+    "verify": "npm run compact:verify && npm run context:build",
     "build": "npm run compact:verify"
   },
   "dependencies": {
@@ -20,6 +23,6 @@
     "@yandex-cloud/nodejs-sdk": "^2.6.0"
   },
   "devDependencies": {
-    "terser": "^5.31.6"
+    "terser": "5.31.6"
   }
 }

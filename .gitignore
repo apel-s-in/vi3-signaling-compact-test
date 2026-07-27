@@ -1,0 +1,7 @@
+node_modules/
+*.log
+.env
+.env.*
+!.env.example
+index.compact.js.tmp
+.DS_Store

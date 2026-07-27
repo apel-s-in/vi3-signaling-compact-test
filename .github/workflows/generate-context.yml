@@ -1,10 +1,8 @@
-name: Generate repository context
+name: Generate .meta friends context
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
     paths-ignore:
       - '.meta/**'
   workflow_dispatch:
@@ -13,32 +11,30 @@ permissions:
   contents: write
 
 concurrency:
-  group: repository-context-${{ github.ref }}
+  group: war-hearts-context-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  generate:
+  meta:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Generate context
-        run: node generate-context.js
+      - name: Generate Friends context
+        run: |
+          node generate-context.js --mode=both --max-lines=22000
+          ls -la .meta || true
 
-      - name: Commit context
-        uses: stefanzweifel/git-auto-commit-action@v5
+      - uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: 'CI: update repository context'
+          commit_message: "CI: generate friends .meta context"
           branch: ${{ github.ref_name }}
-          file_pattern: '.meta/repository-full.txt'
+          file_pattern: ".meta/project-friends-*.txt"
           commit_user_name: github-actions[bot]
-          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
+          commit_user_email: github-actions[bot]@users.noreply.github.com

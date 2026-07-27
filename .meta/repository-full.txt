@@ -17,7 +17,8 @@ vi3-signaling-compact-test/
 ├── .github/
 │   ├── workflows/
 │   │   ├── compact-check.yml
-│   │   └── generate-context.yml
+│   │   ├── generate-context.yml
+│   │   └── input-compact.yml
 │   └── copilot-instructions.md
 ├── scripts/
 │   ├── build-compact.js
@@ -32,7 +33,7 @@ vi3-signaling-compact-test/
 ├── input.js
 └── package.json
 
-Сгенерировано: 2026-07-27T20:43:29.198Z
+Сгенерировано: 2026-07-27T20:43:51.453Z
 
 //=================================================
 // FILE: /.gitattributes
@@ -237,6 +238,85 @@ jobs:
           file_pattern: '.meta/repository-full.txt'
           commit_user_name: github-actions[bot]
           commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
+
+//=================================================
+// FILE: /.github/workflows/input-compact.yml
+name: Compact ordinary JavaScript file
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'input.js'
+      - 'scripts/compact-core.js'
+      - 'scripts/build-input-compact.js'
+      - 'scripts/check-input-compact.js'
+      - 'package.json'
+      - '.github/workflows/input-compact.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: compact-file-writes-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  input-compact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout latest repository state
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install formatter dependencies
+        run: npm install --package-lock=false --no-audit --no-fund
+
+      - name: Generate ordinary compact file
+        run: npm run input:build
+
+      - name: Verify ordinary file AST
+        run: npm run input:check
+
+      - name: Ensure input.js was not modified
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "$(git status --porcelain -- input.js)" ]; then
+            echo "Ошибка: исходный input.js изменён"
+            git diff -- input.js || true
+            exit 1
+          fi
+
+      - name: Commit output.compact.js
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'CI: update ordinary JavaScript compact file'
+          branch: ${{ github.ref_name }}
+          file_pattern: 'output.compact.js'
+          commit_user_name: github-actions[bot]
+          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
+
+      - name: Upload ordinary JavaScript artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ordinary-javascript-output-compact
+          path: output.compact.js
+          if-no-files-found: error
+          retention-days: 14
 
 //=================================================
 // FILE: /.gitignore

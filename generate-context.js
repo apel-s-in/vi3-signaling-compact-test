@@ -3,255 +3,470 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 
-const argv = Object.fromEntries(process.argv.slice(2).map(a => {
-  const [k, ...r] = a.replace(/^--/, '').split('=');
-  return [k, r.join('=') === '' ? true : r.join('=')];
-}));
+const ROOT = __dirname;
+const META_DIR = path.join(ROOT, '.meta');
+const OUTPUT_FILE = path.join(META_DIR, 'repository-context.txt');
 
-const ROOT = path.resolve(argv.root || __dirname);
-const META_DIR = path.resolve(argv['out-dir'] || path.join(ROOT, '.meta'));
-const MODE = String(argv.mode || 'both').toLowerCase();
-const MAX_LINES = Number(argv['max-lines'] || 22000);
-
-if (!fs.existsSync(META_DIR)) fs.mkdirSync(META_DIR, { recursive: true });
-
-const FULL_FILE = path.join(META_DIR, 'project-friends-full.txt');
-const ADAPTIVE_FILE = path.join(META_DIR, 'project-friends-adaptive.txt');
-
-const toUnix = p => String(p || '').replace(/\\/g, '/');
-const SELF_FULL_REL = toUnix(path.relative(ROOT, FULL_FILE));
-const SELF_ADAPT_REL = toUnix(path.relative(ROOT, ADAPTIVE_FILE));
-
-const TEXT_EXTS = new Set([
-  '.html', '.htm', '.css', '.js', '.mjs', '.cjs', '.ts', '.tsx',
-  '.json', '.webmanifest', '.md', '.txt', '.yml', '.yaml', '.svg'
+const HIDDEN_SOURCE_FILES = new Set([
+  'index.js',
+  'index.compact.js'
 ]);
 
-const BINARY_EXTS = new Set([
-  '.png', '.jpg', '.jpeg', '.webp', '.avif', '.gif', '.ico',
-  '.mp3', '.wav', '.ogg', '.m4a', '.mp4', '.webm',
-  '.woff', '.woff2', '.ttf', '.otf',
-  '.zip', '.7z', '.rar', '.gz', '.pdf'
-]);
-
-const EXCLUDE_RAW = [
-  '.git/**',
-  '.meta/**',
-  'node_modules/**',
-  'dist/**',
-  'build/**',
-  'out/**',
-  'coverage/**',
-  '.cache/**',
-  '.vscode/**',
-  '.idea/**',
-  '.DS_Store',
-  '**/*.log',
-  '**/*.tmp',
-  '**/*.temp',
-  '**/*.bak',
-  '**/*.orig',
-  '**/*.rej',
-  '**/*.map',
-  '**/*.min.js',
-  '**/*.min.css',
-  'package-lock.json',
-  'yarn.lock',
-  'pnpm-lock.yaml',
-  'project-friends-full*.txt',
-  'project-friends-adaptive*.txt'
+const EXCLUDED_PREFIXES = [
+  '.git/',
+  '.meta/',
+  'node_modules/'
 ];
 
-const PRIORITY = {
-  critical: [
-    /^index\.html?$/i,
-    /^styles\.css$/i,
-    /^src\/app\.js$/i,
-    /^\.github\/workflows\/deploy\.ya?ml$/i,
-    /^\.github\/workflows\/generate-context\.ya?ml$/i,
-    /^generate-context\.js$/i,
-    /^ai-rules\.txt$/i,
-    /^README\.md$/i
-  ],
-  high: [
-    /^src\/.*\.(js|mjs|ts)$/i,
-    /^.*\.(css|html?)$/i,
-    /^\.github\/workflows\/.*\.ya?ml$/i
-  ],
-  medium: [
-    /^.*\.(js|mjs|cjs|ts|tsx|json|md|txt|ya?ml|css|html?|svg)$/i
-  ]
+const TEXT_EXTENSIONS = new Set([
+  '.cjs',
+  '.css',
+  '.csv',
+  '.graphql',
+  '.htm',
+  '.html',
+  '.ini',
+  '.js',
+  '.json',
+  '.jsonc',
+  '.jsx',
+  '.md',
+  '.mjs',
+  '.properties',
+  '.scss',
+  '.sh',
+  '.svg',
+  '.toml',
+  '.ts',
+  '.tsx',
+  '.txt',
+  '.webmanifest',
+  '.xml',
+  '.yaml',
+  '.yml'
+]);
+
+const TEXT_FILE_NAMES = new Set([
+  '.editorconfig',
+  '.env.example',
+  '.gitattributes',
+  '.gitignore',
+  '.npmrc',
+  'AGENTS.md',
+  'Dockerfile',
+  'LICENSE',
+  'Makefile',
+  'README',
+  'README.md'
+]);
+
+const toUnix = value =>
+  String(value || '').replace(/\\/g, '/');
+
+const isExcluded = relative => {
+  const file = toUnix(relative);
+
+  return (
+    !file ||
+    file === '.meta' ||
+    file === 'node_modules' ||
+    EXCLUDED_PREFIXES.some(prefix =>
+      file.startsWith(prefix)
+    )
+  );
 };
 
-const globToRegExp = p => {
-  const hasPath = p.includes('/') || p.includes('**');
-  const esc = p
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*\*/g, '___GLOBSTAR___')
-    .replace(/\*/g, '[^/]*')
-    .replace(/___GLOBSTAR___/g, '.*');
-  return hasPath ? new RegExp(`^${esc}$`) : new RegExp(`(^|/)${esc}(/|$)`);
-};
+const sha256 = buffer =>
+  crypto
+    .createHash('sha256')
+    .update(buffer)
+    .digest('hex');
 
-const EXCLUDES = EXCLUDE_RAW.map(globToRegExp);
+const getRepositoryName = () =>
+  String(
+    process.env.GITHUB_REPOSITORY ||
+    path.basename(ROOT)
+  ).trim();
 
-const isExcluded = rel => {
-  const u = toUnix(rel);
-  if (!u || u === SELF_FULL_REL || u === SELF_ADAPT_REL) return true;
-  return EXCLUDES.some(re => re.test(u));
-};
+const getRepositoryUrl = () => {
+  const repository = String(
+    process.env.GITHUB_REPOSITORY || ''
+  ).trim();
 
-const isTextFile = rel => {
-  const ext = path.extname(rel).toLowerCase();
-  if (BINARY_EXTS.has(ext)) return false;
-  return TEXT_EXTS.has(ext);
-};
+  if (repository) {
+    return `https://github.com/${repository}`;
+  }
 
-const readText = rel => {
   try {
-    return fs.readFileSync(path.join(ROOT, rel), 'utf8');
-  } catch (e) {
-    return `// read error: ${e.message}`;
+    const result = execFileSync(
+      'git',
+      ['config', '--get', 'remote.origin.url'],
+      {
+        cwd: ROOT,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore']
+      }
+    ).trim();
+
+    return result || 'не определён';
+  } catch {
+    return 'не определён';
   }
 };
 
-const countLines = s => (String(s || '').match(/\n/g) || []).length + (String(s || '').length ? 1 : 0);
+const listTrackedFiles = () => {
+  try {
+    const output = execFileSync(
+      'git',
+      ['ls-files', '-z'],
+      {
+        cwd: ROOT,
+        encoding: 'buffer',
+        maxBuffer: 64 * 1024 * 1024
+      }
+    );
 
-const listAllEntries = includeFiles => {
-  const out = [];
+    return output
+      .toString('utf8')
+      .split('\0')
+      .map(toUnix)
+      .filter(Boolean)
+      .filter(file => !isExcluded(file))
+      .sort((left, right) =>
+        left.localeCompare(right, 'en')
+      );
+  } catch {
+    return listFilesFallback();
+  }
+};
+
+const listFilesFallback = () => {
+  const files = [];
   const stack = [ROOT];
 
   while (stack.length) {
-    const dir = stack.pop();
+    const directory = stack.pop();
     let entries = [];
+
     try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
+      entries = fs.readdirSync(directory, {
+        withFileTypes: true
+      });
     } catch {
       continue;
     }
 
-    for (const item of entries) {
-      const full = path.join(dir, item.name);
-      const rel = toUnix(path.relative(ROOT, full)) || '.';
-      if (isExcluded(rel)) continue;
+    entries.forEach(entry => {
+      const absolute = path.join(
+        directory,
+        entry.name
+      );
+      const relative = toUnix(
+        path.relative(ROOT, absolute)
+      );
 
-      if (item.isDirectory()) {
-        out.push({ rel, full, dir: true });
-        stack.push(full);
-      } else if (item.isFile() && includeFiles) {
-        out.push({ rel, full, dir: false });
+      if (isExcluded(relative)) return;
+
+      if (entry.isDirectory()) {
+        stack.push(absolute);
+      } else if (entry.isFile()) {
+        files.push(relative);
       }
+    });
+  }
+
+  return files.sort((left, right) =>
+    left.localeCompare(right, 'en')
+  );
+};
+
+const isProbablyText = (relative, buffer) => {
+  const name = path.basename(relative);
+  const extension =
+    path.extname(relative).toLowerCase();
+
+  if (
+    TEXT_EXTENSIONS.has(extension) ||
+    TEXT_FILE_NAMES.has(name)
+  ) {
+    return true;
+  }
+
+  if (!buffer.length) return true;
+
+  const sample = buffer.subarray(
+    0,
+    Math.min(buffer.length, 8192)
+  );
+
+  if (sample.includes(0)) return false;
+
+  let suspicious = 0;
+
+  for (const byte of sample) {
+    const allowedControl =
+      byte === 9 ||
+      byte === 10 ||
+      byte === 13;
+
+    if (
+      byte < 32 &&
+      !allowedControl
+    ) {
+      suspicious++;
     }
   }
 
-  return out.sort((a, b) => a.dir !== b.dir ? (a.dir ? -1 : 1) : a.rel.localeCompare(b.rel));
+  return suspicious / sample.length < 0.01;
 };
 
-const getPriority = rel => {
-  const u = toUnix(rel);
-  return Object.keys(PRIORITY).find(level => PRIORITY[level].some(re => re.test(u))) || 'low';
-};
+const buildTree = files => {
+  const root = {
+    directories: new Map(),
+    files: []
+  };
 
-const readRepoUrl = () => {
-  try {
-    const cfg = path.join(ROOT, '.git', 'config');
-    if (!fs.existsSync(cfg)) return '';
-    return (fs.readFileSync(cfg, 'utf8').match(/url\s*=\s*(.+)\n/) || [])[1]?.trim() || '';
-  } catch {
-    return '';
-  }
-};
+  files.forEach(relative => {
+    const parts = relative.split('/');
+    const fileName = parts.pop();
+    let current = root;
 
-const renderTree = () => {
-  const lines = ['СТРУКТУРА ПРОЕКТА:', `${path.basename(ROOT)}/`];
+    parts.forEach(part => {
+      if (!current.directories.has(part)) {
+        current.directories.set(part, {
+          directories: new Map(),
+          files: []
+        });
+      }
 
-  const walk = (dir, prefix = '') => {
-    let entries = [];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
+      current = current.directories.get(part);
+    });
+
+    current.files.push(fileName);
+  });
+
+  const lines = [
+    'СТРУКТУРА РЕПОЗИТОРИЯ:'
+  ];
+
+  const render = (node, currentPath = '') => {
+    const displayPath = currentPath
+      ? `/${currentPath}/`
+      : '/';
+
+    const fileNames = [...node.files]
+      .sort((left, right) =>
+        left.localeCompare(right, 'en')
+      );
+
+    if (fileNames.length) {
+      lines.push(
+        `[${displayPath}] ${fileNames.join(', ')}`
+      );
     }
 
-    const visible = entries
-      .filter(x => !isExcluded(toUnix(path.relative(ROOT, path.join(dir, x.name)))))
-      .sort((a, b) => a.isDirectory() !== b.isDirectory() ? (a.isDirectory() ? -1 : 1) : a.name.localeCompare(b.name));
+    const directories = [
+      ...node.directories.entries()
+    ].sort(([left], [right]) =>
+      left.localeCompare(right, 'en')
+    );
 
-    visible.forEach((x, i) => {
-      const last = i === visible.length - 1;
-      lines.push(`${prefix}${last ? '└── ' : '├── '}${x.name}${x.isDirectory() ? '/' : ''}`);
-      if (x.isDirectory()) walk(path.join(dir, x.name), `${prefix}${last ? '    ' : '│   '}`);
+    if (
+      !fileNames.length &&
+      !directories.length
+    ) {
+      lines.push(`[${displayPath}] (пусто)`);
+    }
+
+    directories.forEach(([name, child]) => {
+      render(
+        child,
+        currentPath
+          ? `${currentPath}/${name}`
+          : name
+      );
     });
   };
 
-  walk(ROOT);
+  render(root);
   return lines.join('\n');
 };
 
-const headerBlock = () => {
-  const rulesPath = path.join(ROOT, 'ai-rules.txt');
-  const rules = fs.existsSync(rulesPath) ? `${fs.readFileSync(rulesPath, 'utf8').trim()}\n\n` : '';
-  const repoName = String(argv['repo-name'] || path.basename(ROOT));
-  const repoUrl = String(argv['repo-url'] || readRepoUrl() || 'https://github.com/apel-s-in/vi3na1bita-friends');
+const hiddenSourceBlock = (
+  relative,
+  buffer
+) => `//=================================================
+// FILE: /${relative}
+// CONTENT OMITTED INTENTIONALLY
+// Причина: исходный или сгенерированный файл Cloud Function исключён из полного контекста.
+// Размер: ${buffer.length} байт
+// SHA-256: ${sha256(buffer)}
+`;
 
-  return `${rules}Название репозитория: ${repoName}
-Адрес репозитория: ${repoUrl}
-Назначение: отдельный сетевой модуль Друзья для vi3na1bita-music.
-Публичный путь после деплоя: https://vi3na1bita.website.yandexcloud.net/Friends/
-Проект делается и обслуживается средствами https://github.com/ + GitHub Actions + Yandex Object Storage.
+const binaryFileBlock = (
+  relative,
+  buffer
+) => `//=================================================
+// FILE: /${relative}
+// BINARY OR NON-TEXT FILE
+// Полный текст не включён.
+// Размер: ${buffer.length} байт
+// SHA-256: ${sha256(buffer)}
+`;
 
-${renderTree()}
+const textFileBlock = (
+  relative,
+  buffer
+) => {
+  const text = buffer
+    .toString('utf8')
+    .replace(/\r\n/g, '\n');
 
-Сгенерировано: ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC
+  return `//=================================================
+// FILE: /${relative}
+${text}${text.endsWith('\n') ? '' : '\n'}`;
+};
+
+const buildFileBlock = relative => {
+  const absolute = path.join(ROOT, relative);
+  let buffer;
+
+  try {
+    buffer = fs.readFileSync(absolute);
+  } catch (error) {
+    return `//=================================================
+// FILE: /${relative}
+// READ ERROR: ${error.message}
+`;
+  }
+
+  if (HIDDEN_SOURCE_FILES.has(relative)) {
+    return hiddenSourceBlock(relative, buffer);
+  }
+
+  if (!isProbablyText(relative, buffer)) {
+    return binaryFileBlock(relative, buffer);
+  }
+
+  return textFileBlock(relative, buffer);
+};
+
+const buildHeader = ({
+  files,
+  textFiles,
+  binaryFiles
+}) => {
+  const generatedAt = new Date().toISOString();
+
+  return `КОНТЕКСТ ТЕСТОВОГО РЕПОЗИТОРИЯ
+
+Название репозитория: ${getRepositoryName()}
+Адрес репозитория: ${getRepositoryUrl()}
+Сформировано: ${generatedAt}
+
+НАЗНАЧЕНИЕ:
+Диагностика автоматической генерации index.compact.js из index.js.
+
+ПРАВИЛА ЭТОГО КОНТЕКСТА:
+- Дерево содержит все отслеживаемые Git файлы, кроме содержимого .meta.
+- Полный текст index.js намеренно не включён.
+- Полный текст index.compact.js намеренно не включён.
+- Для index.js и index.compact.js указаны только размер и SHA-256.
+- Полный текст остальных текстовых файлов включён.
+- Для бинарных файлов указаны только размер и SHA-256.
+- node_modules, .git и .meta не включаются.
+- Переменные окружения и GitHub Secrets не читаются и не выводятся.
+
+СВОДКА:
+- Файлов в дереве: ${files}
+- Текстовых файлов с содержимым: ${textFiles}
+- Бинарных или нетекстовых файлов: ${binaryFiles}
+- Исключённых исходников: ${HIDDEN_SOURCE_FILES.size}
 
 `;
 };
 
-const fileBlock = rel => `//=================================================
-// FILE: /${toUnix(rel)}
-${readText(rel)}
-`;
+const main = () => {
+  const files = listTrackedFiles();
 
-const generate = mode => {
-  let out = headerBlock();
-  let lines = countLines(out);
-
-  const groups = listAllEntries(true)
-    .filter(e => !e.dir && isTextFile(e.rel))
-    .reduce((acc, e) => {
-      acc[getPriority(e.rel)].push(e.rel);
-      return acc;
-    }, { critical: [], high: [], medium: [], low: [] });
-
-  const order = mode === 'adaptive' ? ['critical', 'high', 'medium'] : ['critical', 'high', 'medium', 'low'];
-
-  for (const level of order) {
-    for (const rel of groups[level]) {
-      const block = fileBlock(rel);
-      const blockLines = countLines(block);
-      if (mode === 'adaptive' && lines + blockLines > MAX_LINES) {
-        return `${out}\n// ... adaptive context truncated by --max-lines=${MAX_LINES}\n`;
-      }
-      out += block;
-      lines += blockLines;
-    }
+  if (!files.length) {
+    throw new Error(
+      'В репозитории не найдено отслеживаемых файлов'
+    );
   }
 
-  return out;
+  let textFiles = 0;
+  let binaryFiles = 0;
+
+  files.forEach(relative => {
+    if (HIDDEN_SOURCE_FILES.has(relative)) return;
+
+    const absolute = path.join(ROOT, relative);
+
+    try {
+      const buffer = fs.readFileSync(absolute);
+
+      if (isProbablyText(relative, buffer)) {
+        textFiles++;
+      } else {
+        binaryFiles++;
+      }
+    } catch {}
+  });
+
+  let output = buildHeader({
+    files: files.length,
+    textFiles,
+    binaryFiles
+  });
+
+  output += `${buildTree(files)}\n\n`;
+
+  files.forEach(relative => {
+    output += `${buildFileBlock(relative)}\n`;
+  });
+
+  fs.mkdirSync(META_DIR, {
+    recursive: true
+  });
+
+  const temporaryFile =
+    `${OUTPUT_FILE}.tmp`;
+
+  fs.writeFileSync(
+    temporaryFile,
+    output,
+    'utf8'
+  );
+
+  fs.renameSync(
+    temporaryFile,
+    OUTPUT_FILE
+  );
+
+  const outputSize =
+    fs.statSync(OUTPUT_FILE).size;
+
+  console.log(
+    `✅ Создан ${toUnix(
+      path.relative(ROOT, OUTPUT_FILE)
+    )}`
+  );
+  console.log(`Файлов в дереве: ${files.length}`);
+  console.log(`Текстовых файлов: ${textFiles}`);
+  console.log(`Бинарных файлов: ${binaryFiles}`);
+  console.log(`Размер контекста: ${outputSize} байт`);
 };
 
 try {
-  if (MODE === 'full' || MODE === 'both') {
-    fs.writeFileSync(FULL_FILE, generate('full'), 'utf8');
-    console.log(`✅ ${FULL_FILE}`);
-  }
-
-  if (MODE === 'adaptive' || MODE === 'both') {
-    fs.writeFileSync(ADAPTIVE_FILE, generate('adaptive'), 'utf8');
-    console.log(`✅ ${ADAPTIVE_FILE}`);
-  }
-} catch (e) {
-  console.error('❌ context generation failed:', e);
+  main();
+} catch (error) {
+  console.error(
+    '❌ Ошибка генерации контекста:',
+    error?.stack || error
+  );
   process.exit(1);
 }

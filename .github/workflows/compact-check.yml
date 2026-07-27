@@ -1,85 +1,76 @@
-name: Generate readable compact function
+name: Compact Cloud Function
 
 on:
   push:
     branches:
       - main
       - master
-    paths-ignore:
-      - 'index.compact.js'
-      - '.meta/**'
+    paths:
+      - 'index.js'
+      - 'scripts/compact-core.js'
+      - 'scripts/build-compact.js'
+      - 'scripts/check-compact.js'
+      - 'package.json'
+      - '.github/workflows/compact-check.yml'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: compact-build-${{ github.ref }}
-  cancel-in-progress: true
+  group: compact-file-writes-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  compact:
+  function-compact:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      - name: Checkout repository
+      - name: Checkout latest repository state
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.ref_name }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install dependencies
+      - name: Install formatter dependencies
         run: npm install --package-lock=false --no-audit --no-fund
 
-      - name: Check source syntax
-        run: node --check index.js
+      - name: Generate Cloud Function compact file
+        run: npm run function:build
 
-      - name: Generate readable index.compact.js
-        run: node scripts/build-compact.js
+      - name: Verify Cloud Function AST
+        run: npm run function:check
 
-      - name: Check compact syntax
-        run: node --check index.compact.js
-
-      - name: Verify compact function
-        run: node scripts/check-compact.js
-
-      - name: Ensure source was not modified
+      - name: Ensure index.js was not modified
         shell: bash
         run: |
           set -euo pipefail
 
           if [ -n "$(git status --porcelain -- index.js)" ]; then
-            echo "Ошибка: генератор изменил index.js"
+            echo "Ошибка: исходный index.js изменён"
             git diff -- index.js || true
             exit 1
           fi
 
-      - name: Show generated file information
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ls -lh index.js index.compact.js
-          head -n 5 index.compact.js
-
       - name: Commit index.compact.js
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: 'CI: update readable index.compact.js'
+          commit_message: 'CI: update Cloud Function compact file'
           branch: ${{ github.ref_name }}
           file_pattern: 'index.compact.js'
           commit_user_name: github-actions[bot]
           commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
 
-      - name: Upload index.compact.js
+      - name: Upload Cloud Function artifact
         uses: actions/upload-artifact@v4
         with:
-          name: index-readable-compact
+          name: cloud-function-index-compact
           path: index.compact.js
           if-no-files-found: error
           retention-days: 14

@@ -1,53 +1,134 @@
-name: Compact build check
+name: Build and verify compact function
 
 on:
   push:
     branches:
       - main
       - master
+    paths-ignore:
+      - 'index.compact.js'
+      - '.meta/**'
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: compact-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  compact-check:
-    name: Build and verify index.compact.js
+  compact:
+    name: Generate, verify and save compact function
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
+          node-version: '20'
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install --package-lock=false --no-audit --no-fund
 
-      - name: Generate and verify compact file
-        run: npm run compact:verify
+      - name: Check utility scripts syntax
+        run: npm run check:tools
 
-      - name: Check that generated file is committed
+      - name: Check source syntax
+        run: npm run check:source
+
+      - name: Generate compact function
+        run: npm run compact:build
+
+      - name: Verify compact function
+        run: npm run compact:check
+
+      - name: Ensure source was not modified
         shell: bash
         run: |
-          if [ -n "$(git status --porcelain -- index.compact.js)" ]; then
-            echo "index.compact.js не соответствует index.js."
-            echo "Выполните локально: npm run compact:verify"
-            echo "После этого добавьте index.compact.js в коммит."
-            git status --short -- index.compact.js
-            git diff -- index.compact.js || true
+          set -euo pipefail
+
+          if [ -n "$(git status --porcelain -- index.js)" ]; then
+            echo "Ошибка: генератор изменил index.js"
+            git diff -- index.js || true
             exit 1
           fi
 
-      - name: Upload compact file
+      - name: Generate repository context
+        run: npm run context:build
+
+      - name: Validate generated context
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          context=".meta/project-signaling-compact-full.txt"
+
+          test -s "$context"
+
+          grep -Fq "Название репозитория:" "$context"
+          grep -Fq "СТРУКТУРА ПРОЕКТА:" "$context"
+
+          if grep -Fq "// FILE: /index.js" "$context"; then
+            echo "Ошибка: index.js попал в контекст"
+            exit 1
+          fi
+
+          if grep -Fq "// FILE: /index.compact.js" "$context"; then
+            echo "Ошибка: index.compact.js попал в контекст"
+            exit 1
+          fi
+
+          if grep -Fq "project-friends-adaptive" "$context"; then
+            echo "Ошибка: в контексте осталось старое adaptive-имя"
+            exit 1
+          fi
+
+          echo "Контекст проверен:"
+          ls -lh "$context"
+
+      - name: Check generated files in pull request
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "$(git status --porcelain -- index.compact.js .meta/project-signaling-compact-full.txt)" ]; then
+            echo "Сгенерированные файлы не соответствуют исходникам."
+            echo "Запустите npm run verify и добавьте результат в pull request."
+            git status --short -- index.compact.js .meta/project-signaling-compact-full.txt
+            exit 1
+          fi
+
+      - name: Commit generated files
+        if: github.event_name != 'pull_request'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'CI: update compact function and repository context'
+          branch: ${{ github.ref_name }}
+          file_pattern: 'index.compact.js .meta/project-signaling-compact-full.txt'
+          commit_user_name: github-actions[bot]
+          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
+
+      - name: Upload compact function
         uses: actions/upload-artifact@v4
         with:
-          name: index-compact
+          name: vi3-signaling-index-compact
           path: index.compact.js
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload repository context
+        uses: actions/upload-artifact@v4
+        with:
+          name: vi3-signaling-repository-context
+          path: .meta/project-signaling-compact-full.txt
           if-no-files-found: error
           retention-days: 14

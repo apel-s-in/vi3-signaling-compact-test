@@ -1,77 +1,40 @@
-name: Regenerate repository context
+name: Generate .meta friends context
 
 on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '.meta/**'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: signaling-context-${{ github.ref }}
+  group: war-hearts-context-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  context:
-    name: Generate full compact-test context
+  meta:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Validate generator syntax
-        run: node --check generate-context.js
-
-      - name: Generate context
-        run: node generate-context.js
-
-      - name: Validate context
-        shell: bash
+      - name: Generate Friends context
         run: |
-          set -euo pipefail
+          node generate-context.js --mode=both --max-lines=22000
+          ls -la .meta || true
 
-          context=".meta/project-signaling-compact-full.txt"
-
-          test -s "$context"
-
-          if grep -Fq "// FILE: /index.js" "$context"; then
-            echo "index.js попал в контекст"
-            exit 1
-          fi
-
-          if grep -Fq "// FILE: /index.compact.js" "$context"; then
-            echo "index.compact.js попал в контекст"
-            exit 1
-          fi
-
-          if [ -e ".meta/project-friends-adaptive.txt" ]; then
-            echo "Удалите старый project-friends-adaptive.txt"
-            exit 1
-          fi
-
-          ls -lh "$context"
-
-      - name: Commit context
-        uses: stefanzweifel/git-auto-commit-action@v5
+      - uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: 'CI: regenerate signaling compact context'
+          commit_message: "CI: generate friends .meta context"
           branch: ${{ github.ref_name }}
-          file_pattern: '.meta/project-signaling-compact-full.txt'
+          file_pattern: ".meta/project-friends-*.txt"
           commit_user_name: github-actions[bot]
-          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
-
-      - name: Upload context
-        uses: actions/upload-artifact@v4
-        with:
-          name: vi3-signaling-repository-context
-          path: .meta/project-signaling-compact-full.txt
-          if-no-files-found: error
-          retention-days: 14
+          commit_user_email: github-actions[bot]@users.noreply.github.com

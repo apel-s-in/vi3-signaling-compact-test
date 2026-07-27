@@ -32,7 +32,7 @@ vi3-signaling-compact-test/
 ├── input.js
 └── package.json
 
-Сгенерировано: 2026-07-27T20:42:50.726Z
+Сгенерировано: 2026-07-27T20:43:07.409Z
 
 //=================================================
 // FILE: /.gitattributes
@@ -1602,33 +1602,29 @@ export default listeningReceiptService;
 //=================================================
 // FILE: /package.json
 {
-  "name": "vi3-signaling-compact-test",
-  "version": "1.0.0",
+  "name": "javascript-readable-compact-test",
+  "version": "2.0.0",
   "private": true,
-  "description": "Генерация читаемой компактной версии index.compact.js для Yandex Cloud Function vi3-signaling",
-  "main": "index.js",
+  "description": "Два независимых контура безопасного компактного форматирования JavaScript",
   "type": "commonjs",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "check:source": "node --check index.js",
-    "check:tools": "node --check generate-context.js && node --check scripts/build-compact.js && node --check scripts/check-compact.js",
+    "check:tools": "node --check generate-context.js && node --check scripts/compact-core.js && node --check scripts/build-compact.js && node --check scripts/check-compact.js && node --check scripts/build-input-compact.js && node --check scripts/check-input-compact.js",
+    "function:build": "node scripts/build-compact.js",
+    "function:check": "node scripts/check-compact.js",
+    "function:verify": "npm run check:tools && npm run function:build && npm run function:check",
+    "input:build": "node scripts/build-input-compact.js",
+    "input:check": "node scripts/check-input-compact.js",
+    "input:verify": "npm run check:tools && npm run input:build && npm run input:check",
     "context:build": "node generate-context.js",
-    "compact:build": "node scripts/build-compact.js",
-    "compact:check": "node scripts/check-compact.js",
-    "compact:verify": "npm run check:tools && npm run check:source && npm run compact:build && npm run compact:check",
-    "verify": "npm run compact:verify && npm run context:build",
-    "build": "npm run compact:verify"
+    "verify": "npm run function:verify && npm run input:verify"
   },
-  "dependencies": {
-    "ydb-sdk": "^5.9.0",
-    "@yandex-cloud/nodejs-sdk": "^2.6.0"
-  },
-"devDependencies": {
-  "@babel/parser": "7.28.0",
-  "prettier": "3.6.2"
-}
+  "devDependencies": {
+    "@babel/parser": "7.28.0",
+    "prettier": "3.6.2"
+  }
 }
 
 //=================================================

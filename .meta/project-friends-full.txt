@@ -18,12 +18,11 @@ vi3-signaling-compact-test/
 │   └── check-compact.js
 ├── .gitattributes
 ├── .gitignore
-├── AGENTS.md
 ├── generate-context.js
 ├── index.js
 └── package.json
 
-Сгенерировано: 2026-07-27 18:20:49 UTC
+Сгенерировано: 2026-07-27 18:21:06 UTC
 
 //=================================================
 // FILE: /.github/workflows/generate-context.yml
@@ -468,83 +467,6 @@ jobs:
 //=================================================
 // FILE: /.github/copilot-instructions.md
 
-
-//=================================================
-// FILE: /AGENTS.md
-# Правила репозитория vi3-signaling-compact-test
-
-## Назначение
-
-Репозиторий используется для безопасной автоматической генерации компактной версии Yandex Cloud Function `vi3-signaling`.
-
-## Основные файлы
-
-- `index.js` — единственный редактируемый исходник Cloud Function.
-- `index.compact.js` — автоматически сгенерированный файл.
-- `scripts/build-compact.js` — генератор compact-файла.
-- `scripts/check-compact.js` — защитные и поведенческие проверки.
-- `generate-context.js` — генератор контекста репозитория.
-- `.meta/project-signaling-compact-full.txt` — автоматически сгенерированный контекст.
-
-## Запрет ручного редактирования
-
-Нельзя вручную редактировать:
-
-- `index.compact.js`;
-- `.meta/project-signaling-compact-full.txt`.
-
-Функциональные изменения разрешено вносить только в:
-
-- `index.js`;
-- служебные скрипты, если задача относится к процессу генерации.
-
-## Ограничения Terser
-
-Генератор обязан сохранять следующие настройки:
-
-- `compress: false`;
-- `mangle: false`;
-- `toplevel: false`;
-- `keep_fnames: true`;
-- `keep_classnames: true`;
-- `module: false`;
-- `sourceMap: false`.
-
-Нельзя включать оптимизацию логики или переименование идентификаторов без отдельного запроса.
-
-## Обязательная проверка
-
-После изменения `index.js` необходимо выполнить:
-
-```bash
-npm run compact:verify
-
-Для полной локальной проверки:
-
-bash
-
-npm run verify
-Требования к compact-файлу
-index.compact.js должен:
-
-иметь корректный синтаксис;
-сохранять CommonJS;
-экспортировать handler;
-иметь тот же набор экспортов, что и index.js;
-содержать SHA-256 исходного файла;
-быть меньше исходного файла;
-не содержать source map;
-давать такие же ответы на безопасные проверки ping, неизвестного action и OPTIONS.
-Контекст репозитория
-В контекст запрещено включать:
-
-содержимое index.js;
-содержимое index.compact.js;
-названия этих файлов в дереве контекста;
-.git;
-.meta;
-node_modules;
-временные и сгенерированные вспомогательные файлы.
 
 //=================================================
 // FILE: /index.js

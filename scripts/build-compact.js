@@ -3,18 +3,14 @@
 const crypto = require('crypto');
 const fs = require('fs/promises');
 const path = require('path');
-const { minify } = require('terser');
+const prettier = require('prettier');
 
 const ROOT = path.resolve(__dirname, '..');
 const SOURCE_FILE = path.join(ROOT, 'index.js');
-const OUTPUT_FILE = path.join(
-  ROOT,
-  'index.compact.js'
-);
-const TEMP_FILE = path.join(
-  ROOT,
-  'index.compact.js.tmp'
-);
+const OUTPUT_FILE = path.join(ROOT, 'index.compact.js');
+const TEMP_FILE = path.join(ROOT, 'index.compact.js.tmp');
+
+const PRINT_WIDTH = 240;
 
 function sha256(value) {
   return crypto
@@ -55,38 +51,33 @@ async function main() {
 
   const sourceHash = sha256(source);
 
-  const result = await minify(
+  const formatted = await prettier.format(
+    source,
     {
-      'index.js': source
-    },
-    {
-      ecma: 2022,
-      module: false,
-      compress: false,
-      mangle: false,
-      toplevel: false,
-      keep_fnames: true,
-      keep_classnames: true,
-      sourceMap: false,
-      format: {
-        beautify: false,
-        comments: 'all',
-        semicolons: true,
-        ascii_only: false,
-        braces: false,
-        preamble:
-          `/* GENERATED_FROM=index.js SOURCE_SHA256=${sourceHash} DO_NOT_EDIT */`
-      }
+      parser: 'babel',
+      printWidth: PRINT_WIDTH,
+      tabWidth: 2,
+      useTabs: false,
+      semi: true,
+      singleQuote: true,
+      quoteProps: 'as-needed',
+      jsxSingleQuote: false,
+      trailingComma: 'none',
+      bracketSpacing: true,
+      bracketSameLine: false,
+      arrowParens: 'avoid',
+      proseWrap: 'never',
+      endOfLine: 'lf',
+      objectWrap: 'collapse',
+      embeddedLanguageFormatting: 'off'
     }
   );
 
-  if (!result || typeof result.code !== 'string') {
-    throw new Error(
-      'Terser не вернул сгенерированный код'
-    );
-  }
+  const banner =
+    `/* GENERATED_FROM=index.js SOURCE_SHA256=${sourceHash} ` +
+    `FORMAT=READABLE_COMPACT PRINT_WIDTH=${PRINT_WIDTH} DO_NOT_EDIT */`;
 
-  const compact = `${result.code.trim()}\n`;
+  const compact = `${banner}\n${formatted.trim()}\n`;
 
   if (!compact.includes('exports.handler')) {
     throw new Error(
@@ -110,12 +101,6 @@ async function main() {
     );
   }
 
-  if (Buffer.byteLength(compact) >= Buffer.byteLength(source)) {
-    throw new Error(
-      'Компактный файл не меньше исходного'
-    );
-  }
-
   await fs.writeFile(
     TEMP_FILE,
     compact,
@@ -135,17 +120,21 @@ async function main() {
     compact,
     'utf8'
   );
-  const reduction = Math.round(
-    (1 - compactBytes / sourceBytes) * 100
-  );
+  const reduction = sourceBytes > 0
+    ? Math.round(
+        (1 - compactBytes / sourceBytes) * 100
+      )
+    : 0;
 
-  console.log('✅ Компактная версия создана');
-  console.log(`Исходник: index.js`);
-  console.log(`Результат: index.compact.js`);
+  console.log('✅ Читаемая компактная версия создана');
+  console.log('Формат: Prettier readable compact');
+  console.log(`Ширина строки: ${PRINT_WIDTH}`);
+  console.log('Исходник: index.js');
+  console.log('Результат: index.compact.js');
   console.log(`SHA-256 исходника: ${sourceHash}`);
   console.log(`Размер исходника: ${sourceBytes} байт`);
   console.log(`Размер результата: ${compactBytes} байт`);
-  console.log(`Уменьшение: ${reduction}%`);
+  console.log(`Изменение размера: ${reduction}%`);
 }
 
 main().catch(async error => {

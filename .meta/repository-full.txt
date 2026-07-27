@@ -33,7 +33,7 @@ vi3-signaling-compact-test/
 ├── generate-context.js
 └── package.json
 
-Сгенерировано: 2026-07-27T21:02:38.201Z
+Сгенерировано: 2026-07-27T21:03:07.458Z
 
 //=================================================
 // FILE: /.gitattributes
@@ -95,11 +95,8 @@ jobs:
       - name: Install formatter dependencies
         run: npm install --package-lock=false --no-audit --no-fund
 
-      - name: Generate Cloud Function compact file
-        run: npm run function:build
-
-      - name: Verify Cloud Function AST
-        run: npm run function:check
+      - name: Generate and verify Cloud Function
+        run: npm run function:verify
 
       - name: Ensure index.js was not modified
         shell: bash

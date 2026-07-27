@@ -14,7 +14,7 @@ node_modules/
 index.compact.js.tmp
 
 .meta/*
-!.meta/project-signaling-compact-full.txt
+!.meta/repository-full.txt
 
 .DS_Store
 Thumbs.db

@@ -33,7 +33,7 @@ vi3-signaling-compact-test/
 ├── input.js
 └── package.json
 
-Сгенерировано: 2026-07-27T20:43:51.453Z
+Сгенерировано: 2026-07-27T20:44:25.969Z
 
 //=================================================
 // FILE: /.gitattributes
@@ -47,6 +47,7 @@ vi3-signaling-compact-test/
 *.yaml text eol=lf
 
 index.compact.js linguist-generated=true
+output.compact.js linguist-generated=true
 .meta/repository-full.txt linguist-generated=true
 
 //=================================================
@@ -334,6 +335,7 @@ node_modules/
 *.rej
 
 index.compact.js.tmp
+output.compact.js.tmp
 
 .meta/*
 !.meta/repository-full.txt

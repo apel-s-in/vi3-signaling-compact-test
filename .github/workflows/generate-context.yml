@@ -1,4 +1,4 @@
-name: Generate .meta friends context
+name: Generate repository context
 
 on:
   push:
@@ -11,30 +11,80 @@ permissions:
   contents: write
 
 concurrency:
-  group: war-hearts-context-${{ github.ref }}
+  group: generate-context-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  meta:
+  generate-context:
+    name: Generate .meta/repository-context.txt
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '24'
 
-      - name: Generate Friends context
+      - name: Validate generator syntax
+        run: node --check generate-context.js
+
+      - name: Generate repository context
+        run: node generate-context.js
+
+      - name: Validate generated context
+        shell: bash
         run: |
-          node generate-context.js --mode=both --max-lines=22000
-          ls -la .meta || true
+          set -euo pipefail
 
-      - uses: stefanzweifel/git-auto-commit-action@v5
+          test -s .meta/repository-context.txt
+
+          grep -Fq 'СТРУКТУРА РЕПОЗИТОРИЯ:' \
+            .meta/repository-context.txt
+
+          grep -Fq '// FILE: /index.js' \
+            .meta/repository-context.txt
+
+          if git ls-files --error-unmatch index.compact.js >/dev/null 2>&1; then
+            grep -Fq '// FILE: /index.compact.js' \
+              .meta/repository-context.txt
+          fi
+
+          hidden_count="$(
+            grep -Fc '// CONTENT OMITTED INTENTIONALLY' \
+              .meta/repository-context.txt || true
+          )"
+
+          if [ "$hidden_count" -lt 1 ]; then
+            echo "Не найдено подтверждение исключения index.js"
+            exit 2
+          fi
+
+          if grep -Fq "'use strict';"$'\n'"const crypto = require('crypto');" \
+            .meta/repository-context.txt; then
+            echo "Содержимое index.js попало в контекст"
+            exit 2
+          fi
+
+          if grep -Fq 'АВТОМАТИЧЕСКИ СОЗДАНО ИЗ index.js' \
+            .meta/repository-context.txt; then
+            echo "Содержимое index.compact.js попало в контекст"
+            exit 2
+          fi
+
+          echo "Контекст создан:"
+          ls -lh .meta/repository-context.txt
+
+      - name: Commit generated context
+        uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "CI: generate friends .meta context"
+          commit_message: 'CI: generate repository context'
           branch: ${{ github.ref_name }}
-          file_pattern: ".meta/project-friends-*.txt"
+          file_pattern: '.meta/repository-context.txt'
           commit_user_name: github-actions[bot]
-          commit_user_email: github-actions[bot]@users.noreply.github.com
+          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com

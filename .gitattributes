@@ -8,4 +8,4 @@
 *.yaml text eol=lf
 
 index.compact.js linguist-generated=true
-.meta/project-signaling-compact-full.txt linguist-generated=true
+.meta/repository-full.txt linguist-generated=true

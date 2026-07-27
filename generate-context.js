@@ -12,7 +12,9 @@ const OUTPUT_FILE = path.join(META_DIR, 'repository-full.txt');
 
 const EXCLUDED_FILES = new Set([
   'index.js',
-  'index.compact.js'
+  'index.compact.js',
+  'input.js',
+  'output.compact.js'
 ]);
 
 const EXCLUDED_DIRECTORIES = new Set([
@@ -309,6 +311,8 @@ function main() {
 ИСКЛЮЧЕНО ИЗ КОНТЕКСТА:
 - index.js
 - index.compact.js
+- input.js
+- output.compact.js
 - .git
 - .meta
 - node_modules

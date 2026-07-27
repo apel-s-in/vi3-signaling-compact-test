@@ -34,6 +34,14 @@ async function main() {
     'utf8'
   );
 
+  console.log(
+    `Прочитан index.js: ${Buffer.byteLength(source, 'utf8')} байт`
+  );
+
+  console.log(
+    'Проверяется экспорт handler...'
+  );
+
   if (!hasHandlerExport(source)) {
     throw new Error(
       [
@@ -46,24 +54,36 @@ async function main() {
     );
   }
 
+  console.log(
+    'Запускается читаемое компактное форматирование...'
+  );
+
   const result =
     await formatReadableCompact({
       source,
       sourceName: 'index.js'
     });
 
+  console.log(
+    'Форматирование завершено'
+  );
+
   if (!hasHandlerExport(result.compact)) {
     throw new Error(
       'Экспорт handler исчез после форматирования'
     );
   }
-
+  console.log(
+    'Сравниваются AST исходника и результата...'
+  );
   assertSameProgram(
     source,
     result.compact,
     'AST index.js и index.compact.js различается'
   );
-
+  console.log(
+    'AST исходника и результата совпадают'
+  );
   await fs.writeFile(
     TEMP_FILE,
     result.compact,

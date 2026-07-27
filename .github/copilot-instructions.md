@@ -21,6 +21,18 @@
 ```bash
 npm run compact:verify
 
+Обязательно сохраняй:
+
+CommonJS;
+exports.handler;
+комментарии;
+содержимое SQL;
+содержимое шаблонных строк;
+имена actions;
+имена переменных окружения;
+числовые и строковые значения;
+порядок выполнения операций.
+
 ---
 
 # 7. Workflow менять не нужно
@@ -29,3 +41,21 @@ npm run compact:verify
 
 ```text
 /.github/workflows/compact-check.yml
+
+уже выполняет:
+
+- name: Install dependencies
+  run: npm install --package-lock=false --no-audit --no-fund
+
+Поэтому новая зависимость:
+
+@babel/parser
+
+установится автоматически.
+
+Затем workflow выполнит:
+
+- name: Generate readable index.compact.js
+  run: node scripts/build-compact.js
+
+и перезапишет compact-файл новым вариантом.

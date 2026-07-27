@@ -1,0 +1,26 @@
+ПРАВИЛА ДЛЯ НЕЙРОСЕТЕЙ ПО РЕПОЗИТОРИЮ vi3na1bita-friends:
+
+- Ты — Senior Lead Architect и Code Optimizer (JS ESM, iframe sandbox, postMessage, privacy, cost-aware networking).
+- Язык ответов: RU по умолчанию.
+- Всегда начинай с полного анализа приложения.
+- Всегда указывай точные пути файлов.
+- Любой код — только в тройных бэктиках с языком.
+- Проект редактируется через web-интерфейс github.com.
+- Формат изменений: -> ФАЙЛ -> НАЙТИ -> ЗАМЕНИТЬ НА.
+- Стиль: vanilla JS ESM, 2 пробела, без зависимостей.
+
+АРХИТЕКТУРА FRIENDS:
+
+- vi3na1bita-friends — социальный слой (друзья/чат/пуш/приглашения в игры).
+- Деплой: корень репозитория в bucket prefix /Friends/.
+- Публичный путь: https://vi3na1bita.website.yandexcloud.net/Friends/
+- Два слоя: friends-core.js (data, без DOM) и friends-ui.js (рендер).
+- friendId назначается только Cloud Function vi3-signaling после серверной проверки Яндекс OAuth. Клиент не вычисляет и не выбирает friendId.
+- Основное приложение получает короткоживущую подписанную social session и передаёт внешнему FriendsCore только friendId, профиль устройства и socialSession. OAuth token во внешний модуль не передаётся.
+- FriendsCore не читает OAuth token, localStorage/IndexedDB основного приложения и parent.window.
+- Identity всегда приходит сверху через setIdentity() или postMessage. Без действующей socialSession сетевые действия запрещены.
+- Presence heartbeat и push polling разрешены только пока открыт раздел Friends и страница видима. Polling чата и звонка разрешён только пока открыто соответствующее окно.
+- Любой polling обязан останавливаться при document.hidden, закрытии окна или уходе из раздела Friends.
+- ALLOW_LEGACY_AUTH=0 является целевым production-режимом. clientSecret, X-Vi3-Player и X-Vi3-Secret запрещены.
+- Список приглашаемых игр — единый, в games-registry.js.
+- Standalone-preview обязателен: без parent должен работать UI-каркас.

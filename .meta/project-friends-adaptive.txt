@@ -50,7 +50,7 @@ vi3-signaling-compact-test/
 ├── index.js
 └── package.json
 
-Сгенерировано: 2026-07-27 18:24:27 UTC
+Сгенерировано: 2026-07-27 18:31:44 UTC
 
 //=================================================
 // FILE: /.github/workflows/generate-context.yml
@@ -435,6 +435,25 @@ jobs:
       - name: Generate compact function
         run: npm run compact:build
 
+      - name: Confirm compact file exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s index.compact.js
+
+          echo "index.compact.js успешно создан:"
+          ls -lh index.js index.compact.js
+
+          echo "Git status:"
+          git status --short -- index.compact.js
+
+          if git check-ignore -q index.compact.js; then
+            echo "Ошибка: index.compact.js исключён через .gitignore"
+            git check-ignore -v index.compact.js || true
+            exit 1
+          fi
+
       - name: Verify compact function
         run: npm run compact:check
 
@@ -447,61 +466,27 @@ jobs:
             echo "Ошибка: генератор изменил index.js"
             git diff -- index.js || true
             exit 1
-          fi
 
-      - name: Generate repository context
-        run: npm run context:build
-
-      - name: Validate generated context
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          context=".meta/project-signaling-compact-full.txt"
-
-          test -s "$context"
-
-          grep -Fq "Название репозитория:" "$context"
-          grep -Fq "СТРУКТУРА ПРОЕКТА:" "$context"
-
-          if grep -Fq "// FILE: /index.js" "$context"; then
-            echo "Ошибка: index.js попал в контекст"
-            exit 1
-          fi
-
-          if grep -Fq "// FILE: /index.compact.js" "$context"; then
-            echo "Ошибка: index.compact.js попал в контекст"
-            exit 1
-          fi
-
-          if grep -Fq "project-friends-adaptive" "$context"; then
-            echo "Ошибка: в контексте осталось старое adaptive-имя"
-            exit 1
-          fi
-
-          echo "Контекст проверен:"
-          ls -lh "$context"
-
-      - name: Check generated files in pull request
+      - name: Check generated compact file in pull request
         if: github.event_name == 'pull_request'
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ -n "$(git status --porcelain -- index.compact.js .meta/project-signaling-compact-full.txt)" ]; then
-            echo "Сгенерированные файлы не соответствуют исходникам."
-            echo "Запустите npm run verify и добавьте результат в pull request."
-            git status --short -- index.compact.js .meta/project-signaling-compact-full.txt
+          if [ -n "$(git status --porcelain -- index.compact.js)" ]; then
+            echo "index.compact.js не соответствует index.js."
+            echo "Запустите npm run compact:verify и добавьте index.compact.js в pull request."
+            git status --short -- index.compact.js
             exit 1
           fi
 
-      - name: Commit generated files
+      - name: Commit generated compact file
         if: github.event_name != 'pull_request'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: 'CI: update compact function and repository context'
+          commit_message: 'CI: update index.compact.js'
           branch: ${{ github.ref_name }}
-          file_pattern: 'index.compact.js .meta/project-signaling-compact-full.txt'
+          file_pattern: 'index.compact.js'
           commit_user_name: github-actions[bot]
           commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
 
@@ -510,14 +495,6 @@ jobs:
         with:
           name: vi3-signaling-index-compact
           path: index.compact.js
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload repository context
-        uses: actions/upload-artifact@v4
-        with:
-          name: vi3-signaling-repository-context
-          path: .meta/project-signaling-compact-full.txt
           if-no-files-found: error
           retention-days: 14
 

@@ -1,272 +1,757 @@
-// Канонический pure-контракт Избранного.
-// Не читает storage, не управляет playback и не выполняет сеть.
+#!/usr/bin/env node
 
-export const FAVORITE_STATUSES = Object.freeze([
-  'active',
-  'inactive',
-  'deleted'
-]);
+import fs from 'node:fs';
+import path from 'node:path';
 
-const safe = value =>
-  String(value == null ? '' : value).trim();
+const root = process.cwd();
+const failures = [];
 
-const num = value =>
-  Number.isFinite(Number(value))
-    ? Math.max(0, Number(value))
-    : 0;
+const read = relative => {
+  const file = path.join(root, relative);
 
-const minPositive = (...values) => {
-  const rows = values.map(num).filter(value => value > 0);
-  return rows.length ? Math.min(...rows) : 0;
-};
-
-export const favoriteStatus = item => {
-  if (
-    !item ||
-    typeof item !== 'object' ||
-    Array.isArray(item)
-  ) {
+  if (!fs.existsSync(file)) {
+    failures.push(`${relative}: файл не найден`);
     return '';
   }
 
-  const explicit = safe(item.status);
+  return fs.readFileSync(file, 'utf8');
+};
 
-  if (FAVORITE_STATUSES.includes(explicit)) {
-    return explicit;
+const assert = (condition, message) => {
+  if (condition) {
+    console.log(`✅ ${message}`);
+  } else {
+    failures.push(message);
+  }
+};
+
+const contains = (relative, marker) => {
+  const found = read(relative).includes(marker);
+
+  if (found) {
+    console.log(`✅ ${relative}: найден ${marker}`);
+  } else {
+    failures.push(`${relative}: отсутствует ${marker}`);
+  }
+};
+
+const excludes = (relative, pattern, message) => {
+  const source = read(relative);
+  pattern.lastIndex = 0;
+  const found = pattern.test(source);
+
+  if (!found) {
+    console.log(`✅ ${relative}: нарушение отсутствует — ${message}`);
+  } else {
+    failures.push(`${relative}: ${message}`);
+  }
+};
+
+const listFiles = directory => {
+  const base = path.join(root, directory);
+  if (!fs.existsSync(base)) return [];
+
+  const files = [];
+  const stack = [base];
+
+  while (stack.length) {
+    const current = stack.pop();
+
+    for (const entry of fs.readdirSync(current, {
+      withFileTypes: true
+    })) {
+      if (
+        entry.name === 'node_modules' ||
+        entry.name === 'vendor'
+      ) {
+        continue;
+      }
+
+      const absolute = path.join(current, entry.name);
+
+      if (entry.isDirectory()) {
+        stack.push(absolute);
+      } else if (entry.isFile()) {
+        files.push(
+          path.relative(root, absolute).replace(/\\/g, '/')
+        );
+      }
+    }
   }
 
-  if (num(item?.deletedAt) > 0) return 'deleted';
-  if (num(item?.inactiveAt) > 0) return 'inactive';
-  return 'active';
+  return files.sort();
 };
 
-export const favoriteClock = item =>
-  Math.max(
-    num(item?.updatedAt),
-    num(item?.deletedAt),
-    num(item?.inactiveAt),
-    num(item?.addedAt)
-  );
+const assertNoMatch = (files, pattern, message) => {
+  const matches = [];
 
-export const normalizeFavoriteItem = (
-  raw = {},
-  {
-    fallbackNow = Date.now(),
-    keepUnknown = true
-  } = {}
-) => {
-  const uid = safe(raw?.uid);
-  if (!uid) return null;
+  files.forEach(relative => {
+    const source = read(relative);
+    pattern.lastIndex = 0;
 
-  const status = favoriteStatus(raw);
-  const clock = favoriteClock(raw) || num(fallbackNow);
-  const album = safe(
-    raw?.sourceAlbum ||
-    raw?.albumKey ||
-    raw?.album
-  ) || null;
-
-  return {
-    ...(keepUnknown ? raw : {}),
-    uid,
-    status,
-    liked: status === 'active',
-    addedAt: num(raw?.addedAt) || clock,
-    updatedAt: clock,
-    inactiveAt:
-      status === 'inactive'
-        ? num(raw?.inactiveAt) || clock
-        : 0,
-    deletedAt:
-      status === 'deleted'
-        ? num(raw?.deletedAt) || clock
-        : 0,
-    sourceAlbum: album,
-    albumKey: album
-  };
-};
-
-export const normalizeFavoriteList = (
-  rows,
-  options = {}
-) => {
-  const items = new Map();
-
-  (Array.isArray(rows) ? rows : [])
-    .map(item => normalizeFavoriteItem(item, options))
-    .filter(Boolean)
-    .forEach(item => items.set(item.uid, item));
-
-  return [...items.values()];
-};
-
-export const localToRemote = item => {
-  const normalized = normalizeFavoriteItem(item);
-  if (!normalized) return null;
-
-  return {
-    uid: normalized.uid,
-    album:
-      normalized.sourceAlbum ||
-      normalized.albumKey ||
-      '',
-    status: normalized.status,
-    addedAt: normalized.addedAt,
-    updatedAt: normalized.updatedAt,
-    inactiveAt: normalized.inactiveAt,
-    deletedAt: normalized.deletedAt
-  };
-};
-
-export const remoteToLocal = state => {
-  const rows = Array.isArray(state)
-    ? state
-    : Array.isArray(state?.items)
-      ? state.items
-      : [];
-
-  return normalizeFavoriteList(
-    rows.map(item => ({
-      ...item,
-      sourceAlbum:
-        item?.sourceAlbum ||
-        item?.albumKey ||
-        item?.album ||
-        null,
-      albumKey:
-        item?.albumKey ||
-        item?.sourceAlbum ||
-        item?.album ||
-        null
-    }))
-  );
-};
-
-export const favoriteSignature = item => {
-  const normalized = localToRemote(item);
-
-  return normalized
-    ? JSON.stringify({
-        uid: normalized.uid,
-        status: normalized.status,
-        album: normalized.album
-      })
-    : '';
-};
-
-export const mergeFavoritePair = (
-  leftRaw,
-  rightRaw,
-  policy = 'ask'
-) => {
-  const fallbackNow = Math.max(
-    favoriteClock(leftRaw),
-    favoriteClock(rightRaw),
-    Date.now()
-  );
-  const left = normalizeFavoriteItem(leftRaw, {
-    fallbackNow
-  });
-  const right = normalizeFavoriteItem(rightRaw, {
-    fallbackNow
+    if (pattern.test(source)) matches.push(relative);
   });
 
-  if (!left) return right;
-  if (!right) return left;
+  assert(
+    matches.length === 0,
+    matches.length
+      ? `${message}: ${matches.join(', ')}`
+      : message
+  );
+};
 
-  const newest =
-    favoriteClock(right) >= favoriteClock(left)
-      ? right
-      : left;
-  const oldest = newest === right ? left : right;
+const importAchievementDictionary = async () => {
+  const source = read(
+    'scripts/analytics/achievements-dict.js'
+  );
+  const url = `data:text/javascript;base64,${
+    Buffer.from(source, 'utf8').toString('base64')
+  }`;
+  const module = await import(url);
+  return module.AchievementDictionary;
+};
 
-  if (policy === 'latest') return newest;
+const validateAchievements = async () => {
+  const dictionary = await importAchievementDictionary();
+  const play = dictionary?.play_total;
+  const full = dictionary?.full_total;
+  const time = dictionary?.time_total;
 
-  if (
-    policy === 'trash' &&
-    (left.deletedAt || right.deletedAt)
-  ) {
-    const deleted =
-      left.deletedAt >= right.deletedAt
-        ? left
-        : right;
-    const live = deleted === left ? right : left;
+  assert(
+    JSON.stringify(play?.scaling?.steps) ===
+      JSON.stringify([
+        1, 10, 25, 50, 70, 100, 250,
+        500, 1000, 5000, 10000, 15000, 20000
+      ]),
+    'В потоке: последовательность уровней'
+  );
 
-    return deleted.deletedAt >= favoriteClock(live)
-      ? normalizeFavoriteItem({
-          ...live,
-          ...deleted,
-          inactiveAt: 0
-        })
-      : normalizeFavoriteItem({
-          ...oldest,
-          ...newest,
-          status: 'active',
-          inactiveAt: 0,
-          deletedAt: 0
-        });
-  }
+  assert(
+    JSON.stringify(play?.reward?.steps) ===
+      JSON.stringify([
+        10, 15, 20, 25, 35, 50, 75,
+        100, 150, 200, 300, 400, 500
+      ]),
+    'В потоке: таблица наград'
+  );
 
-  const active =
-    left.status === 'active' ||
-    right.status === 'active';
+  assert(
+    play?.scaling?.resetEachLevel === true,
+    'В потоке: последовательный progress'
+  );
+  assert(
+    JSON.stringify(full?.scaling?.steps) ===
+      JSON.stringify([
+        1, 2, 5, 10, 50, 100, 150, 200,
+        250, 300, 400, 500, 1000, 1500,
+        2000, 2500
+      ]),
+    'Верное ухо: последовательность уровней'
+  );
 
-  if (
-    newest.status === 'deleted' &&
-    (
-      !active ||
-      favoriteClock(newest) >= favoriteClock(oldest)
-    )
-  ) {
-    return normalizeFavoriteItem({
-      ...oldest,
-      ...newest,
-      status: 'deleted',
-      inactiveAt: 0
-    });
-  }
+  assert(
+    JSON.stringify(full?.reward?.steps) ===
+      JSON.stringify([
+        5, 10, 15, 30, 50, 75, 85, 100,
+        125, 150, 200, 250, 500, 250,
+        250, 250
+      ]),
+    'Верное ухо: таблица наград'
+  );
 
-  if (active) {
-    return normalizeFavoriteItem({
-      ...oldest,
-      ...newest,
-      status: 'active',
-      addedAt:
-        minPositive(left.addedAt, right.addedAt) ||
-        fallbackNow,
-      updatedAt: Math.max(
-        favoriteClock(left),
-        favoriteClock(right)
+  assert(
+    full?.scaling?.resetEachLevel === true &&
+      full?.scaling?.cumulativeSteps === true &&
+      full?.scaling?.repeatAfterLevel === 16 &&
+      full?.scaling?.repeatStep === 500 &&
+      full?.reward?.repeatAmount === 250,
+    'Верное ухо: последовательное продолжение после 2500'
+  );
+  assert(
+    time?.scaling?.resetEachLevel === true &&
+      time?.scaling?.cumulativeSteps === true &&
+      time?.scaling?.repeatAfterLevel === 14 &&
+      time?.scaling?.repeatStep === 3600000,
+    'Хранитель времени: динамические уровни'
+  );
+
+  assert(
+    time?.reward?.repeatAmount === 500,
+    'Хранитель времени: повторная награда'
+  );
+};
+
+const validateListening = () => {
+  const receipts =
+    'scripts/analytics/listening-receipts.js';
+  const server =
+    'cloud-functions/vi3-signaling/index.js';
+
+  [
+    'listen_session_start',
+    'listen_session_heartbeat',
+    'listen_session_complete',
+    'achievement_reward_status',
+    'listeningReceipts:completionOutbox:v1',
+    'flushCompletionOutbox',
+    'applyShardRewardResult'
+  ].forEach(marker => contains(receipts, marker));
+
+  assert(
+    /const\s+HEARTBEAT_MS\s*=\s*20000\s*;/
+      .test(read(receipts)),
+    'Listening heartbeat: 20 секунд'
+  );
+
+  contains(receipts, 'heartbeatPending');
+  contains(receipts, 'scheduleHeartbeat');
+  contains(receipts, 'getSocialServerBackoffState');
+  contains(receipts, 'deviceId: this.session.deviceId');
+  contains(server, 'const LISTEN_PROGRESS_RECEIPT_LIMIT = 500');
+  contains(server, 'const LISTEN_TIME_SESSION_LIMIT = 64');
+  contains(server, 'const LISTEN_CREDIT_SEGMENT_LIMIT = 64');
+  contains(server, 'listenByHourMs');
+  contains(server, 'listenByWeekdayMs');
+  contains(server, 'listenMsByTrack');
+  contains(server, 'classifiedListenMs');
+  contains(server, 'legacyUnclassifiedMs');
+  contains(server, 'splitListenInterval');
+  contains(server, 'assertConfirmedListeningInvariants');
+  contains(server, 'publicConfirmedListeningStats');
+  contains(
+    'scripts/analytics/confirmed-listening-stats.js',
+    'resolveListeningStatsViewModel'
+  );
+  contains(
+    'scripts/analytics/temporal-buckets.js',
+    'splitTemporalInterval'
+  );
+  contains(
+    'scripts/analytics/session-tracker.js',
+    'creditedSegments'
+  );
+
+  assertNoMatch(
+    [
+      'scripts/app/profile/model.js',
+      'scripts/app/profile/stats-view.js',
+      'scripts/app/profile/live-bindings.js',
+      'scripts/ui/statistics-modal.js'
+    ],
+    /getCanonicalFullListenCount/g,
+    'Legacy local/server full-count selector удалён'
+  );
+
+  assert(
+    /resolveListenSessionRow\(\s*playerId,\s*sessionId,\s*body\.deviceId\s*\)/
+      .test(read(server)),
+    'Listening heartbeat использует direct per-device lookup'
+  );
+
+  const finalizeStart = read(server).indexOf(
+    'async function finalizeListenSession(session)'
+  );
+  const duplicateCheck = read(server).indexOf(
+    'if (oldReceipt.progressApplied === true)',
+    finalizeStart
+  );
+  const timeApply = read(server).indexOf(
+    'await applyVerifiedListenTimeProgress(data);',
+    finalizeStart
+  );
+
+  assert(
+    finalizeStart >= 0 &&
+      duplicateCheck > finalizeStart &&
+      timeApply > duplicateCheck,
+    'Completion проверяет постоянный receipt до применения времени'
+  );
+
+  assert(
+    /listenedSeconds\s*>=\s*25/
+      .test(read('scripts/analytics/session-tracker.js')),
+    'Valid listen: 25 секунд'
+  );
+
+  assert(
+    /liveAccumulatedMs\s*\/\s*1000\)\s*>=\s*25/
+      .test(read('scripts/analytics/live-stats.js')),
+    'Live streak: 25 секунд'
+  );
+
+  [
+    'const LISTEN_VALID_MIN_SEC = 25',
+    'totalListenMs',
+    'listenTimeBySession',
+    'applyVerifiedListenTimeProgress',
+    'buildFullListenRewards',
+    'buildTimeRewards',
+    'data.continuityBroken !== true',
+    'Math.floor(data.duration * 0.95)'
+  ].forEach(marker => contains(server, marker));
+
+  assertNoMatch(
+    [
+      ...listFiles('scripts/analytics'),
+      server
+    ],
+    /listenedSeconds\s*>=\s*13|Засчитывается\s*≥13\s*сек|Math\.max\(\s*13\s*,/g,
+    'Старый порог 13 секунд отсутствует'
+  );
+
+  excludes(
+    receipts,
+    /\.(play|pause|stop|seek|next|prev|setVolume|setMuted)\s*\(/,
+    'listening receipts управляет playback'
+  );
+};
+
+const validateRewards = () => {
+  const engine =
+    'scripts/analytics/achievement-engine.js';
+
+  [
+    '_requiresServerVerification',
+    'legacy_local_unverified',
+    'getCompletedCount',
+    '_hasScalableLevel',
+    'server_wallet'
+  ].forEach(marker => contains(engine, marker));
+
+  contains(
+    'scripts/app/profile/achievements-view.js',
+    'rewardAwarded'
+  );
+  contains(
+    'scripts/app/shards/view.js',
+    'getRewardCatalog'
+  );
+  contains(
+    'scripts/app/shards/view.js',
+    'serverRewardMap'
+  );
+  contains(
+    'scripts/app/shards/reward-notifier.js',
+    'applyShardRewardResult'
+  );
+
+  excludes(
+    engine,
+    /projectedTotalSec\s*\|\|\s*rawCurrent/,
+    'локальное время подменяет серверное'
+  );
+
+  excludes(
+    engine,
+    /toggleableTimer\s*:\s*true/,
+    'найден переключаемый time timer'
+  );
+
+  excludes(
+    'scripts/app/shards/reward-notifier.js',
+    /\.(play|pause|stop|seek|next|prev|setVolume|setMuted)\s*\(/,
+    'reward notifier управляет playback'
+  );
+};
+
+const validatePwaAndLegacy = () => {
+  const pwa = 'scripts/app/pwa-install.js';
+
+  [
+    'pwa_install_intent',
+    'pwa_launch_verify',
+    'display-mode: standalone'
+  ].forEach(marker => contains(pwa, marker));
+
+  excludes(
+    pwa,
+    /\.(play|pause|stop|seek|next|prev|setVolume|setMuted)\s*\(/,
+    'PWA bridge управляет playback'
+  );
+
+  const applicationFiles = [
+    ...listFiles('scripts')
+      .filter(file =>
+        !file.startsWith('scripts/ci/') &&
+        !file.startsWith('scripts/e2e/')
       ),
-      inactiveAt: 0,
-      deletedAt: 0
-    });
-  }
+    ...listFiles('data')
+  ];
 
-  return normalizeFavoriteItem({
-    ...oldest,
-    ...newest,
-    status: 'inactive',
-    inactiveAt: Math.max(
-      num(left.inactiveAt),
-      num(right.inactiveAt)
-    ) || fallbackNow,
-    deletedAt: 0,
-    updatedAt: Math.max(
-      favoriteClock(left),
-      favoriteClock(right)
+  assertNoMatch(
+    applicationFiles,
+    /socials_all_visited|socialVisitAll|social_visit_all|Подписчик всего/g,
+    'Удалённое социальное достижение отсутствует'
+  );
+
+  assertNoMatch(
+    [
+      ...listFiles('scripts')
+        .filter(file => !file.startsWith('scripts/ci/')),
+      'service-worker.js'
+    ],
+    /verified-achievement-state|verified-achievements-view|claim_prepare|claim_validate|claim_index|achievement_verify/g,
+    'Удалённый backup claim contour отсутствует'
+  );
+};
+
+const validateDataBoundaries = () => {
+  const account =
+    'scripts/analytics/account-data-boundary.js';
+  const favorite =
+    'scripts/analytics/favorite-state-contract.js';
+  const mirror =
+    'scripts/analytics/favorite-mirror.js';
+
+  [
+    'Vi3AccountVault_v1',
+    'eventLedger:chainId:v1',
+    'favoriteMirror:outbox:v1',
+    'listeningReceipts:completionOutbox:v1',
+    'adoptLocalData'
+  ].forEach(marker => contains(account, marker));
+
+  [
+    'normalizeFavoriteItem',
+    'favoriteClock',
+    'favoriteStatus',
+    'mergeFavoritePair',
+    'remoteToLocal',
+    'localToRemote',
+    'favoriteSignature'
+  ].forEach(marker => contains(favorite, marker));
+
+  [
+    'favorite_state_get',
+    'favorite_state_mutate',
+    'favorite_state_reconcile'
+  ].forEach(marker => contains(mirror, marker));
+
+  excludes(
+    account,
+    /\.(play|pause|stop|seek|setVolume|setMuted)\s*\(/,
+    'Account vault управляет playback'
+  );
+
+  assertNoMatch(
+    [favorite, mirror],
+    /\.(play|pause|stop|seek|next|prev|setVolume|setMuted|applyFavoritesOnlyFilter)\s*\(/g,
+    'Favorite contract или mirror управляет playback'
+  );
+};
+
+const validateRecommendationsAndStats = () => {
+  contains(
+    'scripts/app/profile/recs-view.js',
+    'stableScore'
+  );
+
+  excludes(
+    'scripts/app/profile/recs-view.js',
+    /sort\(\s*\(\)\s*=>\s*Math\.random/,
+    'случайный comparator рекомендаций'
+  );
+
+  excludes(
+    'scripts/app/profile/carousel-flat.js',
+    /oldTabs/,
+    'legacy oldTabs'
+  );
+
+  [
+    'const activeDays = new Set',
+    'if (lSec > 0)',
+    's.globalListenSeconds += lSec',
+    'calculateStreakSummary'
+  ].forEach(marker =>
+    contains(
+      'scripts/analytics/stats-aggregator.js',
+      marker
     )
+  );
+};
+
+const validatePlaybackBoundaries = () => {
+  const protectedFiles = [
+    ...listFiles('scripts/app/games'),
+    ...listFiles('scripts/app/friends'),
+    ...listFiles('scripts/intel')
+  ];
+
+  assertNoMatch(
+    protectedFiles,
+    /playerCore(?:\?\.|\.)\s*(play|pause|stop|seek|next|prev|setVolume|setMuted|load|setPlaylist|applyFavoritesOnlyFilter)\s*\(/g,
+    'Games, Friends или Intel мутируют PlayerCore'
+  );
+
+  assertNoMatch(
+    [
+      ...protectedFiles,
+      ...listFiles('scripts/analytics')
+    ],
+    /new\s+Howl\s*\(/g,
+    'Найден вторичный владелец Howl'
+  );
+
+  [
+    'player:transportReloaded',
+    'previousUid',
+    '_loadReq'
+  ].forEach(marker => contains('src/PlayerCore.js', marker));
+};
+const validateLoyaltyReleaseD = () => {
+  const server =
+    'cloud-functions/vi3-signaling/index.js';
+  const scheduler =
+    'cloud-functions/vi3-loyalty-reminder/index.js';
+  const webpush =
+    'cloud-functions/vi3-webpush/index.js';
+
+  [
+    'const LOYALTY_VERSION = 2',
+    'LOYALTY_VACATION_ALLOWANCE_MS',
+    'LOYALTY_VACATION_WINDOW_MS',
+    'LOYALTY_DUE_BUCKET_MS',
+    'LOYALTY_REMINDER_BEFORE_MS',
+    'loyaltyWindowIndex',
+    'loyaltyWindowSnapshot',
+    'activityAccounted',
+    'nextBoundaryAt',
+    'nextMilestoneAt',
+    'currentDayRewardAmount',
+    'materializeLoyaltyVacation',
+    'syncLoyaltyDueIndex',
+    'actionLoyaltyPreferenceSet',
+    'actionLoyaltyVacationSet',
+    'actionLoyaltyDueRun',
+    'loyalty_preference_set',
+    'loyalty_vacation_set',
+    'loyalty_due_run'
+  ].forEach(marker => contains(server, marker));
+
+  assert(
+    /kvPrefixOrdered\(\s*['"]loyaltyDue:['"]\s*,/
+      .test(read(server)),
+    'Release D scheduler читает ordered loyalty due-index'
+  );
+
+  assert(
+    /const\s+LOYALTY_REMINDER_BEFORE_MS\s*=\s*60\s*\*\s*60\s*\*\s*1000/
+      .test(read(server)),
+    'Преданность: напоминание за один час'
+  );
+
+  assertNoMatch(
+    [server],
+    /deadlineAt:\s*at\s*\+\s*LOYALTY_WINDOW_MS/g,
+    'Преданность не сдвигает дедлайн каждой активностью'
+  );
+
+  assertNoMatch(
+    [server],
+    /LOYALTY_ADVANCE_MIN_MS|LOYALTY_NORMAL_REMINDER_BEFORE_MS/g,
+    'Удалена старая плавающая loyalty-логика'
+  );
+
+  contains(
+    'scripts/app/profile/loyalty-card.js',
+    'data-ach="loyalty"'
+  );
+  contains(
+    'scripts/app/profile/loyalty-card.js',
+    'activityAccounted'
+  );
+  contains(
+    'scripts/app/profile/loyalty-card.js',
+    'за один час'
+  );
+  
+  [
+    'LOYALTY_REMINDER',
+    'LOYALTY_VACATION_ENDING',
+    'LOYALTY_VACATION_ENDED',
+    'notificationTtl',
+    'notificationUrgency'
+  ].forEach(marker => contains(webpush, marker));
+
+  [
+    "action: 'loyalty_due_run'",
+    "'X-Vi3-Scheduler': SCHEDULER_SECRET",
+    'limit: 50'
+  ].forEach(marker => contains(scheduler, marker));
+
+  [
+    'setLoyaltyReminderEnabled',
+    'setLoyaltyVacationEnabled'
+  ].forEach(marker =>
+    contains(
+      'scripts/app/push/loyalty-reminders.js',
+      marker
+    )
+  );
+
+  contains(
+    'scripts/app/profile/loyalty-card.js',
+    'renderLoyaltyCard'
+  );
+  contains(
+    'service-worker.js',
+    "target.searchParams.set('openLoyalty', '1')"
+  );
+  contains(
+    'scripts/app.js',
+    "p.get('openLoyalty')==='1'"
+  );
+
+  assertNoMatch(
+    [
+      'scripts/app/push/loyalty-reminders.js',
+      'scripts/app/profile/loyalty-card.js',
+      scheduler
+    ],
+    /\.(play|pause|stop|seek|next|prev|setVolume|setMuted)\s*\(/g,
+    'Release D не управляет playback'
+  );
+};
+const validateBackupProxy = () => {
+  const proxy =
+    'cloud-functions/vi3na1bita-backup-proxy/index.js';
+  const transport =
+    'scripts/core/yandex-disk-transport.js';
+
+  [
+    'requestContext?.http?.method',
+    'requestContext?.httpMethod',
+    "method === 'OPTIONS'",
+    "'X-Yandex-Auth'",
+    'upload_backup',
+    'upload_event_segment',
+    'archive_delete_segments',
+    'backup_achievement_receipt'
+  ].forEach(marker => contains(proxy, marker));
+
+  assert(
+    /const\s+mode\s*=\s*requestedMode\s*\|\|\s*['"]ping['"]/
+      .test(read(proxy)),
+    'Backup proxy: корневой вызов является ping'
+  );
+
+  assertNoMatch(
+    [transport],
+    /searchParams\.set\(['"]token['"]/g,
+    'OAuth token не помещается в query string'
+  );
+
+  assertNoMatch(
+    [transport],
+    /Authorization\s*:/g,
+    'Клиент не отправляет Authorization в Cloud Function'
+  );
+
+  assertNoMatch(
+    [proxy],
+    /event\.httpMethod\s*!==\s*['"]POST['"]/g,
+    'Backup proxy использует нормализованный HTTP method'
+  );
+};
+
+const validateCloudFunctionFiles = () => {
+  [
+    'vi3-signaling',
+    'vi3na1bita-backup-proxy',
+    'vi3-webpush',
+    'vi3-loyalty-reminder'
+  ].forEach(name => {
+    const indexPath =
+      `cloud-functions/${name}/index.js`;
+    const packagePath =
+      `cloud-functions/${name}/package.json`;
+    const source = read(indexPath);
+
+    assert(
+      !source.includes('FILE: /package.json'),
+      `${indexPath}: package.json не склеен с index.js`
+    );
+
+    try {
+      const value = JSON.parse(read(packagePath));
+
+      assert(
+        value &&
+          typeof value === 'object' &&
+          !Array.isArray(value),
+        `${packagePath}: корректный JSON object`
+      );
+
+      assert(
+        !value.main || value.main === 'index.js',
+        `${packagePath}: main=index.js`
+      );
+    } catch (error) {
+      failures.push(
+        `${packagePath}: ${error.message}`
+      );
+    }
   });
 };
 
-export default {
-  FAVORITE_STATUSES,
-  favoriteStatus,
-  favoriteClock,
-  normalizeFavoriteItem,
-  normalizeFavoriteList,
-  localToRemote,
-  remoteToLocal,
-  favoriteSignature,
-  mergeFavoritePair
+const validateWorkflows = () => {
+  const workflows = listFiles('.github/workflows');
+
+  assertNoMatch(
+    workflows,
+    /node-version:\s*['"]?20['"]?/g,
+    'Workflow с Node.js 20 отсутствуют'
+  );
+
+  assertNoMatch(
+    workflows,
+    /actions\/(checkout|setup-node)@v4/g,
+    'Legacy GitHub Actions v4 отсутствуют'
+  );
+
+  [
+    "node-version: '24'",
+    'npm install --no-save @playwright/test@1.55.0',
+    'playwright.config.js --grep-invert "@remote"',
+    'playwright.config.js --grep "@remote"',
+    'continue-on-error: true',
+    'cancel-in-progress: true'
+  ].forEach(marker =>
+    contains('.github/workflows/e2e.yml', marker)
+  );
 };
+
+const main = async () => {
+  await validateAchievements();
+  validateListening();
+  validateRewards();
+  validatePwaAndLegacy();
+  validateDataBoundaries();
+  validateRecommendationsAndStats();
+  validatePlaybackBoundaries();
+  validateLoyaltyReleaseD();
+  validateBackupProxy();
+  validateCloudFunctionFiles();
+  validateWorkflows();
+
+  if (failures.length) {
+    console.error('\n❌ Нарушения контрактов:\n');
+
+    failures.forEach((failure, index) => {
+      console.error(`${index + 1}. ${failure}`);
+    });
+
+    process.exit(2);
+  }
+
+  console.log('\n✅ Все application contracts прошли');
+};
+
+main().catch(error => {
+  console.error(
+    '\n❌ validate-contracts crashed:',
+    error?.stack || error
+  );
+  process.exit(2);
+});

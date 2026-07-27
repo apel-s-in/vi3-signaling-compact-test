@@ -28,7 +28,7 @@ vi3-signaling-compact-test/
 ├── generate-context.js
 └── package.json
 
-Сгенерировано: 2026-07-27T19:39:35.901Z
+Сгенерировано: 2026-07-27T19:42:00.675Z
 
 //=================================================
 // FILE: /.gitattributes
@@ -69,6 +69,18 @@ index.compact.js linguist-generated=true
 ```bash
 npm run compact:verify
 
+Обязательно сохраняй:
+
+CommonJS;
+exports.handler;
+комментарии;
+содержимое SQL;
+содержимое шаблонных строк;
+имена actions;
+имена переменных окружения;
+числовые и строковые значения;
+порядок выполнения операций.
+
 ---
 
 # 7. Workflow менять не нужно
@@ -77,6 +89,24 @@ npm run compact:verify
 
 ```text
 /.github/workflows/compact-check.yml
+
+уже выполняет:
+
+- name: Install dependencies
+  run: npm install --package-lock=false --no-audit --no-fund
+
+Поэтому новая зависимость:
+
+@babel/parser
+
+установится автоматически.
+
+Затем workflow выполнит:
+
+- name: Generate readable index.compact.js
+  run: node scripts/build-compact.js
+
+и перезапишет compact-файл новым вариантом.
 
 //=================================================
 // FILE: /.github/workflows/compact-check.yml

@@ -1,90 +1,77 @@
-name: Generate repository context
+name: Regenerate repository context
 
 on:
-  push:
-    branches: [main, master]
-    paths-ignore:
-      - '.meta/**'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: generate-context-${{ github.ref }}
+  group: signaling-context-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  generate-context:
-    name: Generate .meta/repository-context.txt
+  context:
+    name: Generate full compact-test context
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '20'
 
       - name: Validate generator syntax
         run: node --check generate-context.js
 
-      - name: Generate repository context
+      - name: Generate context
         run: node generate-context.js
 
-      - name: Validate generated context
+      - name: Validate context
         shell: bash
         run: |
           set -euo pipefail
 
-          test -s .meta/repository-context.txt
+          context=".meta/project-signaling-compact-full.txt"
 
-          grep -Fq 'СТРУКТУРА РЕПОЗИТОРИЯ:' \
-            .meta/repository-context.txt
+          test -s "$context"
 
-          grep -Fq '// FILE: /index.js' \
-            .meta/repository-context.txt
-
-          if git ls-files --error-unmatch index.compact.js >/dev/null 2>&1; then
-            grep -Fq '// FILE: /index.compact.js' \
-              .meta/repository-context.txt
+          if grep -Fq "// FILE: /index.js" "$context"; then
+            echo "index.js попал в контекст"
+            exit 1
           fi
 
-          hidden_count="$(
-            grep -Fc '// CONTENT OMITTED INTENTIONALLY' \
-              .meta/repository-context.txt || true
-          )"
-
-          if [ "$hidden_count" -lt 1 ]; then
-            echo "Не найдено подтверждение исключения index.js"
-            exit 2
+          if grep -Fq "// FILE: /index.compact.js" "$context"; then
+            echo "index.compact.js попал в контекст"
+            exit 1
           fi
 
-          if grep -Fq "'use strict';"$'\n'"const crypto = require('crypto');" \
-            .meta/repository-context.txt; then
-            echo "Содержимое index.js попало в контекст"
-            exit 2
+          if [ -e ".meta/project-friends-adaptive.txt" ]; then
+            echo "Удалите старый project-friends-adaptive.txt"
+            exit 1
           fi
 
-          if grep -Fq 'АВТОМАТИЧЕСКИ СОЗДАНО ИЗ index.js' \
-            .meta/repository-context.txt; then
-            echo "Содержимое index.compact.js попало в контекст"
-            exit 2
-          fi
+          ls -lh "$context"
 
-          echo "Контекст создан:"
-          ls -lh .meta/repository-context.txt
-
-      - name: Commit generated context
+      - name: Commit context
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: 'CI: generate repository context'
+          commit_message: 'CI: regenerate signaling compact context'
           branch: ${{ github.ref_name }}
-          file_pattern: '.meta/repository-context.txt'
+          file_pattern: '.meta/project-signaling-compact-full.txt'
           commit_user_name: github-actions[bot]
           commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
+
+      - name: Upload context
+        uses: actions/upload-artifact@v4
+        with:
+          name: vi3-signaling-repository-context
+          path: .meta/project-signaling-compact-full.txt
+          if-no-files-found: error
+          retention-days: 14

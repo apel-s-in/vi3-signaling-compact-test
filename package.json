@@ -2,7 +2,7 @@
   "name": "vi3-signaling-compact-test",
   "version": "1.0.0",
   "private": true,
-  "description": "Безопасная генерация и проверка index.compact.js для Yandex Cloud Function vi3-signaling",
+  "description": "Генерация читаемой компактной версии index.compact.js для Yandex Cloud Function vi3-signaling",
   "main": "index.js",
   "type": "commonjs",
   "engines": {
@@ -23,6 +23,6 @@
     "@yandex-cloud/nodejs-sdk": "^2.6.0"
   },
   "devDependencies": {
-    "terser": "5.31.6"
+    "prettier": "3.6.2"
   }
 }

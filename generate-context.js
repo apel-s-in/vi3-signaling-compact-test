@@ -11,7 +11,7 @@ const argv = Object.fromEntries(process.argv.slice(2).map(a => {
 
 const ROOT = path.resolve(argv.root || __dirname);
 const META_DIR = path.resolve(argv['out-dir'] || path.join(ROOT, '.meta'));
-const MODE = String(argv.mode || 'both').toLowerCase();
+const MODE = String(argv.mode || 'full').toLowerCase();
 const MAX_LINES = Number(argv['max-lines'] || 22000);
 
 if (!fs.existsSync(META_DIR)) fs.mkdirSync(META_DIR, { recursive: true });
@@ -43,6 +43,8 @@ const EXCLUDE_RAW = [
   'build/**',
   'out/**',
   'coverage/**',
+  'index.js',
+  'index.compact.js',
   '.cache/**',
   '.vscode/**',
   '.idea/**',
@@ -56,7 +58,6 @@ const EXCLUDE_RAW = [
   '**/*.map',
   '**/*.min.js',
   '**/*.min.css',
-  'package-lock.json',
   'yarn.lock',
   'pnpm-lock.yaml',
   'project-friends-full*.txt',
@@ -247,10 +248,6 @@ try {
     console.log(`✅ ${FULL_FILE}`);
   }
 
-  if (MODE === 'adaptive' || MODE === 'both') {
-    fs.writeFileSync(ADAPTIVE_FILE, generate('adaptive'), 'utf8');
-    console.log(`✅ ${ADAPTIVE_FILE}`);
-  }
 } catch (e) {
   console.error('❌ context generation failed:', e);
   process.exit(1);

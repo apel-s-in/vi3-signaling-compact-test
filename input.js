@@ -1,484 +1,484 @@
-import { createMessage, MessageType } from '../game/protocol.js';
+import { packBoardReveal } from './fair-play.js';
 
-export class WarHeartsSession {
-  constructor({ gameId, player }) {
-    this.gameId = gameId;
-    this.player = player;
-    this.bridge = null;
-    this.ready = false;
-    this.room = null;
-    this.onStatus = () => {};
-    this.onChat = () => {};
-    this.onGameData = () => {};
-    this.onRoom = () => {};
-    this.onConnect = () => {};
-    this.onDisconnect = () => {};
-    this.onIceDiagnostics = () => {};
-    this.lastError = '';
+export const RANKED_TERMINAL_STATUSES = new Set([
+  'settled',
+  'forfeited',
+  'disputed',
+  'aborted',
+  'refunded'
+]);
+
+export const RANKED_ECONOMY_FINAL_STATUSES = new Set([
+  'paid',
+  'refunded',
+  'not_required'
+]);
+
+export const isRankedTerminal = status =>
+  RANKED_TERMINAL_STATUSES.has(String(status || ''));
+
+export const isRankedEconomyFinal = status =>
+  RANKED_ECONOMY_FINAL_STATUSES.has(String(status || ''));
+
+const sortObject = value => {
+  if (Array.isArray(value)) return value.map(sortObject);
+  if (!value || typeof value !== 'object') return value;
+
+  return Object.keys(value)
+    .sort()
+    .reduce((out, key) => {
+      out[key] = sortObject(value[key]);
+      return out;
+    }, {});
+};
+
+const stableStringify = value =>
+  JSON.stringify(sortObject(value));
+
+const wait = ms =>
+  new Promise(resolve => setTimeout(resolve, ms));
+
+const randomHex = (bytes = 24) => {
+  const data = crypto.getRandomValues(
+    new Uint8Array(bytes)
+  );
+
+  return [...data]
+    .map(value => value.toString(16).padStart(2, '0'))
+    .join('');
+};
+
+const applyRankedMatch = (state, match = {}) => {
+  const ranked = ensureRankedState(state);
+
+  ranked.serverStatus = String(
+    match.status ||
+    ranked.serverStatus ||
+    ''
+  );
+  ranked.settlement =
+    match.settlement ||
+    ranked.settlement ||
+    null;
+  ranked.rps =
+    match.rps && typeof match.rps === 'object'
+      ? { ...match.rps }
+      : ranked.rps || null;
+  ranked.economy =
+    match.economy && typeof match.economy === 'object'
+      ? { ...match.economy }
+      : ranked.economy || null;
+
+  if (ranked.rps?.firstPlayerId) {
+    ranked.firstPlayerId = String(
+      ranked.rps.firstPlayerId
+    );
   }
 
-  async init() {
-    this.onStatus({ label: 'bridge...', online: false });
+  return ranked;
+};
 
-    try {
-      const url = new URL(
-        '/Games/common/network-bridge.js',
-        window.location.href
-      );
-      url.searchParams.set('rev', '20260728-network-2');
+const sha256Hex = async value => {
+  const data = new TextEncoder().encode(String(value || ''));
+  const digest = await crypto.subtle.digest('SHA-256', data);
 
-      const mod = await import(url.href);
-      const NetworkBridge = mod.NetworkBridge;
+  return [...new Uint8Array(digest)]
+    .map(byte => byte.toString(16).padStart(2, '0'))
+    .join('');
+};
 
-      this.bridge = new NetworkBridge({
-        gameId: this.gameId,
-        playerId: this.player.id,
-        displayName: this.player.name
-      });
+const normalizePoint = point => ({
+  x: Number(point?.x),
+  y: Number(point?.y)
+});
 
-      this.bridge.onStatus = info => {
-        if (info?.ice) this.onIceDiagnostics(info.ice);
-        this.onStatus(info);
-      };
-      this.bridge.onIceDiagnostics = info => this.onIceDiagnostics(info);
-      this.bridge.onRoom = info => {
-        this.room = info;
-        this.onRoom(info);
-      };
-      this.bridge.onConnect = info => {
-        this.ready = true;
-        this.onStatus({ label: 'online', online: true });
-        this.onConnect(info || {});
-      };
-      this.bridge.onChat = msg => this.handleData(msg);
-      this.bridge.onData = data => {
-        if (data?.type === MessageType.CHAT_MESSAGE || data?.type === 'CHAT_MESSAGE') return;
-        this.handleData(data);
-      };
-      this.bridge.onError = info => {
-        const transient = !!info?.transient || /signal/i.test(String(info?.label || info?.message || ''));
-        if (transient && !this.ready) {
-          this.onStatus({ label: 'signal retry', online: false, transient: true });
-          return;
-        }
+const normalizeEvent = (event, turn) => ({
+  turn: Number(event?.turn || turn),
+  shotId: String(event?.shotId || ''),
+  shooterId: String(event?.shooterId || ''),
+  x: Number(event?.x),
+  y: Number(event?.y),
+  result: String(event?.result || ''),
+  sunkCells: (Array.isArray(event?.sunkCells)
+    ? event.sunkCells
+    : [])
+    .map(normalizePoint)
+    .sort((a, b) => a.y - b.y || a.x - b.x)
+});
 
-        this.ready = false;
-        this.onStatus({ label: 'net err', online: false });
-        this.onDisconnect({ reason: 'network_error' });
-      };
+export const resetRankedState = state => {
+  state.ranked = {
+    version: 2,
+    matchId: '',
+    playerId: '',
+    peerPlayerId: '',
+    firstPlayerId: '',
+    rps: null,
+    economy: null,
+    transcript: [],
+    submitStatus: '',
+    serverStatus: '',
+    settlement: null,
+    error: ''
+  };
 
-      this.bridge.onDisconnect = info => {
-        this.ready = false;
-        this.onStatus({ label: 'offline', online: false });
-        this.onDisconnect(info || { reason: 'disconnect' });
-      };
+  return state.ranked;
+};
 
-      this.bridge.onClose = info => {
-        this.ready = false;
-        this.onStatus({ label: 'closed', online: false });
-        this.onDisconnect(info || { reason: 'closed' });
-      };
+export const ensureRankedState = state =>
+  state.ranked || resetRankedState(state);
 
-      await this.bridge.init();
+export const prepareRankedMatch = async ({
+  state,
+  session
+} = {}) => {
+  const ranked = ensureRankedState(state);
 
-      const joined = await this.bridge.connectFromUrl();
-      this.lastError = '';
-      this.onStatus({
-        label: joined ? 'joining' : 'ready',
-        online: false
-      });
+  if (ranked.matchId) return ranked;
 
-      return true;
-    } catch (err) {
-      try {
-        await this.bridge?.close?.();
-      } catch {}
+  const response = await session.prepareRankedMatch();
+  const match = response?.match || {};
 
-      this.bridge = null;
-      this.ready = false;
-      this.lastError = err?.message ||
-        String(err || 'network_bridge_init_failed');
-
-      this.onStatus({
-        label: 'mock',
-        online: false,
-        error: this.lastError
-      });
-
-      return false;
-    }
+  if (!match.matchId || !response.playerId) {
+    throw new Error('ranked_match_prepare_failed');
   }
 
-async createNearbyGameCode() {
-if (!this.bridge) throw new Error('network_bridge_unavailable');
-if (!this.room) {
-await this.createInvite();
-}
-return this.bridge.createNearbyGameCode();
-}
+  ranked.matchId = String(match.matchId);
+  ranked.playerId = String(response.playerId);
+  ranked.peerPlayerId = String(response.peerPlayerId || '');
+  ranked.serverStatus = String(match.status || 'pending');
+  ranked.economy = match.economy || null;
+  ranked.error = '';
 
-// ─── LAN Wi-Fi: создание и подключение к комнате ──────────────────────────────
-async createLanRoom({ ranked = false, forceLocalOnly = false } = {}) {
-  if (!this.bridge) throw new Error('network_bridge_unavailable');
+  state.matchStats.matchId = ranked.matchId;
 
-  const room = await this.bridge.connectAsHost({ forceLocalOnly, ranked });
-  let registered = null;
-  let code = '';
+  const stakeResponse = await session.prepareRankedStake(
+    ranked.matchId
+  );
 
-  for (let i = 0; i < 3 && !registered?.ok; i++) {
-    code = this.bridge.generateLanCode?.() ||
-      String(Math.floor(100000 + Math.random() * 900000));
+  applyRankedMatch(
+    state,
+    stakeResponse?.match || {}
+  );
 
-    registered = await this.bridge
-      .registerLanCode?.(
-        code,
-        room.roomId,
-        room.roomSecret,
-        ranked,
-        forceLocalOnly
-      )
-      .catch(() => null);
+  if (
+    !['locking', 'funded'].includes(
+      ranked.economy?.status
+    )
+  ) {
+    throw new Error('ranked_stake_prepare_failed');
   }
 
-  if (!registered?.ok) throw new Error('lan_code_register_failed');
+  return ranked;
+};
 
-  this.room = {
-    roomId: room.roomId,
-    roomSecret: room.roomSecret,
-    code,
-    ranked: !!ranked,
-    localOnly: !!forceLocalOnly,
-    matchMode: ranked ? 'ranked' : 'casual',
-    joinUrl: room.joinUrl
-  };
+export const playRankedRps = async ({
+  state,
+  session,
+  choice,
+  attempts = 40,
+  intervalMs = 650
+} = {}) => {
+  const ranked = ensureRankedState(state);
+  const selected = String(choice || '');
 
-  return {
-    roomId: room.roomId,
-    roomSecret: room.roomSecret,
-    code,
-    ranked: !!ranked,
-    localOnly: !!forceLocalOnly,
-    matchMode: ranked ? 'ranked' : 'casual',
-    joinUrl: room.joinUrl,
-    expiresAt: registered.expiresAt
-  };
-}
+  if (
+    !['rock', 'scissors', 'paper'].includes(selected)
+  ) {
+    throw new Error('ranked_rps_choice_invalid');
+  }
 
-async resolveLanRoom(code) {
-  if (!this.bridge) throw new Error('network_bridge_unavailable');
+  if (!ranked.matchId || !ranked.playerId) {
+    throw new Error('ranked_match_not_prepared');
+  }
 
-  const cleanCode = String(code || '').replace(/\D/g, '').slice(0, 6);
-  if (!cleanCode) throw new Error('lan_code_required');
-
-  const roomInfo = await this.bridge.getLanRoomByCode?.(cleanCode);
-  if (!roomInfo?.roomId || !roomInfo?.roomSecret) throw new Error('lan_room_not_found');
-
-  return {
-    ...roomInfo,
-    code: cleanCode,
-    ranked: !!roomInfo.ranked,
-    localOnly: roomInfo.localOnly !== false,
-    matchMode: roomInfo.ranked ? 'ranked' : 'casual'
-  };
-}
-
-async joinLanRoom(code, { forceLocalOnly = false, rankedOverride = null } = {}) {
-  if (!this.bridge) throw new Error('network_bridge_unavailable');
-
-  const roomInfo = await this.resolveLanRoom(code);
-  const ranked = rankedOverride === null ? !!roomInfo.ranked : !!rankedOverride;
-  const localOnly = roomInfo.localOnly !== false && !!forceLocalOnly;
-
-  this.room = {
-    roomId: roomInfo.roomId,
-    roomSecret: roomInfo.roomSecret,
-    code: roomInfo.code,
-    ranked,
-    localOnly,
-    matchMode: ranked ? 'ranked' : 'casual',
-    expiresAt: roomInfo.expiresAt || 0
-  };
-
-  await this.bridge.connectAsGuest({
-    roomId: roomInfo.roomId,
-    roomSecret: roomInfo.roomSecret,
-    forceLocalOnly: localOnly,
-    ranked,
-    rankedOverride
+  let current = await refreshRankedMatchStatus({
+    state,
+    session
   });
 
-  this.room = {
-    ...this.room,
-    ranked: !!this.bridge.ranked,
-    localOnly: !!this.bridge.forceLocalOnly,
-    matchMode: this.bridge.ranked ? 'ranked' : 'casual'
-  };
+  if (current.firstPlayerId) return current;
 
-  return this.room;
-}
+  const round = Math.max(
+    1,
+    Number(current.rps?.round || 1)
+  );
+  const salt = randomHex(24);
+  const commit = await sha256Hex([
+    ranked.matchId,
+    round,
+    ranked.playerId,
+    selected,
+    salt
+  ].join(':'));
 
-  async joinNearbyGameCode(code) {
-    if (!this.bridge) throw new Error('network_bridge_unavailable');
-
-    const res = await this.bridge.getNearbyGame(code);
-    if (!res?.roomId || !res?.roomSecret) throw new Error('nearby_game_not_found');
-
-    await this.bridge.connectAsGuest({
-      roomId: res.roomId,
-      roomSecret: res.roomSecret
-    });
-
-    return res;
-  }
-
-  async createInvite() {
-    if (!this.bridge) {
-      const invite = {
-        id: `mock_${Date.now().toString(36)}`,
-        roomId: '',
-        roomSecret: '',
-        url: '',
-        expiresAt: Date.now() + 120000,
-        preview: true,
-        mock: true
-      };
-      this.room = invite;
-      return invite;
-    }
-
-    const room = await this.bridge.connectAsHost();
-    const invite = {
-      id: room.roomId,
-      roomId: room.roomId,
-      roomSecret: room.roomSecret,
-      url: room.joinUrl,
-      expiresAt: Date.now() + 120000
-    };
-
-    this.room = invite;
-    return invite;
-  }
-
-  handleData(data) {
-    if (!data) return;
-
-    if (data?.type === MessageType.CHAT_MESSAGE || data?.type === 'CHAT_MESSAGE') {
-      this.onChat({
-        from: data.payload?.from || 'Соперник',
-        text: data.payload?.text || '',
-        at: data.at || Date.now()
-      });
-      return;
-    }
-
-    if (Object.values(MessageType).includes(data.type)) {
-      this.onGameData(data);
-    }
-  }
-
-  send(data) {
-    if (!this.bridge || !this.ready) return false;
-
-    try {
-      return !!this.bridge.send(data);
-    } catch {
-      this.ready = false;
-      this.onStatus({ label: 'send err', online: false });
-      this.onDisconnect({ reason: 'send_error' });
-      return false;
-    }
-  }
-
-  sendChat(text) {
-    const msg = createMessage(MessageType.CHAT_MESSAGE, {
-      from: this.player.name,
-      text
-    });
-
-    if (!this.bridge || !this.ready) return false;
-
-    try {
-      return this.bridge.sendChat
-        ? !!this.bridge.sendChat(text, this.player.name)
-        : this.send(msg);
-    } catch {
-      this.ready = false;
-      this.onStatus({ label: 'chat err', online: false });
-      this.onDisconnect({ reason: 'chat_send_error' });
-      return false;
-    }
-  }
-
-  sendGame(type, payload = {}) {
-    return this.send(createMessage(type, {
-      gameId: this.gameId,
-      from: {
-        id: this.player.id,
-        name: this.player.name
-      },
-      ...payload
-    }));
-  }
-
-  sendReady(payload = {}) {
-    return this.sendGame(MessageType.READY, payload);
-  }
-
-  sendBoardCommit(payload = {}) {
-    return this.sendGame(MessageType.BOARD_COMMIT, payload);
-  }
-
-  sendBoardReveal(payload = {}) {
-    return this.sendGame(MessageType.BOARD_REVEAL, payload);
-  }
-
-  sendShot(payload = {}) {
-    return this.sendGame(MessageType.SHOT, payload);
-  }
-
-  sendShotResult(payload = {}) {
-    return this.sendGame(MessageType.SHOT_RESULT, payload);
-  }
-
-  sendMatchFinished(payload = {}) {
-    return this.sendGame(MessageType.MATCH_FINISHED, payload);
-  }
-
-  async getProfile(friendId) {
-    if (!this.bridge) {
-      throw new Error('network_bridge_unavailable');
-    }
-
-    return this.bridge.getProfile(friendId);
-  }
-
-  async prepareRankedMatch() {
-    if (!this.bridge) {
-      throw new Error('network_bridge_unavailable');
-    }
-
-    const result = await this.bridge.prepareRankedMatch();
-
-    this.ranked = {
-      matchId: result?.match?.matchId || '',
-      playerId: result?.playerId || '',
-      peerPlayerId: result?.peerPlayerId || '',
-      status: result?.match?.status || ''
-    };
-
-    return result;
-  }
-
-  async prepareRankedStake(matchId) {
-    if (!this.bridge) {
-      throw new Error('network_bridge_unavailable');
-    }
-
-    return this.bridge.prepareRankedStake(matchId);
-  }
-
-  async commitRankedRps({
-    matchId,
+  let response = await session.commitRankedRps({
+    matchId: ranked.matchId,
     round,
     commit
-  } = {}) {
-    if (!this.bridge) {
-      throw new Error('network_bridge_unavailable');
+  });
+
+  applyRankedMatch(state, response?.match || {});
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (
+      ranked.firstPlayerId ||
+      ranked.rps?.canReveal
+    ) break;
+
+    if (document.hidden) {
+      await wait(Math.max(intervalMs, 1800));
+      continue;
     }
 
-    return this.bridge.commitRankedRps({
-      matchId,
-      round,
-      commit
+    await wait(intervalMs);
+    await refreshRankedMatchStatus({
+      state,
+      session
     });
   }
 
-  async revealRankedRps({
-    matchId,
+  if (ranked.firstPlayerId) return ranked;
+
+  if (!ranked.rps?.canReveal) {
+    throw new Error('ranked_rps_peer_commit_timeout');
+  }
+
+  response = await session.revealRankedRps({
+    matchId: ranked.matchId,
     round,
-    choice,
+    choice: selected,
     salt
-  } = {}) {
-    if (!this.bridge) {
-      throw new Error('network_bridge_unavailable');
+  });
+
+  applyRankedMatch(state, response?.match || {});
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (
+      ranked.firstPlayerId ||
+      ranked.rps?.roundStatus === 'draw' ||
+      Number(ranked.rps?.round || 1) > round
+    ) break;
+
+    if (document.hidden) {
+      await wait(Math.max(intervalMs, 1800));
+      continue;
     }
 
-    return this.bridge.revealRankedRps({
-      matchId,
-      round,
-      choice,
-      salt
+    await wait(intervalMs);
+    await refreshRankedMatchStatus({
+      state,
+      session
     });
   }
 
-  async submitRankedMatch({
-    matchId,
-    submission
-  } = {}) {
-    if (!this.bridge) {
-      throw new Error('network_bridge_unavailable');
+  return ranked;
+};
+
+export const recordRankedShot = (state, event) => {
+  const ranked = ensureRankedState(state);
+  const shotId = String(event?.shotId || '');
+
+  if (!shotId) return false;
+  if (ranked.transcript.some(item => item.shotId === shotId)) {
+    return false;
+  }
+
+  ranked.transcript.push(
+    normalizeEvent(event, ranked.transcript.length + 1)
+  );
+
+  return true;
+};
+
+export const setRankedFirstPlayer = (
+  state,
+  playerId
+) => {
+  const ranked = ensureRankedState(state);
+  ranked.firstPlayerId = String(playerId || '');
+  return ranked.firstPlayerId;
+};
+
+export const abortRankedMatch = async ({
+  state,
+  session,
+  reason = 'disconnect'
+} = {}) => {
+  const ranked = ensureRankedState(state);
+
+  if (
+    state.network?.ranked !== true ||
+    !ranked.matchId ||
+    isRankedTerminal(ranked.serverStatus)
+  ) {
+    return ranked;
+  }
+
+  const response = await session.abortRankedMatch({
+    matchId: ranked.matchId,
+    reason
+  });
+
+  const match = response?.match || {};
+  ranked.serverStatus = String(match.status || '');
+  ranked.settlement = match.settlement || null;
+  ranked.error = '';
+
+  if (match.terminal) {
+    ranked.submitStatus = match.status;
+  }
+
+  return ranked;
+};
+
+export const refreshRankedMatchStatus = async ({
+  state,
+  session
+} = {}) => {
+  const ranked = ensureRankedState(state);
+  if (!ranked.matchId) return ranked;
+
+  const response = await session.getRankedMatchStatus(
+    ranked.matchId
+  );
+
+  const match = response?.match || {};
+  applyRankedMatch(state, match);
+
+  if (isRankedTerminal(match.status)) {
+    ranked.submitStatus = match.status;
+  } else if (ranked.submitStatus !== 'submitting') {
+    ranked.submitStatus = 'submitted';
+  }
+
+  return ranked;
+};
+
+export const waitForRankedSettlement = async ({
+  state,
+  session,
+  attempts = 12,
+  intervalMs = 1250
+} = {}) => {
+  const ranked = ensureRankedState(state);
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const terminal = isRankedTerminal(
+      ranked.serverStatus
+    );
+    const economyDone = isRankedEconomyFinal(
+      ranked.economy?.status
+    );
+
+    if (terminal && economyDone) break;
+
+    if (document.hidden) {
+      await wait(Math.max(intervalMs, 2500));
+      continue;
     }
 
-    return this.bridge.submitRankedMatch({
-      matchId,
-      submission
+    await wait(intervalMs);
+    await refreshRankedMatchStatus({
+      state,
+      session
     });
   }
 
-  async getRankedMatchStatus(matchId) {
-    if (!this.bridge) {
-      throw new Error('network_bridge_unavailable');
-    }
+  return ranked;
+};
 
-    return this.bridge.getRankedMatchStatus(matchId);
+export const buildRankedSubmission = async state => {
+  const ranked = ensureRankedState(state);
+  const transcript = ranked.transcript
+    .map((event, index) => normalizeEvent(event, index + 1));
+
+  return {
+    result: state.result,
+    firstPlayerId: ranked.firstPlayerId,
+    boardReveal: packBoardReveal(state.myBoard),
+    boardSalt: state.fairPlay?.mySalt || '',
+    boardCommit: state.fairPlay?.myCommitHash || '',
+    transcript,
+    transcriptHash: await sha256Hex(
+      stableStringify(transcript)
+    )
+  };
+};
+
+export const submitRankedMatch = async ({
+  state,
+  session
+} = {}) => {
+  const ranked = ensureRankedState(state);
+
+  if (
+    state.network?.ranked !== true ||
+    state.phase !== 'finished' ||
+    !state.fairPlay?.enemyReveal ||
+    !ranked.matchId ||
+    !ranked.firstPlayerId
+  ) {
+    return null;
   }
 
-  async abortRankedMatch({
-    matchId,
-    reason = 'disconnect'
-  } = {}) {
-    if (!this.bridge) {
-      throw new Error('network_bridge_unavailable');
-    }
+  if (
+    ranked.submitStatus === 'submitting' ||
+    ranked.submitStatus === 'settled'
+  ) {
+    return ranked;
+  }
 
-    return this.bridge.abortRankedMatch({
-      matchId,
-      reason
+  ranked.submitStatus = 'submitting';
+  ranked.error = '';
+
+  try {
+    const response = await session.submitRankedMatch({
+      matchId: ranked.matchId,
+      submission: await buildRankedSubmission(state)
     });
-  }
 
-  async sendGameInvite({
-    toFriendId,
-    roomId,
-    roomSecret
-  } = {}) {
-    if (!this.bridge) {
-      throw new Error('network_bridge_unavailable');
+    const match = response?.match || {};
+    ranked.serverStatus = String(match.status || '');
+    ranked.settlement = match.settlement || null;
+    ranked.submitStatus =
+      match.status === 'settled'
+        ? 'settled'
+        : match.status === 'disputed'
+          ? 'disputed'
+          : 'submitted';
+
+    if (ranked.submitStatus === 'submitted') {
+      await waitForRankedSettlement({
+        state,
+        session
+      });
     }
 
-    return this.bridge.sendGameInvite({
-      toFriendId,
-      gameId: this.gameId,
-      roomId,
-      roomSecret
-    });
+    return ranked;
+  } catch (error) {
+    ranked.submitStatus = 'failed';
+    ranked.error = String(
+      error?.message || 'ranked_submit_failed'
+    );
+    throw error;
   }
+};
 
-  async toggleVoice(active) {
-    if (!this.bridge) return false;
-    await this.bridge.toggleVoice(active);
-    return true;
-  }
-
-  async close() {
-    try {
-      await this.bridge?.close?.();
-    } catch {
-      // ignore bridge close errors
-    }
-
-    this.ready = false;
-    this.room = null;
-    this.onStatus({ label: 'offline', online: false });
-  }
-}
+export default {
+  RANKED_TERMINAL_STATUSES,
+  RANKED_ECONOMY_FINAL_STATUSES,
+  isRankedTerminal,
+  isRankedEconomyFinal,
+  resetRankedState,
+  ensureRankedState,
+  prepareRankedMatch,
+  playRankedRps,
+  abortRankedMatch,
+  recordRankedShot,
+  setRankedFirstPlayer,
+  refreshRankedMatchStatus,
+  waitForRankedSettlement,
+  buildRankedSubmission,
+  submitRankedMatch
+};

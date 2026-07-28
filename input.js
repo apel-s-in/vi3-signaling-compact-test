@@ -1,209 +1,271 @@
-import { MessageType } from './protocol.js';
+const MAX_TURN_LOG = 80;
 
-const TICK_MS = 5000;
-const PING_EVERY_MS = 12000;
+const trimList = list => Array.isArray(list) ? list.slice(-MAX_TURN_LOG) : [];
 
-const now = () => Date.now();
+const makeViolation = (reason, details = {}) => ({
+  reason,
+  details,
+  at: Date.now()
+});
 
-export const createNetworkWatchdogState = () => ({
-  active: false,
-  lastPeerAt: 0,
-  lastPingAt: 0,
-  lastPongAt: 0,
-  lastWarningAt: 0,
-  softTimeoutMs: 20000,
-  hardTimeoutMs: 45000,
-  pendingTimeoutMs: 16000,
-  warning: false,
+export const createNetworkTurnState = () => ({
+  ok: true,
+  expectedShotId: '',
+  expectedShotX: -1,
+  expectedShotY: -1,
+  sentShotIds: [],
+  receivedShotIds: [],
+  resolvedShotIds: [],
+  violations: [],
   note: ''
 });
 
-export const ensureNetworkWatchdogState = state => {
-  if (!state.networkWatchdog) state.networkWatchdog = createNetworkWatchdogState();
+export const ensureNetworkTurnState = state => {
+  if (!state.networkTurn) state.networkTurn = createNetworkTurnState();
 
-  state.networkWatchdog.softTimeoutMs = Number(state.networkWatchdog.softTimeoutMs || 20000);
-  state.networkWatchdog.hardTimeoutMs = Number(state.networkWatchdog.hardTimeoutMs || 45000);
-  state.networkWatchdog.pendingTimeoutMs = Number(state.networkWatchdog.pendingTimeoutMs || 16000);
+  state.networkTurn.expectedShotId =
+    String(
+      state.networkTurn.expectedShotId || ''
+    );
+  state.networkTurn.expectedShotX =
+    Number.isInteger(
+      Number(state.networkTurn.expectedShotX)
+    )
+      ? Number(state.networkTurn.expectedShotX)
+      : -1;
+  state.networkTurn.expectedShotY =
+    Number.isInteger(
+      Number(state.networkTurn.expectedShotY)
+    )
+      ? Number(state.networkTurn.expectedShotY)
+      : -1;
+  state.networkTurn.sentShotIds =
+    trimList(state.networkTurn.sentShotIds);
+  state.networkTurn.receivedShotIds = trimList(state.networkTurn.receivedShotIds);
+  state.networkTurn.resolvedShotIds = trimList(state.networkTurn.resolvedShotIds);
+  state.networkTurn.violations = trimList(state.networkTurn.violations);
 
-  return state.networkWatchdog;
+  return state.networkTurn;
 };
 
-export const createNetworkWatchdog = ({
-  state,
-  session,
-  render,
-  addSystemMessage,
-  scheduleSaveMatchDraft
-}) => {
-  let timer = 0;
-  let paused = false;
+export const recordTurnViolation = (state, reason, details = {}) => {
+  const turn = ensureNetworkTurnState(state);
 
-  const touchPeer = () => {
-    const wd = ensureNetworkWatchdogState(state);
-    wd.active = !!state.network?.active;
-    wd.lastPeerAt = now();
-    wd.warning = false;
-    wd.note = '';
-  };
-
-  const markPong = () => {
-    const wd = ensureNetworkWatchdogState(state);
-    wd.lastPongAt = now();
-    touchPeer();
-  };
-
-  const warn = (text, { hard = false } = {}) => {
-    const wd = ensureNetworkWatchdogState(state);
-    const stamp = now();
-
-    if (stamp - Number(wd.lastWarningAt || 0) < 9000 && wd.note === text) return;
-
-    wd.warning = true;
-    wd.note = text;
-    wd.lastWarningAt = stamp;
-
-    if (state.network) {
-      state.network.status = hard ? 'error' : 'waiting';
-      state.network.text = text;
-      if (hard) state.network.connected = false;
-    }
-
-    addSystemMessage(text);
-    scheduleSaveMatchDraft();
-    render();
-  };
-
-  const clearWarning = () => {
-    const wd = ensureNetworkWatchdogState(state);
-    if (!wd.warning && !wd.note) return;
-
-    wd.warning = false;
-    wd.note = '';
-
-    if (state.network?.active && state.network?.connected && state.network.status === 'waiting') {
-      state.network.text = state.network.text || 'P2P-соединение активно.';
-    }
-
-    render();
-  };
-
-  const sendPingIfNeeded = () => {
-    if (!state.network?.active || !state.network?.connected) return;
-    if (state.phase === 'finished' && !state.network?.awaitingReveal) return;
-
-    const wd = ensureNetworkWatchdogState(state);
-    const stamp = now();
-
-    if (stamp - Number(wd.lastPingAt || 0) < PING_EVERY_MS) return;
-
-    wd.lastPingAt = stamp;
-
-    session.sendGame(MessageType.PING, {
-      matchId: state.matchStats?.matchId || '',
-      phase: state.phase,
-      awaitingShotResult: !!state.network?.awaitingShotResult,
-      awaitingReveal: !!state.network?.awaitingReveal,
-      hidden: !!document.hidden
-    });
-  };
-
-  const checkPending = () => {
-    if (!state.network?.active || !state.network?.connected) return;
-
-    const wd = ensureNetworkWatchdogState(state);
-    const stamp = now();
-    const lastPeerAt = Number(wd.lastPeerAt || state.network.lastEventAt || 0);
-    const silence = lastPeerAt ? stamp - lastPeerAt : 0;
-
-    if (state.network.awaitingShotResult && silence > wd.pendingTimeoutMs) {
-      warn('Соперник долго не отвечает на выстрел. Проверьте соединение.');
-      return;
-    }
-
-    if (state.network.awaitingReveal && silence > wd.pendingTimeoutMs) {
-      warn('Соперник долго не отправляет BOARD_REVEAL. Проверьте соединение.');
-      return;
-    }
-
-    if (state.phase === 'setup' && state.network.myReady && !state.network.peerReady && silence > wd.pendingTimeoutMs) {
-      warn('Вы готовы, но соперник долго не подтверждает готовность.');
-      return;
-    }
-
-    if (state.phase === 'rps' && state.networkRps?.myChoice && !state.networkRps?.peerChoice && silence > wd.pendingTimeoutMs) {
-      warn('Ждём выбор соперника в розыгрыше. Соединение может быть нестабильным.');
-      return;
-    }
-  };
-
-  const checkSilence = () => {
-    if (!state.network?.active || !state.network?.connected) return;
-
-    const wd = ensureNetworkWatchdogState(state);
-    const stamp = now();
-    const lastPeerAt = Number(wd.lastPeerAt || state.network.lastEventAt || 0);
-    if (!lastPeerAt) return;
-
-    const silence = stamp - lastPeerAt;
-
-    if (silence > wd.hardTimeoutMs) {
-      warn('Соперник не отвечает. Связь, возможно, потеряна.', { hard: true });
-      return;
-    }
-
-    if (silence > wd.softTimeoutMs) {
-      warn('Соперник долго не отвечает. Проверьте соединение.');
-      return;
-    }
-
-    if (wd.warning && silence < wd.softTimeoutMs) clearWarning();
-  };
-
-  const tick = () => {
-    if (paused || document.hidden) return;
-    if (!state.network?.active) return;
-
-    sendPingIfNeeded();
-    checkPending();
-    checkSilence();
-  };
-
-  const start = () => {
-    if (timer) return;
-
-    const wd = ensureNetworkWatchdogState(state);
-    wd.active = true;
-    timer = setInterval(tick, TICK_MS);
-  };
-
-  const stop = () => {
-    clearInterval(timer);
-    timer = 0;
-    paused = false;
-
-    const wd = ensureNetworkWatchdogState(state);
-    wd.active = false;
-  };
-
-  const pause = () => {
-    paused = true;
-  };
-
-  const resume = () => {
-    paused = false;
-    touchPeer();
-    tick();
-  };
+  turn.ok = false;
+  turn.note = reason;
+  turn.violations = trimList([
+    ...turn.violations,
+    makeViolation(reason, details)
+  ]);
 
   return {
-    start,
-    stop,
-    pause,
-    resume,
-    tick,
-    touchPeer,
-    markPong,
-    warn,
-    clearWarning
+    ok: false,
+    reason,
+    details
+  };
+};
+
+export const canSendNetworkShot = ({ state, x, y }) => {
+  const turn = ensureNetworkTurnState(state);
+  const cell = state.enemyBoard?.[y]?.[x];
+
+  if (state.phase !== 'player') {
+    return recordTurnViolation(state, 'shot_not_your_turn', {
+      phase: state.phase,
+      x,
+      y
+    });
+  }
+
+  if (state.network?.awaitingShotResult || turn.expectedShotId) {
+    return recordTurnViolation(state, 'shot_result_still_pending', {
+      expectedShotId: turn.expectedShotId,
+      x,
+      y
+    });
+  }
+
+  if (!cell) {
+    return recordTurnViolation(state, 'shot_outside_enemy_board', {
+      x,
+      y
+    });
+  }
+
+  if (cell.status) {
+    return recordTurnViolation(state, 'shot_to_open_cell', {
+      x,
+      y,
+      status: cell.status
+    });
+  }
+
+  return {
+    ok: true,
+    reason: 'ok'
+  };
+};
+
+export const recordOutgoingShot = ({ state, shotId, x, y, seq }) => {
+  const turn = ensureNetworkTurnState(state);
+
+  turn.expectedShotId = String(shotId || '');
+  turn.expectedShotX = Number(x);
+  turn.expectedShotY = Number(y);
+  turn.sentShotIds = trimList([
+    ...turn.sentShotIds,
+    String(shotId || '')
+  ]);
+  turn.note = `ожидается SHOT_RESULT ${shotId}`;
+
+  return {
+    ok: true,
+    shotId,
+    x,
+    y,
+    seq
+  };
+};
+
+export const clearOutgoingShotExpectation = state => {
+  const turn = ensureNetworkTurnState(state);
+  turn.expectedShotId = '';
+  turn.expectedShotX = -1;
+  turn.expectedShotY = -1;
+  turn.note = '';
+};
+
+export const verifyIncomingShot = ({ state, shotId, x, y }) => {
+  const turn = ensureNetworkTurnState(state);
+  const id = String(shotId || '');
+  const cell = state.myBoard?.[y]?.[x];
+
+  if (state.phase !== 'computer') {
+    return recordTurnViolation(state, 'incoming_shot_not_peer_turn', {
+      phase: state.phase,
+      shotId: id,
+      x,
+      y
+    });
+  }
+
+  if (!id) {
+    return recordTurnViolation(state, 'incoming_shot_without_id', {
+      x,
+      y
+    });
+  }
+
+  if (turn.receivedShotIds.includes(id)) {
+    return recordTurnViolation(state, 'duplicate_incoming_shot', {
+      shotId: id,
+      x,
+      y
+    });
+  }
+
+  if (!cell) {
+    return recordTurnViolation(state, 'incoming_shot_outside_board', {
+      shotId: id,
+      x,
+      y
+    });
+  }
+
+  if (cell.status) {
+    return recordTurnViolation(state, 'incoming_shot_to_open_cell', {
+      shotId: id,
+      x,
+      y,
+      status: cell.status
+    });
+  }
+
+  return {
+    ok: true,
+    reason: 'ok'
+  };
+};
+
+export const recordIncomingShot = ({ state, shotId }) => {
+  const turn = ensureNetworkTurnState(state);
+
+  turn.receivedShotIds = trimList([
+    ...turn.receivedShotIds,
+    String(shotId || '')
+  ]);
+  turn.note = '';
+
+  return {
+    ok: true
+  };
+};
+
+export const verifyIncomingShotResult = ({ state, shotId, x, y, result }) => {
+  const turn = ensureNetworkTurnState(state);
+  const id = String(shotId || '');
+
+  if (!state.network?.awaitingShotResult && !turn.expectedShotId) {
+    return recordTurnViolation(state, 'unexpected_shot_result', {
+      shotId: id
+    });
+  }
+
+  if (!id) {
+    return recordTurnViolation(state, 'shot_result_without_id', {});
+  }
+
+  if (turn.expectedShotId && id !== turn.expectedShotId) {
+    return recordTurnViolation(state, 'shot_result_id_mismatch', {
+      expectedShotId: turn.expectedShotId,
+      actualShotId: id
+    });
+  }
+  if (
+    Number(x) !== Number(turn.expectedShotX) ||
+    Number(y) !== Number(turn.expectedShotY)
+  ) {
+    return recordTurnViolation(state, 'shot_result_coordinate_mismatch', {
+      expectedX: turn.expectedShotX,
+      expectedY: turn.expectedShotY,
+      actualX: Number(x),
+      actualY: Number(y),
+      shotId: id
+    });
+  }
+
+  if (!['miss', 'hit', 'sunk'].includes(String(result || ''))) {
+    return recordTurnViolation(state, 'shot_result_value_invalid', {
+      shotId: id,
+      result
+    });
+  }
+  if (turn.resolvedShotIds.includes(id)) {
+    return recordTurnViolation(state, 'duplicate_shot_result', {
+      shotId: id
+    });
+  }
+
+  return {
+    ok: true,
+    reason: 'ok'
+  };
+};
+
+export const recordIncomingShotResult = ({ state, shotId }) => {
+  const turn = ensureNetworkTurnState(state);
+  const id = String(shotId || '');
+
+  turn.expectedShotId = '';
+  turn.expectedShotX = -1;
+  turn.expectedShotY = -1;
+  turn.resolvedShotIds = trimList([
+    ...turn.resolvedShotIds,
+    id
+  ]);
+  turn.note = '';
+
+  return {
+    ok: true
   };
 };

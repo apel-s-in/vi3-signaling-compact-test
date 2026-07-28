@@ -1,684 +1,1496 @@
-// UID.001_(Playback safety invariant)_(bridge не принимает playback-команды)_(Game iframe не может pause/stop/mute/seek/next/prev)
-// UID.082_(Local truth vs external telemetry split)_(iframe получает только safe snapshot)_(OAuth token/raw event log/localStorage не передаются)
-// UID.094_(No-paralysis rule)_(ошибка iframe не ломает приложение)_(bridge можно уничтожить без влияния на музыку)
-// UID.095_(Ownership boundary)_(parent остаётся владельцем профиля/stat/auth/backup/player)_(game-app только читает snapshot)
-import { requestSocialAction } from '../../core/social-session.js';
-import { getConfirmedListeningStats } from '../../analytics/confirmed-listening-stats.js';
-import { getLoyaltyState } from '../../analytics/loyalty-state.js';
-import {
-  getEmbeddedFriendsRpcMethod
-} from 'https://vi3na1bita.website.yandexcloud.net/Friends/embedded-rpc-contract.js?v=9.1.8';
-const W = window;
-const safe = v => String(v == null ? '' : v).trim();
-const n = v => Number.isFinite(Number(v)) ? Number(v) : 0;
-const GAME_SIGNALING_SCOPES = Object.freeze({
-  tower: new Set([
-    'player_register',
-    'presence_heartbeat',
-    'friend_status_check',
-    'presence_batch',
-    'friend_list',
-    'profile_get',
-    'rtc_config',
-    'leaderboard_v2_get'
-  ]),
-  war_hearts: new Set([
-    'player_register',
-    'presence_heartbeat',
-    'friend_status_check',
-    'profile_get',
-    'rtc_config',
-    'room_create',
-    'room_join',
-    'room_join_token_create',
-    'room_join_token_redeem',
-    'room_get',
-    'room_close',
-    'room_set_mode',
-    'ranked_match_prepare',
-    'ranked_stake_prepare',
-    'ranked_rps_commit',
-    'ranked_rps_reveal',
-    'ranked_match_submit',
-    'ranked_match_status',
-    'ranked_match_abort',
-    'leaderboard_v2_get',
-    'signal_send',
-    'signal_poll',
-    'signal_ack',
-    'push_send',
-    'nearby_game_create',
-    'nearby_game_join',
-    'lan_code_register',
-    'lan_code_resolve'
-  ])
+import { createEmptyBoard, createFleet, autoPlaceFleet, syncFleetToBoard, formatCellName, getShipCellsAt, isShipSunk, markSunkPerimeter } from './game/board.js';
+import { createInitialState } from './game/state.js';
+import { pickSmartTarget } from './game/targeting.js';
+import { applyRevealToBoard, createSalt, packBoardReveal, validateRevealLayout } from './game/fair-play.js';
+import { createMatchPersistence } from './game/match-persistence.js';
+import { WarHeartsSession } from './net/war-hearts-session.js';
+import { createNetworkCombat } from './game/network-combat.js';
+import { createNetworkWatchdog } from './game/network-watchdog.js';
+import { renderMenu } from './screens/menu.js';
+import { renderOpponentSelect } from './screens/opponent-select.js';
+import { renderField } from './screens/field.js';
+import { renderInviteWait } from './screens/invite-wait.js';
+import { renderBattle } from './screens/battle.js';
+const $ = id => document.getElementById(id);
+const GAME_ID = 'war_hearts';
+let hostBridgeId = '';
+const postToHost = (type, payload = {}) => {
+  if (window.parent === window) return false;
+  try {
+    window.parent.postMessage({ kind: 'vitrina:game', bridgeId: hostBridgeId, capabilityToken: String(window.__GC_CAPABILITY_TOKEN || ''), type, gameId: GAME_ID, payload: { gameId: GAME_ID, ...payload, at: payload.at || Date.now() } }, '*');
+    return true;
+  } catch {
+    return false;
+  }
+};
+const initialFleet = autoPlaceFleet(createFleet());
+const state = createInitialState({
+  snapshot: null,
+  player: { id: `wh_${Math.random().toString(36).slice(2, 10)}`, name: 'Слушатель', title: 'Новичок Сердец' },
+  fleet: initialFleet,
+  myBoard: syncFleetToBoard(initialFleet, createEmptyBoard()),
+  enemyBoard: syncFleetToBoard(autoPlaceFleet(createFleet()), createEmptyBoard())
 });
-
-const GAME_SAVE_LIMITS = Object.freeze({
-  war_hearts: Object.freeze({
-    matchDraft: 192 * 1024,
-    matchHistory: 96 * 1024,
-    presets: 48 * 1024,
-    uiSettings: 16 * 1024
-  })
+window.addEventListener('message', e => {
+  if (window.parent !== window && e.source !== window.parent) return;
+  const d = e.data || {};
+  if (d.kind !== 'vitrina:game-host') return;
+  if (d.bridgeId) {
+    hostBridgeId = d.bridgeId;
+    window.__GC_BRIDGE_ID = hostBridgeId;
+  }
+  if (d.type === 'GC_INIT') {
+    window.__GC_CAPABILITY_TOKEN = String(d.payload?.capabilityToken || '');
+    const snap = d.payload?.snapshot || null;
+    if (snap) {
+      state.snapshot = snap;
+      state.friendIdentity = snap.friend || null;
+      if (snap.user?.displayName) state.player.name = snap.user.displayName;
+      if (snap.user?.gcAccountId) state.player.id = snap.user.gcAccountId;
+    }
+    postToHost('GC_REQUEST_SNAPSHOT');
+    render();
+    return;
+  }
+  if (d.type === 'GC_SNAPSHOT') {
+    state.snapshot = d.payload || state.snapshot;
+    state.friendIdentity = d.payload?.friend || d.payload?.snapshot?.friend || null;
+    if (d.payload?.user?.displayName) state.player.name = d.payload.user.displayName;
+    if (d.payload?.user?.gcAccountId) state.player.id = d.payload.user.gcAccountId;
+    if (!restoreMatchDraft()) render();
+    return;
+  }
+  if (d.type === 'GC_RESTORE_GAME') {
+    document.body.dataset.screen = state.screen || 'menu';
+    $('app')?.removeAttribute('hidden');
+    $('screen-root')?.removeAttribute('hidden');
+    render();
+    // После восстановления просим свежий snapshot, чтобы кнопка сворачивания не теряла play/pause-состояние.
+    const requestSnapshot = () => postToHost('GC_REQUEST_SNAPSHOT');
+    requestSnapshot();
+    setTimeout(requestSnapshot, 150);
+  }
 });
+postToHost('GC_READY');
 
-const GAME_HOST_SYNC_EVENTS = Object.freeze([
-  'achievements:updated',
-  'stats:updated',
-  'analytics:liveTick',
-  'yandex:auth:changed',
-  'shards:wallet-updated',
-  'player:play',
-  'player:pause',
-  'player:stop',
-  'player:trackChanged',
-  'player:transportReloaded',
-  'playlist:changed',
-  'quality:changed'
-]);
+const waitForHostBridge = async (timeoutMs = 5000) => {
+  if (window.parent === window) return true;
 
-const validateGameSave = payload => {
-  const gameId = safe(payload?.gameId);
-  const key = safe(payload?.key);
-  const limit = GAME_SAVE_LIMITS[gameId]?.[key];
-
-  if (!limit) {
-    throw new Error('game_save_key_forbidden');
+  const startedAt = Date.now();
+  while (!hostBridgeId && Date.now() - startedAt < timeoutMs) {
+    postToHost('GC_READY');
+    await new Promise(resolve => setTimeout(resolve, 100));
   }
 
-  const text = JSON.stringify(payload?.data ?? null);
+  return !!hostBridgeId;
+};
 
-  if (text.length > limit) {
-    throw new Error('game_save_payload_too_large');
+const session = new WarHeartsSession({ gameId: GAME_ID, player: state.player });
+let computerTimer = 0;
+let playerAutoTimer = 0;
+let inviteTimer = 0;
+let matchPersistence = null;
+let networkCombat = null;
+let networkWatchdog = null;
+let sessionReady = Promise.resolve(false);
+const saveMatchDraftNow = () => matchPersistence?.saveMatchDraftNow();
+const scheduleSaveMatchDraft = () => matchPersistence?.scheduleSaveMatchDraft();
+const restoreMatchDraft = () => matchPersistence?.restoreMatchDraft() || false;
+const clearMatchDraft = () => matchPersistence?.clearMatchDraft();
+let launchCancelled = false;
+const isLaunchCancelled = () => launchCancelled;
+const markLaunchCancelled = () => {
+  launchCancelled = true;
+};
+const stripLaunchParams = () => {
+  const u = new URL(window.location.href);
+  ['inviteFriend', 'join', 'room', 'key', 'secret'].forEach(key => u.searchParams.delete(key));
+  window.history.replaceState(null, '', u.toString());
+};
+const waitForFriendIdentity = async (timeoutMs = 3500) => {
+  const started = Date.now();
+  while (!state.friendIdentity?.friendId && Date.now() - started < timeoutMs) {
+    postToHost('GC_REQUEST_SNAPSHOT');
+    await new Promise(resolve => setTimeout(resolve, 120));
   }
+  return state.friendIdentity || state.snapshot?.friend || null;
+};
+const isYandexAuthed = () => !!state.snapshot?.user?.yandexLinked;
+const requestYandexLogin = () => {
+  postToHost('GC_AUTH_LOGIN', { reason: 'war_hearts_ranked_required' });
+  postToHost('GC_REQUEST_SNAPSHOT');
+  toast('Откройте вход через Яндекс в основном приложении');
+};
+const waitForYandexAuth = async (timeoutMs = 18000) => {
+  const started = Date.now();
+  while (!isYandexAuthed() && Date.now() - started < timeoutMs) {
+    postToHost('GC_REQUEST_SNAPSHOT');
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  return isYandexAuthed();
+};
+const openRankedAuthGate = ({
+  title = 'Рейтинговый бой',
+  text = 'Войдите через Яндекс. Сетевые бои всегда рейтинговые и требуют ставку 100 ♦.',
+  loginText = 'Войти через Яндекс',
+  onAuthed
+} = {}) => {
+  const overlay = document.createElement('div');
+  overlay.className = 'wh-modal-overlay';
+  overlay.innerHTML = `
+    <div class="wh-modal-box">
+      <h3 class="wh-modal-title">${title}</h3>
+      <p class="wh-modal-text">${text}</p>
+      <div class="wh-modal-actions" style="flex-direction:column;gap:10px">
+        <button class="wh-btn" type="button" id="wh-auth-login" style="background:linear-gradient(135deg,#ff9800,#f57c00)">
+          🏆 ${loginText}
+        </button>
+        <button class="wh-btn secondary" type="button" id="wh-auth-cancel" style="background:transparent;border:1px solid rgba(255,255,255,.2)">
+          Отмена
+        </button>
+      </div>
+    </div>
+  `;
 
-  return {
-    gameId,
-    key,
-    data: JSON.parse(text)
+  document.body.appendChild(overlay);
+  overlay.querySelector('#wh-auth-cancel').onclick = () => overlay.remove();
+  overlay.querySelector('#wh-auth-login').onclick = async () => {
+    requestYandexLogin();
+
+    if (!(await waitForYandexAuth())) {
+      toast('Авторизация пока не завершена');
+      return;
+    }
+
+    overlay.remove();
+    onAuthed?.();
   };
 };
-const normalizeRpcPayload = payload => {
-  const data = payload && typeof payload === 'object'
-    ? payload
-    : {};
-
-  const text = JSON.stringify(data);
-  if (text.length > 65536) {
-    throw new Error('game_rpc_payload_too_large');
-  }
-
-  return JSON.parse(text);
+const makeEmptyBoard = () => Array.from({ length: 10 }, () => Array.from({ length: 10 }, () => ({ ship: false, status: '' })));
+const clearBattleTimers = () => {
+  clearTimeout(computerTimer);
+  clearTimeout(playerAutoTimer);
 };
-const confirmEmbeddedFriendsAction = descriptor =>
-  new Promise(resolve => {
-    const confirmation = descriptor?.confirmation;
-
-    if (!descriptor?.dangerous || !confirmation) {
-      resolve(true);
-      return;
-    }
-
-    if (!W.Modals?.confirm) {
-      resolve(false);
-      return;
-    }
-
-    let settled = false;
-    const finish = value => {
-      if (settled) return;
-      settled = true;
-      resolve(!!value);
+const INVITE_TTL_MS = 120000;
+const boardShipCells = board => board.flat().filter(cell => cell.ship);
+const isBoardDefeated = board => {
+  const ships = boardShipCells(board);
+  return ships.length > 0 && ships.every(cell => cell.status === 'hit');
+};
+const createMatchStats = () => ({
+  matchId: `whm_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+  startedAt: Date.now(),
+  finishedAt: 0,
+  playerShots: 0,
+  opponentShots: 0,
+  playerHits: 0,
+  opponentHits: 0,
+  playerMisses: 0,
+  opponentMisses: 0,
+  playerSunk: 0,
+  opponentSunk: 0,
+  playerHitStreak: 0,
+  opponentHitStreak: 0,
+  playerBestHitStreak: 0,
+  opponentBestHitStreak: 0,
+  playerSunkStreak: 0,
+  opponentSunkStreak: 0,
+  playerBestSunkStreak: 0,
+  opponentBestSunkStreak: 0
+});
+const resetMatchStats = () => {
+  state.matchStats = createMatchStats();
+};
+const resetFairPlayForMatch = () => {
+  state.fairPlay = { matchId: state.matchStats.matchId, mySalt: createSalt(), myCommitHash: '', enemyCommitHash: '', myReveal: null, enemyReveal: null, revealed: false, myLayoutOk: null, enemyLayoutOk: null, enemyCommitOk: null, enemyTranscriptOk: null, note: 'commit будет рассчитан перед сетевым матчем' };
+};
+const revealFinalBoards = () => {
+  const myReveal = packBoardReveal(state.myBoard);
+  const myCheck = validateRevealLayout(myReveal);
+  applyRevealToBoard(state.myBoard, myReveal);
+  if (state.opponent?.type === 'network') {
+    state.fairPlay = {
+      ...state.fairPlay,
+      matchId: state.matchStats.matchId,
+      myReveal,
+      revealed: !!state.fairPlay.enemyReveal,
+      myLayoutOk: myCheck.ok,
+      enemyLayoutOk: state.fairPlay.enemyLayoutOk,
+      enemyCommitOk: state.fairPlay.enemyCommitOk,
+      note: state.fairPlay.enemyReveal ? state.fairPlay.note : 'ожидается BOARD_REVEAL соперника'
     };
-
-    W.Modals.confirm({
-      title: safe(confirmation.title || 'Подтвердите действие'),
-      textHtml:
-        W.Utils?.escapeHtml?.(
-          confirmation.text ||
-          'Это действие изменит данные Friends.'
-        ) ||
-        safe(confirmation.text),
-      confirmText: safe(
-        confirmation.confirmText ||
-        'Продолжить'
-      ),
-      cancelText: 'Отмена',
-      onConfirm: () => finish(true),
-      onCancel: () => finish(false),
-      onClose: () => finish(false)
-    });
-  });
-const buildSnapshot = ({ config = {} } = {}) => {
-  const a = W.achievementEngine, ya = W.YandexAuth, t = W.playerCore?.getCurrentTrack?.(), confirmed = getConfirmedListeningStats(), loyalty = getLoyaltyState();
-  const gcId = localStorage.getItem('intel:internal-user-id') || localStorage.getItem('deviceHash') || 'local';
-  const unlocked = a?.getCompletedCount?.() ??
-    Object.keys(a?.unlocked || {}).length;
-  const total = Array.isArray(a?.achievements) ? a.achievements.length : 0;
-  let gameData = {};
-  try { gameData = JSON.parse(localStorage.getItem(`gc_data_${gcId}`) || '{}'); } catch {}
-  return {
-    kind: 'GC_SNAPSHOT',
-    app: {
-      version: safe(W.APP_CONFIG?.APP_VERSION || W.VERSION || ''),
-      buildDate: safe(W.APP_CONFIG?.BUILD_DATE || W.BUILD_DATE || ''),
-      bridgeVersion: n(config.bridgeVersion || 1)
-    },
-    gate: {
-      status: safe(config.status || 'off'),
-      enterEnabled: !!config.enterEnabled,
-      revision: safe(config.revision || '')
-    },
-    friend: W.__vfIdentity || null,
-    user: {
-      gcAccountId: gcId,
-      displayName: safe(ya?.getProfile?.()?.displayName || ya?.getProfile?.()?.login || 'Слушатель'),
-      avatar: safe(ya?.getProfile?.()?.avatar || ''),
-      authStatus: safe(ya?.getSessionStatus?.() || 'logged_out'),
-      yandexLinked: ya?.getSessionStatus?.() === 'active',
-      diskAccess: !!ya?.hasDiskAccess?.()
-    },
-    gameData,
-    progress: {
-      level: n(a?.profile?.level || 1),
-      xp: n(a?.profile?.xp || 0),
-      achievementsUnlocked: unlocked,
-      achievementsTotal: total,
-      streak: loyalty.available
-        ? n(loyalty.currentDays)
-        : 0,
-      totalListenSec: confirmed.available
-        ? Math.floor(n(confirmed.totalListenMs) / 1000)
-        : 0
-    },
-    wallet: W.ShardWallet?.getSnapshot?.() || {
-      available: false,
-      shards: 0,
-      locked: 0,
-      spendable: 0,
-      version: 0
-    },
-    player: {
-      playing: !!W.playerCore?.isPlaying?.(),
-      uid: safe(t?.uid || ''),
-      title: safe(t?.title || ''),
-      album: safe(t?.album || W.TrackRegistry?.getAlbumTitle?.(t?.sourceAlbum) || ''),
-      cover: safe(t?.cover || ''),
-      position: Math.max(0, n(W.playerCore?.getPosition?.())),
-      duration: Math.max(0, n(W.playerCore?.getDuration?.())),
-      quality: safe(W.playerCore?.qMode || 'hi')
-    }
-  };
+    return;
+  }
+  const enemyReveal = packBoardReveal(state.enemyBoard);
+  const enemyCheck = validateRevealLayout(enemyReveal);
+  applyRevealToBoard(state.enemyBoard, enemyReveal);
+  state.fairPlay = { ...state.fairPlay, matchId: state.matchStats.matchId, myReveal, enemyReveal, revealed: true, myLayoutOk: myCheck.ok, enemyLayoutOk: enemyCheck.ok, enemyCommitOk: true, note: 'локальный бой: расстановка раскрыта и проверена по правилам' };
 };
-
-export const createGameBridgeHost = ({ iframe, config = {}, onState } = {}) => {
-  const bridgeId = crypto.randomUUID();
-  const activeFriendsRequests = new Set();
-
-  const capabilities = Object.freeze({
-    tower: crypto.randomUUID(),
-    war_hearts: crypto.randomUUID()
-  });
-
-  const capabilityScopes = new Map([
-    [capabilities.tower, 'tower'],
-    [capabilities.war_hearts, 'war_hearts']
-  ]);
-
-  let alive = true;
-
-  const getCapabilityScope = payload =>
-    capabilityScopes.get(
-      safe(payload?.capabilityToken)
-    ) || '';
-
-  const requireCapability = (
-    payload,
-    allowedScopes
-  ) => {
-    const scope = getCapabilityScope(payload);
-
-    if (
-      !scope ||
-      !allowedScopes.includes(scope)
-    ) {
-      const error = new Error('game_capability_forbidden');
-      error.status = 403;
-      throw error;
+const finishMatch = (result, message) => {
+  if (state.phase === 'finished') return;
+  state.result = result;
+  state.phase = 'finished';
+  state.autoBattle.player = false;
+  clearTimeout(playerAutoTimer);
+  clearTimeout(computerTimer);
+  state.matchStats.finishedAt = Date.now();
+  revealFinalBoards();
+  addSystemMessage(message);
+  addSystemMessage('Расстановки раскрыты. Проверка правил завершена.');
+  if (state.opponent?.type === 'network') {
+    networkCombat?.sendMatchFinished(result);
+    networkCombat?.sendBoardReveal();
+  }
+  render();
+  saveMatchDraftNow();
+};
+const registerShotStats = (side, result) => {
+  const stats = state.matchStats;
+  if (!stats.matchId) stats.matchId = `whm_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  if (!stats.startedAt) stats.startedAt = Date.now();
+  const hit = result === 'hit' || result === 'sunk';
+  if (side === 'player') {
+    stats.playerShots++;
+    if (hit) {
+      stats.playerHits++;
+      stats.playerHitStreak++;
+      stats.playerBestHitStreak = Math.max(stats.playerBestHitStreak || 0, stats.playerHitStreak);
+    } else {
+      stats.playerMisses++;
+      stats.playerHitStreak = 0;
     }
-
-    return scope;
-  };
-
-  const makeInitPayload = (extra = {}) => ({
-    bridgeId,
-    snapshot: buildSnapshot({ config }),
-    capabilities: {
-      tower: capabilities.tower,
-      games: {
-        war_hearts: capabilities.war_hearts
-      }
-    },
-    ...extra
-  });
-
-  const send = (type, payload = {}) => {
-    if (!alive || !iframe?.contentWindow) return false;
-    try {
-      iframe.contentWindow.postMessage({ kind: 'vitrina:game-host', bridgeId, type, payload }, '*');
-      return true;
-    } catch { return false; }
-  };
-
-  const sendSnapshot = () => send('GC_SNAPSHOT', buildSnapshot({ config }));
-  const handleFriendsRequest = async payload => {
-    const requestId = safe(payload?.requestId);
-    const method = safe(payload?.method);
-    const descriptor = getEmbeddedFriendsRpcMethod(method);
-    const capabilityScope = getCapabilityScope(payload);
-
-    if (
-      !requestId ||
-      !descriptor ||
-      !['tower', 'war_hearts'].includes(capabilityScope)
-    ) {
-      send('GC_FRIENDS_RESPONSE', {
-        requestId,
-        ok: false,
-        status: 403,
-        error: 'friends_rpc_method_forbidden'
-      });
-      return;
-    }
-
-    if (activeFriendsRequests.has(requestId)) {
-      send('GC_FRIENDS_RESPONSE', {
-        requestId,
-        ok: false,
-        status: 409,
-        error: 'friends_rpc_request_duplicate'
-      });
-      return;
-    }
-
-    activeFriendsRequests.add(requestId);
-
-    try {
-      const args = normalizeRpcPayload(
-        Array.isArray(payload?.args)
-          ? payload.args
-          : []
+    if (result === 'sunk') {
+      stats.playerSunk++;
+      stats.playerSunkStreak = Number(stats.playerSunkStreak || 0) + 1;
+      stats.playerBestSunkStreak = Math.max(
+        Number(stats.playerBestSunkStreak || 0),
+        stats.playerSunkStreak
       );
-
-      const module = await import(
-        '../friends/friends-block.js'
-      );
-      const core = await module.getFriendsCoreService();
-
-      if (!core?.isReady?.()) {
-        throw new Error('friends_identity_required');
-      }
-
-      if (
-        descriptor.dangerous &&
-        !(await confirmEmbeddedFriendsAction(descriptor))
-      ) {
-        send('GC_FRIENDS_RESPONSE', {
-          requestId,
-          ok: false,
-          status: 409,
-          error: 'friends_rpc_confirmation_cancelled'
-        });
+    } else if (result === 'miss') {
+      stats.playerSunkStreak = 0;
+    }
+    return;
+  }
+  stats.opponentShots++;
+  if (hit) {
+    stats.opponentHits++;
+    stats.opponentHitStreak++;
+    stats.opponentBestHitStreak = Math.max(stats.opponentBestHitStreak || 0, stats.opponentHitStreak);
+  } else {
+    stats.opponentMisses++;
+    stats.opponentHitStreak = 0;
+  }
+  if (result === 'sunk') {
+    stats.opponentSunk++;
+    stats.opponentSunkStreak = Number(stats.opponentSunkStreak || 0) + 1;
+    stats.opponentBestSunkStreak = Math.max(
+      Number(stats.opponentBestSunkStreak || 0),
+      stats.opponentSunkStreak
+    );
+  } else if (result === 'miss') {
+    stats.opponentSunkStreak = 0;
+  }
+};
+const addSystemMessage = text => {
+  state.chat.push({ from: 'Система', text, at: Date.now() });
+  scheduleSaveMatchDraft();
+};
+const showBattleFx = (lane, kind) => {
+  const labels = { miss: 'ПРОМАХ', hit: 'РАНИЛ', sunk: 'УБИЛ' };
+  state.battleFx = { lane, kind, text: labels[kind] || String(kind || '').toUpperCase(), id: Date.now() };
+  render();
+  const fxId = state.battleFx.id;
+  setTimeout(() => {
+    if (state.battleFx?.id === fxId) {
+      state.battleFx = null;
+      render();
+    }
+  }, 920);
+};
+const computerShoot = () => {
+  if (state.screen !== 'battle' || state.phase !== 'computer') return;
+  const target = pickSmartTarget(state.myBoard);
+  if (!target) {
+    state.phase = 'player';
+    render();
+    schedulePlayerAutoShot();
+    return;
+  }
+  const coord = formatCellName(target.x, target.y);
+  const hit = !!target.cell.ship;
+  target.cell.status = hit ? 'hit' : 'miss';
+  const shipCells = hit ? getShipCellsAt(state.myBoard, target.x, target.y) : [];
+  const sunk = hit && isShipSunk(state.myBoard, shipCells);
+  if (sunk) markSunkPerimeter(state.myBoard, shipCells);
+  const fxKind = sunk ? 'sunk' : hit ? 'hit' : 'miss';
+  const resultText = sunk ? 'убил корабль' : hit ? 'ранил корабль' : 'промахнулся';
+  registerShotStats('opponent', fxKind);
+  showBattleFx('mine', fxKind);
+  addSystemMessage(`Компьютер стреляет ${coord}: ${resultText}.`);
+  if (isBoardDefeated(state.myBoard)) {
+    finishMatch('loss', 'Матч завершён: поражение.');
+    return;
+  }
+  if (!hit) {
+    state.phase = 'player';
+    render();
+    scheduleSaveMatchDraft();
+    schedulePlayerAutoShot();
+    return;
+  }
+  render();
+  scheduleSaveMatchDraft();
+  clearTimeout(computerTimer);
+  computerTimer = setTimeout(computerShoot, 720);
+};
+const toast = text => {
+  const el = $('toast');
+  if (!el) return;
+  el.textContent = text;
+  el.hidden = false;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => {
+    el.hidden = true;
+  }, 1500);
+};
+const openTurnDuel = () => {
+  const old = document.querySelector('.wh-rps-modal-overlay');
+  if (old) old.remove();
+  state.rps = { active: true, playerChoice: '', opponentChoice: '', message: 'Выбери знак. Победитель делает первый выстрел.' };
+  const choices = [
+    { id: 'rock', icon: '✊', label: 'Камень' },
+    { id: 'scissors', icon: '✌️', label: 'Ножницы' },
+    { id: 'paper', icon: '✋', label: 'Бумага' }
+  ];
+  const overlay = document.createElement('div');
+  overlay.className = 'wh-rps-modal-overlay';
+  overlay.innerHTML = `
+    <div class="wh-rps-modal-box">
+      <div class="wh-rps-kicker">Розыгрыш первого хода</div>
+      <h2 class="wh-rps-title">Камень · Ножницы · Бумага</h2>
+      <p class="wh-rps-text" id="wh-rps-text">${state.rps.message}</p>
+      <div class="wh-rps-choices" id="wh-rps-choices">
+        ${choices
+          .map(
+            choice => `
+          <button class="wh-rps-choice" type="button" data-choice="${choice.id}">
+            <span>${choice.icon}</span>
+            <b>${choice.label}</b>
+          </button>
+        `
+          )
+          .join('')}
+      </div>
+      <div class="wh-rps-result" id="wh-rps-result" hidden></div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  const getOpponentChoice = () => choices[Math.floor(Math.random() * choices.length)].id;
+  const getChoiceLabel = id => choices.find(choice => choice.id === id)?.label || id;
+  const compare = (player, opponent) => {
+    if (player === opponent) return 'draw';
+    if ((player === 'rock' && opponent === 'scissors') || (player === 'scissors' && opponent === 'paper') || (player === 'paper' && opponent === 'rock')) {
+      return 'player';
+    }
+    return 'opponent';
+  };
+  const confirmLeave = () => {
+    const confirm = document.createElement('div');
+    confirm.className = 'wh-modal-overlay';
+    confirm.innerHTML = `
+      <div class="wh-modal-box">
+        <h3 class="wh-modal-title">Покинуть бой?</h3>
+        <p class="wh-modal-text">Если покинуть сейчас, это будет засчитано как поражение. Вернуться в главное меню?</p>
+        <div class="wh-modal-actions">
+          <button class="wh-btn secondary" type="button" id="wh-rps-leave-cancel">Остаться</button>
+          <button class="wh-btn" type="button" id="wh-rps-leave-confirm" style="background:var(--wh-red)">Покинуть</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(confirm);
+    confirm.querySelector('#wh-rps-leave-cancel').onclick = () => confirm.remove();
+    confirm.querySelector('#wh-rps-leave-confirm').onclick = () => {
+      confirm.remove();
+      overlay.remove();
+      state.rps.active = false;
+      state.result = 'loss';
+      state.phase = 'finished';
+      state.matchStats.finishedAt = Date.now();
+      addSystemMessage('Игрок покинул бой до первого выстрела. Засчитано поражение.');
+      actions.openMenu();
+    };
+  };
+  const showResult = result => {
+    const choicesEl = overlay.querySelector('#wh-rps-choices');
+    const resultEl = overlay.querySelector('#wh-rps-result');
+    const text = overlay.querySelector('#wh-rps-text');
+    if (choicesEl) choicesEl.hidden = true;
+    if (text) {
+      text.textContent = result === 'player' ? 'Поздравляем, ваш ход первый.' : 'Ваш соперник получил право первого выстрела.';
+    }
+    resultEl.hidden = false;
+    resultEl.innerHTML = `
+      <div class="wh-rps-result-card ${result === 'player' ? 'is-player' : 'is-opponent'}">
+        <b>${result === 'player' ? 'Первый ход твой' : 'Первым ходит соперник'}</b>
+        <span>${result === 'player' ? 'Начни бой и выбери цель.' : 'После старта соперник сделает первый выстрел.'}</span>
+      </div>
+      <div class="wh-rps-actions">
+        <button class="wh-btn" type="button" id="wh-rps-start">Начать бой</button>
+        <button class="wh-btn secondary" type="button" id="wh-rps-leave">Покинуть</button>
+      </div>
+    `;
+    resultEl.querySelector('#wh-rps-start').onclick = () => {
+      state.rps.active = false;
+      overlay.remove();
+      if (result === 'player') {
+        state.phase = 'player';
+        addSystemMessage('Розыгрыш завершён. Первый ход твой.');
+        render();
+        scheduleSaveMatchDraft();
+        schedulePlayerAutoShot();
         return;
       }
-
-      let result;
-
-      if (method === 'getEmbeddedIdentity') {
-        result = {
-          friendId: safe(core.identity?.friendId),
-          displayName: safe(
-            core.identity?.displayName ||
-            'Слушатель'
-          ),
-          avatar: safe(core.identity?.avatar),
-          yandexLinked: true
-        };
-      } else if (method === 'getEmbeddedWebPushEnabled') {
-        result = module.getFriendsWebPushEnabled();
-      } else if (method === 'enableEmbeddedWebPush') {
-        result = await module.enableFriendsWebPush();
-      } else if (method === 'setEmbeddedFriendsActive') {
-        result = await module.setFriendsEmbeddedActive(
-          args[0] || {}
-        );
-      } else {
-        const fn = core[method];
-
-        if (
-          descriptor.route !== 'core' ||
-          typeof fn !== 'function'
-        ) {
-          throw new Error('friends_rpc_method_missing');
-        }
-
-        result = await fn.apply(core, args);
-      }
-
-      send('GC_FRIENDS_RESPONSE', {
-        requestId,
-        ok: true,
-        status: 200,
-        result: result === undefined ? null : result
-      });
-    } catch (error) {
-      send('GC_FRIENDS_RESPONSE', {
-        requestId,
-        ok: false,
-        status: Number(error?.status || 500),
-        error: safe(
-          error?.message ||
-          'friends_rpc_failed'
-        )
-      });
-    } finally {
-      activeFriendsRequests.delete(requestId);
-    }
+      state.phase = 'computer';
+      addSystemMessage('Розыгрыш завершён. Первым ходит соперник.');
+      render();
+      scheduleSaveMatchDraft();
+      clearTimeout(computerTimer);
+      computerTimer = setTimeout(computerShoot, 720);
+    };
+    resultEl.querySelector('#wh-rps-leave').onclick = confirmLeave;
   };
-  const handleSignalingRequest = async payload => {
-    const requestId = safe(payload?.requestId);
-    const action = safe(payload?.action);
-    const scope = getCapabilityScope(payload);
-    const allowed = GAME_SIGNALING_SCOPES[scope];
-
-    if (
-      !requestId ||
-      !allowed?.has(action)
-    ) {
-      send('GC_SIGNALING_RESPONSE', {
-        requestId,
-        ok: false,
-        status: 403,
-        error: 'game_rpc_action_forbidden'
-      });
-      return;
-    }
-
-    try {
-      const data = normalizeRpcPayload(payload?.data);
-      const result = await requestSocialAction(action, data);
-
-      if (
-        action === 'ranked_stake_prepare' ||
-        (
-          action === 'ranked_match_status' &&
-          ['paid', 'refunded'].includes(
-            result?.match?.economy?.status
-          )
-        )
-      ) {
-        W.ShardWallet?.refresh?.({ force: true })
-          .catch(() => null);
+  overlay.querySelectorAll('[data-choice]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const playerChoice = btn.dataset.choice;
+      const opponentChoice = getOpponentChoice();
+      const result = compare(playerChoice, opponentChoice);
+      const text = overlay.querySelector('#wh-rps-text');
+      state.rps.playerChoice = playerChoice;
+      state.rps.opponentChoice = opponentChoice;
+      if (result === 'draw') {
+        state.rps.message = `Ничья: ${getChoiceLabel(playerChoice)} против ${getChoiceLabel(opponentChoice)}. Ещё раз!`;
+        if (text) text.textContent = state.rps.message;
+        overlay.classList.remove('is-shake');
+        void overlay.offsetWidth;
+        overlay.classList.add('is-shake');
+        return;
       }
-
-      send('GC_SIGNALING_RESPONSE', {
-        requestId,
-        ok: true,
-        status: 200,
-        result
-      });
-    } catch (error) {
-      send('GC_SIGNALING_RESPONSE', {
-        requestId,
-        ok: false,
-        status: Number(error?.status || 500),
-        error: safe(error?.message || 'game_rpc_failed')
-      });
-    }
+      state.rps.message = `${getChoiceLabel(playerChoice)} против ${getChoiceLabel(opponentChoice)}.`;
+      showResult(result);
+    });
+  });
+};
+matchPersistence = createMatchPersistence({
+  state,
+  gameId: GAME_ID,
+  postToHost,
+  createMatchStats,
+  render: () => render(),
+  openTurnDuel: () => openTurnDuel(),
+  scheduleComputerTurn: () => {
+    clearTimeout(computerTimer);
+    computerTimer = setTimeout(computerShoot, 720);
+  }
+});
+networkCombat = createNetworkCombat({
+  state,
+  session,
+  setScreen: screen => setScreen(screen),
+  render: () => render(),
+  toast,
+  addSystemMessage,
+  formatCellName,
+  getShipCellsAt,
+  isShipSunk,
+  markSunkPerimeter,
+  isBoardDefeated,
+  registerShotStats,
+  showBattleFx,
+  finishMatch,
+  resetMatchStats,
+  resetFairPlayForMatch,
+  scheduleSaveMatchDraft,
+  saveMatchDraftNow,
+  clearTimers: clearBattleTimers,
+  makeEmptyBoard,
+  requestHostAuth: reason => {
+    postToHost('GC_AUTH_LOGIN', { reason });
+    postToHost('GC_REQUEST_SNAPSHOT');
+  }
+});
+networkWatchdog = createNetworkWatchdog({ state, session, render: () => render(), addSystemMessage, scheduleSaveMatchDraft });
+networkWatchdog.start();
+const startLocalPreparedBattle = ({ opponent = state.opponent, message = 'Расстановка подтверждена. Разыгрываем первый ход.', toastText = '' } = {}) => {
+  if (!opponent) {
+    setScreen('opponents');
+    return;
+  }
+  clearTimeout(computerTimer);
+  clearTimeout(playerAutoTimer);
+  state.opponent = opponent;
+  state.myBoard = syncFleetToBoard(state.fleet, createEmptyBoard());
+  state.enemyBoard = syncFleetToBoard(autoPlaceFleet(createFleet()), createEmptyBoard());
+  state.selectedTarget = null;
+  state.battleFx = null;
+  state.autoBattle.player = false;
+  resetMatchStats();
+  resetFairPlayForMatch();
+  state.result = '';
+  state.phase = 'rps';
+  state.chat = [{ from: 'Система', text: message, at: Date.now() }];
+  scheduleSaveMatchDraft();
+  if (toastText) toast(toastText);
+  setScreen('battle');
+  openTurnDuel();
+};
+const openShotConfirm = (x, y) => {
+  const coord = formatCellName(x, y);
+  const old = document.querySelector('.wh-shot-modal-overlay');
+  if (old) old.remove();
+  const overlay = document.createElement('div');
+  overlay.className = 'wh-shot-modal-overlay';
+  overlay.innerHTML = `
+    <div class="wh-shot-modal-box">
+      <div class="wh-shot-modal-kicker">Подтвердить выстрел</div>
+      <div class="wh-shot-modal-coord">${coord}</div>
+      <div class="wh-shot-modal-text">Выстрел будет произведён по выбранной клетке.</div>
+      <div class="wh-modal-actions">
+        <button class="wh-btn secondary" type="button" id="wh-shot-cancel">Отмена</button>
+        <button class="wh-btn" type="button" id="wh-shot-confirm">Выстрел</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#wh-shot-cancel').onclick = () => {
+    overlay.remove();
+    state.selectedTarget = null;
+    render();
+    schedulePlayerAutoShot();
   };
-
-  const onMessage = e => {
-    if (!alive || e.source !== iframe?.contentWindow) return;
-    const d = e.data || {};
-    if (d.kind !== 'vitrina:game' || d.bridgeId !== bridgeId) return;
-    if (d.type === 'GC_SIGNALING_REQUEST') {
-      handleSignalingRequest(d.payload || {});
-      return;
-    }
-
-    if (d.type === 'GC_FRIENDS_REQUEST') {
-      handleFriendsRequest(d.payload || {});
-      return;
-    }
-    if (d.type === 'GC_READY' || d.type === 'GC_REQUEST_SNAPSHOT') sendSnapshot();
-
-    if (d.type === 'GC_AUTH_LOGIN') {
-      try {
-        W.YandexAuth?.login?.();
-      } catch {}
-      return;
-    }
-
-    if (d.type === 'GC_SAVE_DATA') {
-      try {
-        requireCapability(
-          d.payload,
-          ['war_hearts']
-        );
-
-        const save = validateGameSave(d.payload);
-        const gcId =
-          localStorage.getItem('intel:internal-user-id') ||
-          localStorage.getItem('deviceHash') ||
-          'local';
-
-        const storageKey = `gc_data_${gcId}`;
-        const root = JSON.parse(
-          localStorage.getItem(storageKey) || '{}'
-        );
-
-        root[`${save.gameId}_${save.key}`] = save.data;
-
-        localStorage.setItem(
-          storageKey,
-          JSON.stringify(root)
-        );
-
-        sendSnapshot();
-
-        W.dispatchEvent(new CustomEvent(
-          'backup:domain-dirty',
-          {
-            detail: {
-              domain: 'profile',
-              immediate: true
-            }
-          }
-        ));
-      } catch (error) {
-        console.warn(
-          '[GameBridge] save rejected:',
-          error?.message || error
-        );
-      }
-      return;
-    }
-
-    if (d.type === 'GC_DOOR_CLICKED') {
-      try {
-        W.eventLogger?.log?.('FEATURE_USED', 'global', {
-          feature: 'game_center_door',
-          door: safe(d.payload?.door || ''),
-          revision: safe(config.revision || '')
-        });
-      } catch {}
-      return;
-    }
-
-    if (d.type === 'GC_PARENT_SCROLL') {
-      const dy = Math.max(-160, Math.min(160, n(d.payload?.deltaY || 0)));
-      if (dy) {
-        try { W.scrollBy({ top: dy, left: 0, behavior: 'auto' }); } catch { W.scrollBy(0, dy); }
-      }
-      return;
-    }
-
-    if (d.type === 'GC_COLLAPSE_GAME') {
-      const host = document.querySelector('.gc-host.is-mounted');
-      if (host) {
-        document.body.appendChild(host); // Спасаем iframe от уничтожения при рендере альбома
-        host.dataset.gcCollapsed = '1';
-        host.classList.add('is-gc-parked');
-        host.style.display = '';
-      }
-
-      const pc = W.playerCore;
-      const am = W.AlbumsManager;
-
-      if (pc && am) {
-        const track = pc.getCurrentTrack();
-
-        if (track?.sourceAlbum) {
-          am.loadAlbum(track.sourceAlbum).then(() => {
-            setTimeout(() => {
-              const el = document.querySelector(
-                `.track[data-uid="${CSS.escape(track.uid)}"]`
-              );
-              el?.scrollIntoView({
-                behavior: 'smooth',
-                block: 'center'
-              });
-            }, 300);
-          });
-        }
-      }
-
-      let floater = document.getElementById('gc-floating-heart');
-      if (!floater) {
-        floater = document.createElement('div');
-        floater.id = 'gc-floating-heart';
-        floater.innerHTML = `
-          <div class="gc-floating-pulse"></div>
-          <img src="img/icon_game.png" class="gc-floating-img" alt="Разбитое сердце">
-          <div class="gc-floating-text">ВЕРНИСЬ<br>В ИГРУ</div>
-          <button class="gc-floating-close" aria-label="Закрыть игру">✕</button>
-        `;
-        document.body.appendChild(floater);
-
-        const restore = () => {
-          floater.remove();
-
-          const savedHost = host || document.querySelector('.gc-host.is-mounted');
-          if (!savedHost) return;
-
-          savedHost.dataset.gcCollapsed = '0';
-          savedHost.classList.remove('is-gc-parked');
-          savedHost.hidden = false;
-          savedHost.style.display = '';
-          savedHost.classList.add('is-mounted');
-
-          const frameWrap = savedHost.querySelector('#gc-frame-wrap, .gc-frame-wrap');
-          if (frameWrap) {
-            frameWrap.hidden = false;
-            frameWrap.style.display = '';
-          }
-
-          const panel = savedHost.querySelector('.gc-panel');
-          if (panel) {
-            panel.hidden = true;
-            panel.style.display = 'none';
-          }
-
-          const frame = savedHost.querySelector('.gc-frame');
-          const gameId = d.payload?.gameId || 'war_hearts';
-          const post = (type, payload = {}) => {
-            try {
-              frame?.contentWindow?.postMessage({ kind: 'vitrina:game-host', bridgeId, type, payload }, '*');
-            } catch {}
-          };
-
-          // Re-handshake: если Safari/iOS выгрузил JS-state Башни, она заново получит bridgeId и gameId.
-          post('GC_INIT', makeInitPayload({
-            gameId
-          }));
-          post('GC_RESTORE_GAME', {
-            gameId,
-            at: Date.now()
-          });
-          post('GC_SNAPSHOT', buildSnapshot({ config }));
-
-          setTimeout(() => {
-            post('GC_INIT', makeInitPayload({
-              gameId
-            }));
-            post('GC_RESTORE_GAME', {
-              gameId,
-              at: Date.now()
-            });
-            post('GC_SNAPSHOT', buildSnapshot({ config }));
-          }, 160);
-        };
-
-        floater.querySelector('.gc-floating-img').onclick = restore;
-        floater.querySelector('.gc-floating-text').onclick = restore;
-
-        floater.querySelector('.gc-floating-close').onclick = (e) => {
-          e.stopPropagation();
-          W.Modals?.confirm?.({
-            title: 'Выход из игры',
-            textHtml: 'Сессия прервётся, и не законченные игры не принесут очки. Точно выйти?',
-            confirmText: 'Выйти',
-            cancelText: 'Отмена',
-            onConfirm: () => {
-              floater.remove();
-
-              const savedHost = host || document.querySelector('.gc-host.is-mounted');
-              if (savedHost) savedHost.remove();
-
-              onState?.({ state: 'closed_by_game' });
-            }
-          });
-        };
-      }
-      return;
-    }
-
-    if (d.type === 'GC_CLOSE') {
-      try {
-        W.eventLogger?.log?.('FEATURE_USED', 'global', {
-          feature: 'game_center_close',
-          revision: safe(config.revision || '')
-        });
-      } catch {}
-      onState?.({ state: 'closed_by_game' });
-    }
-  };
-
-  const onHostUpdate = () => send('GC_HOST_STATE', buildSnapshot({ config }));
-
-  W.addEventListener('message', onMessage);
-  GAME_HOST_SYNC_EVENTS.forEach(name =>
-    W.addEventListener(name, onHostUpdate)
-  );
-
-  iframe.addEventListener('load', () => {
-    send('GC_INIT', makeInitPayload());
-    sendSnapshot();
-  }, { once: true });
-
-  return {
-    bridgeId,
-    sendSnapshot,
-    destroy() {
-      alive = false;
-      activeFriendsRequests.clear();
-      W.removeEventListener('message', onMessage);
-      GAME_HOST_SYNC_EVENTS.forEach(name =>
-        W.removeEventListener(name, onHostUpdate)
-      );
-    }
+  overlay.querySelector('#wh-shot-confirm').onclick = () => {
+    overlay.remove();
+    performPlayerShot(x, y);
   };
 };
+const schedulePlayerAutoShot = () => {
+  clearTimeout(playerAutoTimer);
+  if (!state.autoBattle.player) return;
+  if (state.screen !== 'battle') return;
+  if (state.phase !== 'player') return;
+  playerAutoTimer = setTimeout(() => {
+    if (!state.autoBattle.player || state.phase !== 'player') return;
+    const target = pickSmartTarget(state.enemyBoard);
+    if (!target) return;
+    state.selectedTarget = { x: target.x, y: target.y };
+    render();
+    playerAutoTimer = setTimeout(() => {
+      performPlayerShot(target.x, target.y, { auto: true });
+    }, 260);
+  }, 720);
+};
+const performPlayerShot = (x, y, { auto = false } = {}) => {
+  if (state.opponent?.type === 'network') {
+    networkCombat?.shoot(x, y);
+    return;
+  }
+  if (state.phase !== 'player' || state.phase === 'finished') return;
+  const cell = state.enemyBoard[y]?.[x];
+  if (!cell || cell.status) {
+    state.selectedTarget = null;
+    render();
+    schedulePlayerAutoShot();
+    return;
+  }
+  const coord = formatCellName(x, y);
+  const hit = !!cell.ship;
+  cell.status = hit ? 'hit' : 'miss';
+  const shipCells = hit ? getShipCellsAt(state.enemyBoard, x, y) : [];
+  const sunk = hit && isShipSunk(state.enemyBoard, shipCells);
+  if (sunk) markSunkPerimeter(state.enemyBoard, shipCells);
+  const fxKind = sunk ? 'sunk' : hit ? 'hit' : 'miss';
+  const resultText = sunk ? 'убил корабль' : hit ? 'ранил корабль' : 'промах';
+  registerShotStats('player', fxKind);
+  showBattleFx('enemy', fxKind);
+  addSystemMessage(`${auto ? 'Автобой' : state.player.name} стреляет ${coord}: ${resultText}.`);
+  toast(sunk ? 'Корабль уничтожен!' : hit ? 'Попадание!' : 'Мимо');
+  state.selectedTarget = null;
+  if (isBoardDefeated(state.enemyBoard)) {
+    finishMatch('win', 'Матч завершён: победа!');
+    return;
+  }
+  if (!hit && state.opponent?.type === 'computer') {
+    state.phase = 'computer';
+    addSystemMessage('Компьютер думает...');
+    render();
+    clearTimeout(computerTimer);
+    computerTimer = setTimeout(computerShoot, 720);
+    return;
+  }
+  if (!hit && state.opponent?.type !== 'computer') {
+    state.phase = 'computer';
+    addSystemMessage('Ход переходит сопернику.');
+    render();
+    return;
+  }
+  state.phase = 'player';
+  render();
+  scheduleSaveMatchDraft();
+  schedulePlayerAutoShot();
+};
+const setScreen = screen => {
+  if (screen === 'battle' && !state.opponent && state.phase !== 'finished') {
+    toast('Сначала выберите соперника.');
+    screen = 'opponents';
+  }
+  if (screen === 'invite' && !state.invite) {
+    screen = 'opponents';
+  }
+  // Запрещаем переключать табы, если идет активный бой или розыгрыш первого хода.
+  const inBattle = state.phase === 'player' || state.phase === 'computer' || state.phase === 'rps';
+  if (inBattle && screen !== 'battle') {
+    toast('Бой активен! Нажмите белый флаг, чтобы сдаться.');
+    return;
+  }
+  // Запрещаем переходить в БОЙ, если поле не готово
+  const isFleetReady = state.fleet.every(s => s.placed);
+  if (screen === 'battle' && !isFleetReady) {
+    toast('Сначала подготовьте поле к бою (расставьте все корабли)!');
+    if (state.screen !== 'field') setScreen('field');
+    return;
+  }
+  state.screen = screen;
+  document.body.dataset.screen = screen;
+  clearInterval(inviteTimer);
+  inviteTimer = 0;
+  if (screen === 'invite' && !document.hidden) {
+    inviteTimer = setInterval(() => {
+      if (state.screen === 'invite' && !document.hidden) render();
+    }, 1000);
+  }
+  document.querySelectorAll('.wh-tab').forEach(btn => {
+    btn.classList.toggle('is-active', btn.dataset.action === screen || (screen === 'menu' && btn.dataset.action === 'menu'));
+  });
+  render();
+};
+const actions = {
+  toast,
+  async openFriends() {
+    const old = document.querySelector('.wh-friends-embed-overlay');
+    if (old) {
+      old._friendsEmbed?.destroy?.();
+      old.remove();
+      return;
+    }
+    const overlay = document.createElement('section');
+    overlay.className = 'wh-friends-embed-overlay';
+    overlay.innerHTML = `
+    <header class="wh-friends-embed-head">
+      <b>Друзья</b>
+      <button type="button" data-friends-close>✕</button>
+    </header>
+    <div class="wh-friends-embed-host"></div>
+  `;
+    document.body.appendChild(overlay);
+    const close = () => {
+      overlay._friendsEmbed?.destroy?.();
+      overlay.remove();
+    };
+    overlay.querySelector('[data-friends-close]')?.addEventListener('click', close);
+    try {
+      const module = await import('/Games/common/friends-embed.js?v=9.1.8');
+      overlay._friendsEmbed = await module.mountCanonicalFriends({
+        root: overlay.querySelector('.wh-friends-embed-host'),
+        identity: state.snapshot?.friend || state.friendIdentity || {},
+        build: '9.1.8',
+        onGameInvite: async ({ friendId, gameId }) => {
+          close();
+          if (!gameId || gameId === GAME_ID) {
+            let name = 'Друг';
+            try {
+              const profile = await session.getProfile(friendId);
+              name = profile?.displayName || name;
+            } catch {}
+            await actions.inviteFriend(friendId, name);
+          }
+        }
+      });
+    } catch (error) {
+      const host = overlay.querySelector('.wh-friends-embed-host');
+      if (host) {
+        host.innerHTML = `
+        <div class="wh-friends-embed-error">
+          Не удалось загрузить Друзья:
+          ${String(error?.message || 'unknown_error')}
+        </div>
+      `;
+      }
+    }
+  },
+  openField() {
+    setScreen('field');
+  },
+  // ═══════════════════════════════════════════════════════════════
+  // LAN Wi-Fi сценарий: выбор режима (рейтинговый / гостевой)
+  // ═══════════════════════════════════════════════════════════════
+  startLanGameFlow() {
+    const open = () => {
+      const overlay = document.createElement('div');
+      overlay.className = 'wh-modal-overlay';
+      overlay.innerHTML = `
+        <div class="wh-modal-box">
+          <h3 class="wh-modal-title">📶 Рейтинговый бой по коду</h3>
+          <p class="wh-modal-text" style="margin-bottom:16px">
+            Код помогает двум игрокам найти одну комнату.
+            WebRTC попробует установить прямое соединение через Wi‑Fi/LAN.
+            Бой всегда рейтинговый: ставка каждого игрока — 100 ♦.
+          </p>
+          <div class="wh-modal-actions" style="flex-direction:column;gap:10px">
+            <button class="wh-btn" type="button" id="lan-host-btn" style="background:linear-gradient(135deg,#4caf50,#2e7d32)">
+              📡 Создать рейтинговую комнату
+            </button>
+            <button class="wh-btn secondary" type="button" id="lan-join-btn">
+              🔗 Ввести код друга
+            </button>
+            <button class="wh-btn secondary" type="button" id="lan-cancel-btn" style="background:transparent;border:1px solid rgba(255,255,255,.2)">
+              Отмена
+            </button>
+          </div>
+        </div>
+      `;
 
-export default { createGameBridgeHost };
+      document.body.appendChild(overlay);
+      overlay.querySelector('#lan-cancel-btn').onclick = () => overlay.remove();
+      overlay.querySelector('#lan-host-btn').onclick = () => {
+        overlay.remove();
+        createLanRoom();
+      };
+      overlay.querySelector('#lan-join-btn').onclick = () => {
+        overlay.remove();
+        showLanJoinCodeInput();
+      };
+    };
+
+    if (isYandexAuthed()) {
+      open();
+      return;
+    }
+
+    openRankedAuthGate({
+      title: '📶 Рейтинговый бой по Wi‑Fi/LAN',
+      text: 'Для боя с реальным игроком нужен вход через Яндекс и 100 доступных Осколков.',
+      loginText: 'Войти и продолжить',
+      onAuthed: open
+    });
+  },
+  openMenu() {
+    clearTimeout(computerTimer);
+    clearTimeout(playerAutoTimer);
+    state.autoBattle.player = false;
+    // Если возвращаемся из завершённого боя, сбрасываем визуальное состояние матча.
+    if (state.phase === 'finished') {
+      clearMatchDraft();
+      state.phase = 'idle';
+      state.result = '';
+      state.selectedTarget = null;
+      state.battleFx = null;
+      state.myBoard.forEach(row => row.forEach(c => (c.status = '')));
+      state.enemyBoard.forEach(row =>
+        row.forEach(c => {
+          c.status = '';
+          c.ship = false;
+        })
+      );
+    }
+    setScreen('menu');
+  },
+  openOpponents() {
+    setScreen('opponents');
+  },
+  openBattle() {
+    setScreen('battle');
+  },
+  setMenuTab(tab) {
+    state.menuTab = tab === 'achievements' ? 'achievements' : 'stats';
+    render();
+  },
+  networkReady() {
+    networkCombat?.markReady();
+  },
+  startPreparedBattle() {
+    if (!state.fleet.every(s => s.placed)) {
+      toast('Сначала расставьте все корабли!');
+      return;
+    }
+    if (!state.opponent) {
+      setScreen('opponents');
+      return;
+    }
+    if (state.opponent.type === 'network') {
+      networkCombat?.markReady();
+      return;
+    }
+    startLocalPreparedBattle({ message: 'Расстановка подтверждена. Разыгрываем первый ход.' });
+  },
+  async inviteFriend(friendId, friendName) {
+    try {
+      toast(`Приглашаем ${friendName}...`);
+      try {
+        await sessionReady;
+      } catch {}
+      const invite = await session.createInvite();
+      await session.sendGameInvite({ toFriendId: friendId, roomId: invite.roomId, roomSecret: invite.roomSecret });
+      state.invite = { id: invite.id || invite.roomId || `invite_${Date.now().toString(36)}`, roomId: invite.roomId || '', roomSecret: invite.roomSecret || '', url: invite.url || '', expiresAt: Date.now() + INVITE_TTL_MS, isDirectPush: true };
+      state.network.active = true;
+      state.network.connected = false;
+      state.network.status = 'waiting';
+      state.network.peerName = friendName;
+      state.network.text = `Пуш-уведомление отправлено. Ожидаем подключение: ${friendName}...`;
+      state.network.lastEventAt = Date.now();
+      toast('Приглашение отправлено');
+      setScreen('invite');
+    } catch (err) {
+      toast(`Ошибка: ${err.message}`);
+    }
+  },
+  async createNearbyGame() {
+    try {
+      toast('Создаём код для друга рядом...');
+      try {
+        await sessionReady;
+      } catch {}
+      const near = await session.createNearbyGameCode();
+      state.invite = { id: `near_${near.code}`, roomId: near.roomId || '', roomSecret: near.roomSecret || '', url: near.joinUrl || '', nearbyCode: near.code, expiresAt: near.expiresAt || Date.now() + INVITE_TTL_MS };
+      state.network.active = true;
+      state.network.connected = false;
+      state.network.status = 'waiting';
+      state.network.peerName = 'Друг рядом';
+      state.network.text = `Код для друга рядом: ${near.code}. Ждём подключение...`;
+      state.network.lastEventAt = Date.now();
+      toast(`Код: ${near.code}`);
+      setScreen('invite');
+    } catch (err) {
+      toast(`Ошибка: ${err.message}`);
+    }
+  },
+  async joinNearbyGame(code) {
+    try {
+      const clean = String(code || '')
+        .replace(/\D/g, '')
+        .slice(0, 6);
+      if (!clean) return toast('Введите код');
+      toast('Подключаемся по коду...');
+      try {
+        await sessionReady;
+      } catch {}
+      await session.joinNearbyGameCode(clean);
+      state.network.active = true;
+      state.network.connected = false;
+      state.network.status = 'waiting';
+      state.network.peerName = 'Друг рядом';
+      state.network.text = 'Код принят. Устанавливаем P2P-соединение...';
+      state.network.lastEventAt = Date.now();
+      setScreen('invite');
+    } catch (err) {
+      toast(err.message === 'nearby_game_not_found' ? 'Код не найден или устарел' : `Ошибка: ${err.message}`);
+    }
+  },
+  async createInvite() {
+    try {
+      toast('Проверяем сетевой bridge...');
+      try {
+        await sessionReady;
+      } catch {
+        // session.createInvite ниже сам уйдёт в preview, если bridge недоступен
+      }
+      const invite = await session.createInvite();
+      state.invite = { id: invite.id || invite.roomId || `invite_${Date.now().toString(36)}`, roomId: invite.roomId || '', roomSecret: invite.roomSecret || '', url: invite.url || '', expiresAt: Date.now() + INVITE_TTL_MS };
+      state.network.active = true;
+      state.network.connected = false;
+      state.network.status = invite.url ? 'waiting' : 'error';
+      state.network.peerName = 'Соперник';
+      state.network.text = invite.url ? 'Ссылка создана. Ожидаем подключение второго устройства...' : `Network bridge недоступен. Preview без P2P${session.lastError ? `: ${session.lastError}` : '.'}`;
+      state.network.lastEventAt = Date.now();
+      toast(invite.url ? 'Ссылка создана' : 'Preview-приглашение создано');
+    } catch {
+      state.invite = { id: `invite_${Date.now().toString(36)}`, url: '', expiresAt: Date.now() + INVITE_TTL_MS };
+      state.network.active = true;
+      state.network.connected = false;
+      state.network.status = 'error';
+      state.network.peerName = 'Соперник';
+      state.network.text = `Сеть недоступна. Preview без P2P${session.lastError ? `: ${session.lastError}` : '.'}`;
+      state.network.lastEventAt = Date.now();
+      toast('Сеть недоступна, создан preview');
+    }
+    setScreen('invite');
+  },
+  extendInvite() {
+    if (!state.invite) return;
+    if (!state.invite.url || !state.invite.roomSecret) {
+      state.invite.expiresAt = Date.now() + INVITE_TTL_MS;
+      state.network.status = 'error';
+      state.network.text = 'Preview-приглашение продлено локально, но P2P-соединение недоступно.';
+      state.network.lastEventAt = Date.now();
+      toast('Preview продлён локально');
+      render();
+      return;
+    }
+    state.invite.expiresAt = Math.max(Date.now(), state.invite.expiresAt || 0) + INVITE_TTL_MS;
+    toast('Приглашение продлено');
+    render();
+  },
+  cancelInvite() {
+    markLaunchCancelled();
+    stripLaunchParams();
+    session.close?.();
+    state.invite = null;
+    state.opponent = null;
+    state.phase = 'idle';
+    state.network.active = false;
+    state.network.connected = false;
+    state.network.status = 'offline';
+    state.network.text = '';
+    state.network.peerName = '';
+    state.network.lastEventAt = Date.now();
+    clearMatchDraft();
+    toast('Приглашение отменено');
+    setScreen('opponents');
+  },
+  startComputerGame() {
+    state.opponent = { id: 'computer_preview', name: 'Компьютер', title: 'Случайный стрелок', type: 'computer' };
+    state.phase = 'setup';
+    setScreen('field');
+    toast('Игра с компьютером. Расставьте корабли.');
+  },
+  shootCell(x, y) {
+    if (state.phase !== 'player' || state.phase === 'finished') return;
+    const cell = state.enemyBoard[y]?.[x];
+    if (!cell || cell.status) return;
+    state.selectedTarget = { x, y };
+    render();
+    if (state.autoBattle.player && state.opponent?.type !== 'network') {
+      performPlayerShot(x, y, { auto: true });
+      return;
+    }
+    openShotConfirm(x, y);
+  },
+  toggleAutoBattle() {
+    state.autoBattle.player = !state.autoBattle.player;
+    toast(state.autoBattle.player ? 'Автобой включён' : 'Автобой выключен');
+    render();
+    schedulePlayerAutoShot();
+  },
+  sendChat(text) {
+    const message = String(text || '')
+      .trim()
+      .slice(0, 300);
+    if (!message) return;
+    const sent = session.sendChat(message);
+    state.chat.push({ from: state.player.name, text: sent || state.opponent?.type !== 'network' ? message : `${message} · не отправлено`, at: Date.now() });
+    if (!sent && state.opponent?.type === 'network') {
+      networkWatchdog?.warn('Сообщение не отправлено. Проверьте соединение.');
+    }
+    render();
+    scheduleSaveMatchDraft();
+  },
+  finishMock(result = 'win') {
+    finishMatch(result, result === 'win' ? 'Preview завершён: победа.' : 'Preview завершён: поражение.');
+  },
+  rematch() {
+    if (state.opponent?.type === 'network') {
+      networkCombat?.requestRematch();
+      return;
+    }
+    clearTimeout(computerTimer);
+    clearTimeout(playerAutoTimer);
+    state.selectedTarget = null;
+    state.battleFx = null;
+    state.autoBattle.player = false;
+    state.result = '';
+    state.phase = 'setup';
+    state.myBoard.forEach(row =>
+      row.forEach(cell => {
+        cell.status = '';
+      })
+    );
+    state.enemyBoard = createEmptyBoard();
+    state.chat = [{ from: 'Система', text: 'Реванш: можно изменить расстановку. После подтверждения будет новый розыгрыш первого хода.', at: Date.now() }];
+    scheduleSaveMatchDraft();
+    toast('Реванш: подготовьте поле');
+    setScreen('field');
+  }
+};
+const showLanJoinCodeInput = () => {
+  const overlay = document.createElement('div');
+  overlay.className = 'wh-modal-overlay';
+  overlay.innerHTML = `
+<div class="wh-modal-box">
+<h3 class="wh-modal-title">🔗 Введите код комнаты</h3>
+<p class="wh-modal-text">Попросите друга создать комнату и назвать вам 6-значный код.</p>
+<input type="text" id="lan-code-input" maxlength="6" placeholder="123456"
+style="width:100%;padding:14px;font-size:24px;text-align:center;font-weight:900;letter-spacing:4px;border-radius:12px;border:1px solid rgba(255,255,255,.15);background:rgba(0,0,0,.3);color:#fff;outline:none;margin-bottom:16px"
+autocomplete="off" inputmode="numeric" pattern="[0-9]*">
+<div class="wh-modal-actions" style="flex-direction:column;gap:10px">
+<button class="wh-btn" type="button" id="lan-join-go-btn">Подключиться</button>
+<button class="wh-btn secondary" type="button" id="lan-join-back-btn" style="background:transparent;border:1px solid rgba(255,255,255,.2)">Назад</button>
+</div>
+<div id="lan-join-error" style="margin-top:10px;font-size:12px;color:#ff6b6b;display:none;text-align:center"></div>
+</div>
+`;
+  document.body.appendChild(overlay);
+  const inp = overlay.querySelector('#lan-code-input');
+  const errEl = overlay.querySelector('#lan-join-error');
+  inp.focus();
+  inp.addEventListener('input', e => {
+    e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6);
+  });
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter') overlay.querySelector('#lan-join-go-btn').click();
+  });
+  overlay.querySelector('#lan-join-back-btn').onclick = () => {
+    overlay.remove();
+    actions.startLanGameFlow();
+  };
+  overlay.querySelector('#lan-join-go-btn').onclick = async () => {
+    const code = inp.value.replace(/\D/g, '');
+    if (code.length < 6) {
+      errEl.textContent = 'Введите 6 цифр кода';
+      errEl.style.display = 'block';
+      return;
+    }
+    errEl.style.display = 'none';
+    state.network.pendingLanCode = code;
+    overlay.remove();
+    joinLanByCode(code);
+  };
+};
+// Создание LAN-комнаты
+const createLanRoom = async () => {
+  toast('Создаём рейтинговую P2P-комнату...');
+
+  try {
+    if (!(await sessionReady)) {
+      throw new Error(session.lastError || 'network_bridge_unavailable');
+    }
+
+    const res = await session.createLanRoom();
+
+    state.lanCode = res.code;
+    state.invite = {
+      id: res.roomId,
+      roomId: res.roomId,
+      roomSecret: res.roomSecret,
+      code: res.code,
+      isLan: true,
+      localOnly: true,
+      ranked: true,
+      matchMode: 'ranked',
+      expiresAt: res.expiresAt || Date.now() + 300000
+    };
+    state.network.active = true;
+    state.network.connected = false;
+    state.network.status = 'waiting';
+    state.network.peerName = 'Соперник по Wi‑Fi';
+    state.network.text = 'Рейтинговая P2P-комната создана. Назовите код сопернику.';
+    state.network.ranked = true;
+    state.network.localOnly = true;
+    state.network.matchMode = 'ranked';
+    state.network.lastEventAt = Date.now();
+
+    addSystemMessage(
+      'Создан рейтинговый бой за 100 ♦. Результат будет принят только после серверной fair-play проверки.'
+    );
+
+    setScreen('invite');
+  } catch (error) {
+    toast(
+      error.message === 'lan_code_register_failed'
+        ? 'Не удалось зарегистрировать код комнаты'
+        : `Ошибка: ${error.message}`
+    );
+  }
+};
+// Подключение по LAN-коду
+const joinLanByCode = async code => {
+  toast('Проверяем код комнаты...');
+
+  try {
+    if (!(await sessionReady)) {
+      throw new Error(session.lastError || 'network_bridge_unavailable');
+    }
+
+    if (!isYandexAuthed()) {
+      openRankedAuthGate({
+        title: '🏆 Рейтинговый бой',
+        text: 'Бой между пользователями всегда рейтинговый. Для подключения нужен вход через Яндекс и ставка 100 ♦.',
+        loginText: 'Войти и подключиться',
+        onAuthed: () => connectLanRoom(code)
+      });
+      return;
+    }
+
+    const roomInfo = await session.resolveLanRoom(code);
+    if (roomInfo.ranked !== true) {
+      throw new Error('ranked_room_required');
+    }
+
+    await connectLanRoom(code);
+  } catch (error) {
+    toast(
+      error.message === 'lan_room_not_found'
+        ? 'Комната не найдена или код истёк'
+        : error.message === 'ranked_room_required'
+          ? 'Этот старый код не относится к рейтинговой комнате'
+          : `Ошибка: ${error.message}`
+    );
+  }
+};
+const connectLanRoom = async code => {
+  toast('Подключаемся к рейтинговой комнате...');
+
+  const res = await session.joinLanRoom(code);
+
+  if (res.ranked !== true) {
+    throw new Error('ranked_room_required');
+  }
+
+  state.invite = {
+    id: res.roomId,
+    roomId: res.roomId,
+    roomSecret: res.roomSecret,
+    code: res.code || code,
+    isLan: true,
+    localOnly: true,
+    ranked: true,
+    matchMode: 'ranked',
+    expiresAt: res.expiresAt || Date.now() + 300000
+  };
+  state.network.active = true;
+  state.network.connected = false;
+  state.network.status = 'connecting';
+  state.network.peerName = 'Хост комнаты';
+  state.network.text = 'Код принят. Устанавливаем рейтинговое P2P-соединение...';
+  state.network.ranked = true;
+  state.network.localOnly = true;
+  state.network.matchMode = 'ranked';
+  state.network.lastEventAt = Date.now();
+
+  addSystemMessage(
+    'Подключение к рейтинговому бою за 100 ♦. Результат будет подтверждён сервером.'
+  );
+
+  setScreen('invite');
+};
+const render = () => {
+  const root = $('screen-root');
+  const subtitle = $('screen-subtitle');
+  if (!root || !subtitle) return;
+  const inBattle = state.phase === 'player' || state.phase === 'computer' || state.phase === 'rps';
+  // Кнопка сворачивания всегда доступна внутри Game Center:
+  // play = трек загружен на паузе, pause = играет, stop = трека нет.
+  const colBtn = $('collapse-btn');
+  if (colBtn) {
+    const player = state.snapshot?.player || {};
+    const embedded = window.parent !== window;
+    const playIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>`;
+    const pauseIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>`;
+    const stopIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>`;
+    colBtn.hidden = !embedded;
+    colBtn.classList.toggle('is-player-stopped', embedded && !player.uid);
+    colBtn.innerHTML = player.uid ? (player.playing ? pauseIcon : playIcon) : stopIcon;
+    colBtn.title = player.uid ? (player.playing ? 'Свернуть игру · музыка играет' : 'Свернуть игру · музыка на паузе') : 'Свернуть игру · плеер остановлен';
+    colBtn.setAttribute('aria-label', colBtn.title);
+  }
+  // Показываем белый флаг ТОЛЬКО на вкладке "Бой" и ТОЛЬКО во время активной стрельбы.
+  const surrenderBtn = $('surrender-btn');
+  const canSurrender = (state.phase === 'player' || state.phase === 'computer') && state.screen === 'battle';
+  if (surrenderBtn) {
+    surrenderBtn.hidden = !canSurrender;
+  }
+  // Во время боя активна только вкладка "Бой". Вне боя вкладка "Бой" заблокирована.
+  document.querySelectorAll('.wh-tab').forEach(btn => {
+    if (inBattle) {
+      btn.disabled = btn.dataset.action !== 'battle';
+    } else {
+      btn.disabled = btn.dataset.action === 'battle';
+    }
+  });
+  root.innerHTML = '';
+  if (state.screen === 'menu') {
+    subtitle.textContent = 'Главное меню';
+    renderMenu(root, state, actions);
+    return;
+  }
+  if (state.screen === 'opponents') {
+    subtitle.textContent = 'Выбор соперника';
+    renderOpponentSelect(root, state, actions);
+    return;
+  }
+  if (state.screen === 'invite') {
+    subtitle.textContent = 'Ожидание ответа';
+    renderInviteWait(root, state, actions);
+    return;
+  }
+  if (state.screen === 'field') {
+    subtitle.textContent = 'Подготовка поля';
+    renderField(root, state, actions);
+    return;
+  }
+  if (state.screen === 'battle') {
+    subtitle.textContent = 'Боевая сессия';
+    renderBattle(root, state, actions);
+    return;
+  }
+};
+const bind = () => {
+  $('collapse-btn')?.addEventListener('click', () => {
+    postToHost('GC_COLLAPSE_GAME');
+  });
+  $('back-btn')?.addEventListener('click', () => {
+    let msg = '';
+    // Проверяем, идет ли активный бой
+    if (state.phase === 'player' || state.phase === 'computer') {
+      msg = 'Вы находитесь в бою! Если выйдете сейчас, прогресс за текущий бой не будет сохранен. Точно выйти?';
+    } else {
+      msg = state.result ? 'Бой завершён. Можно выйти из игры или вернуться позже.' : 'Выйти из игры?';
+    }
+    // Создаем кастомную красивую модалку вместо системного window.confirm
+    const overlay = document.createElement('div');
+    overlay.className = 'wh-modal-overlay';
+    overlay.innerHTML = `
+      <div class="wh-modal-box">
+        <h3 class="wh-modal-title">Выход из игры</h3>
+        <p class="wh-modal-text">${msg}</p>
+        <div class="wh-modal-actions">
+          <button class="wh-btn secondary" type="button" id="wh-modal-cancel">Отмена</button>
+          <button class="wh-btn" type="button" id="wh-modal-confirm">Выйти</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    overlay.querySelector('#wh-modal-cancel').onclick = () => overlay.remove();
+    overlay.querySelector('#wh-modal-confirm').onclick = async () => {
+      overlay.remove();
+      if (state.network?.ranked === true && ['rps', 'player', 'computer'].includes(state.phase)) {
+        await networkCombat?.abortRanked?.('user_exit');
+      }
+      if (!postToHost('GC_CLOSE', { reason: 'war_hearts_exit' })) {
+        window.location.href = new URL('../', window.location.href).toString();
+      }
+    };
+  });
+  // Логика кнопки Сдаться
+  $('surrender-btn')?.addEventListener('click', () => {
+    const overlay = document.createElement('div');
+    overlay.className = 'wh-modal-overlay';
+    overlay.innerHTML = `
+      <div class="wh-modal-box">
+        <h3 class="wh-modal-title">Сдаться?</h3>
+        <p class="wh-modal-text">Бой будет завершён. Соперник получит победу. В рейтинговом бою результат пойдёт на проверку. Точно сдаться?</p>
+        <div class="wh-modal-actions">
+          <button class="wh-btn secondary" type="button" id="wh-surrender-cancel">Отмена</button>
+          <button class="wh-btn" type="button" id="wh-surrender-confirm" style="background:var(--wh-red)">Сдаться</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    overlay.querySelector('#wh-surrender-cancel').onclick = () => overlay.remove();
+    overlay.querySelector('#wh-surrender-confirm').onclick = async () => {
+      overlay.remove();
+      if (state.network?.ranked === true) {
+        await networkCombat?.abortRanked?.('surrender');
+      }
+      finishMatch('loss', 'Игрок сдался. Матч завершён.');
+    };
+  });
+  document.querySelectorAll('.wh-tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const action = btn.dataset.action;
+      if (action === 'menu') setScreen('menu');
+      if (action === 'opponents') setScreen('opponents');
+      if (action === 'field') setScreen('field');
+      if (action === 'battle') setScreen('battle');
+    });
+  });
+  session.onStatus = info => {
+    if (state.network?.active) {
+      const label = String(info?.label || '');
+      state.network.status = info?.online ? 'ready' : label.includes('err') || label.includes('failed') ? 'error' : state.network.status || 'waiting';
+      state.network.text =
+        {
+          'waiting': 'Host ждёт offer от guest...',
+          'connecting': 'Guest отправляет offer...',
+          'send offer': 'Отправляем offer через signaling...',
+          'offer sent': 'Offer отправлен. Ждём answer...',
+          'offer received': 'Offer получен. Отправляем answer...',
+          'send answer': 'Отправляем answer через signaling...',
+          'answer sent': 'Answer отправлен. Ждём ICE...',
+          'answer received': 'Answer получен. Собираем ICE...',
+          'send ice': 'Отправляем ICE candidate...',
+          'ice sent': 'ICE candidate отправлен.',
+          'ice received': 'ICE candidate получен.',
+          'ice retry': 'Один ICE candidate не отправлен. Пробуем остальные...',
+          'ice failed': 'Прямой ICE-маршрут не найден. Пробуем переподключение...',
+          'reconnecting': 'Соединение временно прервано. Восстанавливаем...',
+          'lan waiting': 'Wi‑Fi-комната готова. Ждём подключение гостя...',
+          'lan connecting': 'Подключаемся к Wi‑Fi-комнате...',
+          'signal retry': 'Signaling временно недоступен. Повторяем...',
+          'online': 'P2P-соединение установлено.'
+        }[label] ||
+        label ||
+        state.network.text ||
+        'Синхронизация сети...';
+      state.network.lastEventAt = Date.now();
+      if (info?.ice) state.network.ice = { ...state.network.ice, ...info.ice };
+      render();
+    }
+  };
+  const markNetworkPeerHint = name => {
+    state.network.active = true;
+    state.network.connected = false;
+    state.network.peerName = name || state.network.peerName || 'Соперник';
+  };
+  session.onIceDiagnostics = info => {
+    state.network.ice = { ...state.network.ice, ...(info || {}) };
+    render();
+  };
+  session.onRoom = info => {
+    if (info?.role === 'guest') {
+      markNetworkPeerHint('Хост комнаты');
+      state.network.text = 'Комната найдена. Устанавливаем P2P-соединение...';
+      state.network.status = 'waiting';
+      state.network.lastEventAt = Date.now();
+      toast('Подключаемся к комнате');
+      render();
+    }
+  };
+  session.onConnect = peer => {
+    const ranked = !!(
+      session.room?.ranked ??
+      session.bridge?.ranked
+    );
+    const localOnly = !!(
+      session.room?.localOnly ??
+      session.bridge?.forceLocalOnly
+    );
+
+    state.opponent = {
+      id: peer?.id || 'network-peer',
+      name: peer?.name || 'Соперник',
+      title: localOnly
+        ? ranked
+          ? 'LAN · рейтинг'
+          : 'LAN · гость'
+        : 'Сетевая дуэль',
+      type: 'network'
+    };
+
+    state.network.active = true;
+    state.network.connected = true;
+    state.network.peerName = state.opponent.name;
+    state.network.ranked = ranked;
+    state.network.localOnly = localOnly;
+    state.network.matchMode = state.network.ranked ? 'ranked' : 'casual';
+    networkCombat?.onConnected(state.opponent.name);
+    networkWatchdog?.touchPeer();
+    addSystemMessage('Сетевое соединение установлено.');
+    const canStartPreparation = !['setup', 'rps', 'player', 'computer'].includes(state.phase);
+    if (canStartPreparation) {
+      networkCombat?.startNetworkPreparation({ initiator: session.room?.role !== 'guest', ranked: !!state.network.ranked });
+      return;
+    }
+    render();
+  };
+  session.onDisconnect = () => {
+    networkCombat?.onDisconnected();
+    networkWatchdog?.warn('Соединение с соперником потеряно.', { hard: true });
+    addSystemMessage('Соединение с соперником потеряно.');
+    render();
+  };
+  session.onChat = msg => {
+    networkWatchdog?.touchPeer();
+    state.chat.push(msg);
+    render();
+    scheduleSaveMatchDraft();
+  };
+  session.onGameData = msg => {
+    networkWatchdog?.touchPeer();
+    networkCombat?.handleGameData(msg);
+  };
+};
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    networkWatchdog?.resume();
+    if (state.screen === 'invite' && !inviteTimer) {
+      inviteTimer = setInterval(() => {
+        if (state.screen === 'invite' && !document.hidden) render();
+      }, 1000);
+    }
+    schedulePlayerAutoShot();
+    return;
+  }
+  networkWatchdog?.pause();
+  saveMatchDraftNow();
+  clearTimeout(playerAutoTimer);
+  clearTimeout(computerTimer);
+  clearInterval(inviteTimer);
+  inviteTimer = 0;
+});
+bind();
+render();
+sessionReady = waitForHostBridge()
+  .then(async bridgeReady => {
+    if (!bridgeReady && window.parent !== window) {
+      throw new Error('game_parent_bridge_timeout');
+    }
+
+    const ready = await session.init();
+    if (!ready) {
+      throw new Error(session.lastError || 'network_bridge_init_failed');
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('join')) {
+      state.network.active = true;
+      state.network.status = 'connecting';
+      state.network.text = 'Подключаемся к комнате по приглашению...';
+      state.network.lastEventAt = Date.now();
+      render();
+    }
+
+    const inviteFriendId = params.get('inviteFriend');
+    if (inviteFriendId && !isLaunchCancelled()) {
+      stripLaunchParams();
+
+      try {
+        const identity = await waitForFriendIdentity();
+        if (!identity?.friendId) {
+          throw new Error('friend_identity_not_ready');
+        }
+
+        const profile = await session.getProfile(inviteFriendId).catch(() => null);
+        await actions.inviteFriend(
+          inviteFriendId,
+          profile?.displayName || 'Друг'
+        );
+      } catch (error) {
+        console.error('[Auto-Invite Error]', error);
+        toast(`Ошибка приглашения: ${error?.message || 'unknown_error'}`);
+      }
+    }
+
+    return true;
+  })
+  .catch(error => {
+    session.lastError = String(
+      error?.message || 'network_bridge_init_failed'
+    );
+
+    state.network.connected = false;
+    state.network.status = 'error';
+    state.network.text = `Сетевой контур недоступен: ${session.lastError}`;
+    state.network.lastEventAt = Date.now();
+
+    console.error('[War Hearts Network Init]', error);
+    render();
+    return false;
+  });

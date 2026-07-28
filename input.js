@@ -1,827 +1,430 @@
-// scripts/app/friends/friends-block.js
-// UID.069/070 (Linked providers identity)_(Друзья получают identity сверху, без OAuth-токена)
-// UID.094 (No-paralysis rule)_(сбой Друзей не влияет на плеер/Game Center)
-// Тонкий адаптер: основное приложение -> внешний модуль /Friends/
+// UID.002_(UID-first core)_(сохранить AlbumsManager как контентный навигатор по uid-трекам)_(album shell не должен брать на себя semantic/recommendation ownership)
+// UID.017_(Launch source stats)_(подготовить точку фиксации запуска из album view)_(future analytics/recs слой сможет читать source=album именно отсюда)
+// UID.019_(Compact TrackProfile index)_(дать будущим album-row/card enhancements опору)_(album screen сможет читать preview profile через TrackRegistry/Intel bridge без загрузки full profile)
+// UID.041_(Showcase semantic filters)_(развести обычный album UI и semantic showcase)_(albums.js не должен превращаться в semantic browser)
+// UID.094_(No-paralysis rule)_(обычные альбомы обязаны работать без intel-слоя)_(любой semantic enhancement на строке трека только optional)
+// UID.096_(Helper-first anti-duplication policy)_(рендер иконок вынесен в album-icons-renderer)_(AlbumsManager хранит только навигацию и загрузку контента)
 
-import {
-  getSocialServerBackoffState,
-  getSocialSession,
-  invalidateSocialSession
-} from '../../core/social-session.js';
+import { setFavoriteStarState } from '../ui/icon-utils.js';
+import { mountAlbumCarousel } from './albums/album-carousel.js';
+import { renderAlbumIconRows } from './albums/album-icons-renderer.js';
+import { renderAlbumTracks } from './albums/album-track-renderer.js';
+import { clearAlbumPlaybackTracks } from './albums/album-playback-builder.js';
+import { bindAlbumTrackActions } from './albums/album-track-actions.js';
 
 const W = window;
 const D = document;
-const BASE_FRIENDS =
-  'https://vi3na1bita.website.yandexcloud.net/Friends';
-const FRIENDS_BUILD = '9.1.9';
-const FRIENDS_CORE_URL =
-  `${BASE_FRIENDS}/friends-core.js?v=${FRIENDS_BUILD}`;
-const FRIENDS_UI_URL =
-  `${BASE_FRIENDS}/friends-ui.js?v=${FRIENDS_BUILD}`;
+const C = W.APP_CONFIG || {};
+const {
+  $ = id => D.getElementById(id),
+  escHtml = value => String(value || ''),
+  isMobileUA = () => false
+} = W.AppUtils || {};
 
-let _socialSessionRetryAt = 0;
+const FAV = W.SPECIAL_FAVORITES_KEY || '__favorites__';
+const NEWS = W.SPECIAL_RELIZ_KEY || '__reliz__';
+const SHOWCASE = W.SPECIAL_SHOWCASE_KEY || '__showcase__';
+const SHARDS = C.SPECIAL_SHARDS_KEY || W.SPECIAL_SHARDS_KEY || '__shards__';
+const PROFILE = C.SPECIAL_PROFILE_KEY || '__profile__';
+const GAMES = C.SPECIAL_GAMES_KEY || W.SPECIAL_GAMES_KEY || '__games__';
+const FRIENDS = C.SPECIAL_FRIENDS_KEY || W.SPECIAL_FRIENDS_KEY || '__friends__';
+const LOGO = 'img/logo.png';
+const GALLERY_VISIBLE_KEY = 'albumGalleryVisible:v1';
 
-let _core = null;
-let _ui = null;
-let _container = null;
-let _bound = false;
-let _lastFriendId = '';
-let _pushTimer = 0;
-let _heartbeatTimer = 0;
-let _webPushReady = false;
-let _unread = {};
-let _pushBusy = false;
-let _pushFails = 0;
-let _heartbeatBusy = false;
-const FRIENDS_KEY = '__friends__';
-const _embeddedFriendsContexts = new Set();
-
-const isFriendsSectionActive = () =>
-  W.AlbumsManager?.getCurrentAlbum?.() ===
-  (W.APP_CONFIG?.SPECIAL_FRIENDS_KEY || FRIENDS_KEY);
-
-const isFriendsRuntimeActive = () =>
-  isFriendsSectionActive() ||
-  _embeddedFriendsContexts.size > 0;
-
-const stopFriendsBackgroundTasks = () => {
-  clearTimeout(_pushTimer);
-  clearInterval(_heartbeatTimer);
-  _pushTimer = 0;
-  _heartbeatTimer = 0;
+const SPECIAL_LOADERS = {
+  [FAV]: 'loadFavoritesAlbum',
+  [NEWS]: 'loadNewsAlbum',
+  [SHOWCASE]: 'loadShowcaseAlbum',
+  [SHARDS]: 'loadShardsAlbum',
+  [PROFILE]: 'loadProfileAlbum',
+  [GAMES]: 'loadGamesAlbum',
+  [FRIENDS]: 'loadFriendsAlbum'
 };
 
-const resumeFriendsBackgroundTasks = async () => {
-  if (D.hidden || !isFriendsRuntimeActive()) {
-    stopFriendsBackgroundTasks();
-    return false;
-  }
+class AlbumsManager {
+  curr = null;
+  playing = null;
+  cache = new Map();
+  covers = new Map();
+  loading = false;
+  pendingAlbum = null;
+  galVis = localStorage.getItem(GALLERY_VISIBLE_KEY) !== '0';
+  albumCarousel = null;
+  _eventsBound = false;
 
-  if (!_core?.isReady?.()) {
-    if (Date.now() < _socialSessionRetryAt) {
-      stopFriendsBackgroundTasks();
-      return false;
-    }
-
-    try {
-      await applyIdentity();
-    } catch {
-      stopFriendsBackgroundTasks();
-      return false;
-    }
-  }
-
-  if (!_core?.isReady?.()) {
-    stopFriendsBackgroundTasks();
-    return false;
-  }
-
-  startPresenceHeartbeat();
-  startPushPolling();
-  return true;
-};
-
-const friendsFeatureCards = () => `
-  <div class="friends-feature-grid">
-    <div class="friends-feature-card"><span>💬</span><div><b>Личные сообщения</b><small>Чаты, ответы, реакции и отметки доставки.</small></div></div>
-    <div class="friends-feature-card"><span>📞</span><div><b>Голосовые звонки</b><small>Прямое общение через WebRTC прямо в приложении.</small></div></div>
-    <div class="friends-feature-card"><span>🔔</span><div><b>Push-уведомления</b><small>Сообщения и звонки не потеряются, даже если приложение свёрнуто.</small></div></div>
-    <div class="friends-feature-card"><span>🎮</span><div><b>Игровые приглашения</b><small>Приглашайте друзей в «Войну Сердец» одним нажатием.</small></div></div>
-    <div class="friends-feature-card"><span>🔗</span><div><b>Добавление по ссылке</b><small>Отправьте защищённое приглашение через мессенджер или почту.</small></div></div>
-    <div class="friends-feature-card"><span>📍</span><div><b>Друг рядом</b><small>Добавляйте знакомых коротким временным кодом.</small></div></div>
-  </div>
-`;
-
-const renderUnauthorizedExperience = () => {
-  if (!_container) return;
-
-  _container.classList.add('is-unauth');
-  let box = _container.querySelector('.custom-ya-unauth');
-
-  if (!box) {
-    box = D.createElement('section');
-    box.className = 'custom-ya-unauth';
-    _container.appendChild(box);
-  }
-
-  box.innerHTML = `
-    <div class="friends-hero-icon">👥</div>
-    <div class="friends-hero-kicker">Витрина · социальный раздел</div>
-    <h3>Музыка становится ближе с друзьями</h3>
-    <p class="friends-hero-text">Общайтесь, получайте уведомления и приглашайте друзей играть вместе.</p>
-    ${friendsFeatureCards()}
-    <div class="friends-privacy-note">🔐 Вход выполняется через Яндекс. Пароль не передаётся приложению.</div>
-    <button class="yandex-auth-mainbtn friends-login-btn" type="button" data-friends-login>
-      <span class="friends-ya-letter">Я</span>
-      <span>Войти через Яндекс</span>
-    </button>
-    <small class="friends-login-note">Один Яндекс-аккаунт — один постоянный профиль друга.</small>
-  `;
-
-  box.querySelector('[data-friends-login]')?.addEventListener('click', () =>
-    W.YandexAuth?.login?.()
-  );
-};
-
-const renderFriendsServiceError = error => {
-  if (!_container) return;
-
-  _container.classList.add('is-unauth');
-  let box = _container.querySelector('.custom-ya-unauth');
-
-  if (!box) {
-    box = D.createElement('section');
-    box.className = 'custom-ya-unauth';
-    _container.appendChild(box);
-  }
-
-  const message = String(error?.message || 'social_service_unavailable');
-
-  box.innerHTML = `
-    <div class="friends-hero-icon">⚠️</div>
-    <div class="friends-hero-kicker">Временная ошибка соединения</div>
-    <h3>Раздел друзей сейчас недоступен</h3>
-    <p class="friends-hero-text">Не удалось создать защищённую социальную сессию. Музыка продолжает работать.</p>
-    <div class="friends-privacy-note">${W.Utils?.escapeHtml?.(message) || message}</div>
-    <button class="yandex-auth-mainbtn friends-login-btn" type="button" data-friends-retry>
-      <span>Повторить подключение</span>
-    </button>
-  `;
-
-  box.querySelector('[data-friends-retry]')?.addEventListener('click', async event => {
-    const button = event.currentTarget;
-    button.disabled = true;
-    button.textContent = 'Подключаемся...';
-    _socialSessionRetryAt = 0;
-
-    try {
-      await applyIdentity();
-    } catch (retryError) {
-      renderFriendsServiceError(retryError);
-    }
-  });
-};
-
-const renderAuthorizedExperience = () => {
-  if (!_container) return;
-
-  _container.classList.remove('is-unauth');
-  _container.querySelector('.custom-ya-unauth')?.remove();
-
-  // Панель авторизованного Friends теперь принадлежит
-  // каноническому /Friends/friends-ui.js.
-  _container
-    .querySelector(':scope > .friends-authorized-guide')
-    ?.remove();
-};
-
-const loadUnread = () => {
-  try { _unread = JSON.parse(localStorage.getItem('vf_unread') || '{}') || {}; } catch { _unread = {}; }
-};
-
-const saveUnread = () => {
-  try { localStorage.setItem('vf_unread', JSON.stringify(_unread)); } catch {}
-};
-
-const addUnread = (friendId, meta = {}) => {
-  if (!friendId) return;
-  const old = typeof _unread[friendId] === 'object' ? _unread[friendId] : { count: Number(_unread[friendId] || 0) };
-  _unread[friendId] = {
-    count: Number(old.count || 0) + 1,
-    name: String(meta.name || old.name || 'Друг').trim(),
-    text: String(meta.text || old.text || '').trim().slice(0, 180),
-    at: Date.now()
-  };
-  saveUnread();
-  _ui?.refresh?.();
-};
-
-const clearUnread = (friendId, { refresh = true } = {}) => {
-  if (!friendId || !_unread[friendId]) return;
-  delete _unread[friendId];
-  saveUnread();
-
-  try {
-    D.querySelectorAll(`[data-unread-chat="${CSS.escape(friendId)}"]`).forEach(node => {
-      const small = D.createElement('small');
-      small.textContent = 'не в сети';
-      node.replaceWith(small);
-    });
-  } catch {}
-
-  if (refresh && !D.querySelector('.vf-modal-ov')) _ui?.refresh?.();
-};
-
-const showMailOverlay = ({ friendId, name = 'Друг' } = {}) => {
-  if (!friendId || D.getElementById('vf-mail-ov')) return;
-
-  const ov = D.createElement('div');
-  ov.id = 'vf-mail-ov';
-  ov.className = 'vf-mail-ov';
-  ov.innerHTML = `
-    <div class="vf-mail-card" role="dialog" aria-modal="true">
-      <div class="vf-mail-icon">💌</div>
-      <div class="vf-mail-title">Новое сообщение</div>
-      <div class="vf-mail-from">${W.Utils?.escapeHtml?.(name) || name}</div>
-      <div class="vf-mail-text">Откройте чат, чтобы прочитать сообщение.</div>
-      <div class="vf-mail-actions">
-        <button class="vf-btn" type="button" data-vf-read>Прочитать</button>
-        <button class="vf-btn vf-sec" type="button" data-vf-later>Позже</button>
-      </div>
-    </div>
-  `;
-  D.body.appendChild(ov);
-
-  ov.querySelector('[data-vf-read]')?.addEventListener('click', async () => {
-    ov.remove();
-    await openFriendsChat(friendId);
-  });
-
-  ov.querySelector('[data-vf-later]')?.addEventListener('click', () => ov.remove());
-};
-
-const openFriendsVoiceCall = async (friendId, incoming = null) => {
-  if (!friendId) return false;
-  try {
-    const friendsKey = W.APP_CONFIG?.SPECIAL_FRIENDS_KEY || '__friends__';
-    if (W.AlbumsManager?.getCurrentAlbum?.() !== friendsKey) await W.AlbumsManager?.loadAlbum?.(friendsKey);
-    return !!(await _ui?.openVoiceCall?.(friendId, incoming));
-  } catch {
-    return false;
-  }
-};
-
-const openFriendsChat = async friendId => {
-  if (!friendId) return false;
-  try {
-    const friendsKey = W.APP_CONFIG?.SPECIAL_FRIENDS_KEY || '__friends__';
-    if (W.AlbumsManager?.getCurrentAlbum?.() !== friendsKey) await W.AlbumsManager?.loadAlbum?.(friendsKey);
-    return !!(await _ui?.openChat?.(friendId));
-  } catch {
-    return false;
-  }
-};
-
-const readYandexProfile = () => {
-  const ya = W.YandexAuth;
-  const active = ya?.getSessionStatus?.() === 'active' && ya?.isTokenAlive?.();
-  const p = active ? (ya?.getProfile?.() || null) : null;
-  return {
-    active: !!active,
-    yandexId: String(p?.yandexId || p?.id || '').trim(),
-    displayName: String(p?.displayName || p?.realName || p?.login || 'Слушатель').trim(),
-    avatar: String(p?.avatar || '').trim()
-  };
-};
-
-const isStaleSessionPush = push => {
-  const t = Date.now();
-  const createdAt = Number(push.createdAt || 0);
-  const expiresAt = Number(push.expiresAt || 0);
-  const age = createdAt ? t - createdAt : 0;
-  if (expiresAt && expiresAt < t) return true;
-  if (push.kind === 'GAME_INVITE' && age > 120000) return true;
-  if (push.kind === 'VOICE_CALL' && age > 120000) return true;
-  return false;
-};
-
-const handlePushes = async (items) => {
-  for (const push of items) {
-    if (isStaleSessionPush(push)) continue;
-    if (push.kind === 'CHAT_MESSAGE') {
-      const activeChatId = _ui?.getActiveChatFriendId?.() || '';
-      if (activeChatId && activeChatId === push.fromFriendId && _ui?.pushIncomingChat?.(push)) {
-        await _core.markChatRead?.({ friendId: push.fromFriendId, msgId: push.msgId }).catch(() => null);
-        continue;
-      }
-
-      let name = 'Друг';
+  async initialize() {
+    if (!W.albumsIndex?.length) {
       try {
-        const prof = await _core.getProfile(push.fromFriendId);
-        if (prof?.displayName) name = prof.displayName;
+        await W.Utils?.onceEvent?.(W, 'albumsIndex:ready', { timeoutMs: 5000 });
       } catch {}
-
-      addUnread(push.fromFriendId, {
-        name,
-        text: 'Новое сообщение'
-      });
-      showMailOverlay({ friendId: push.fromFriendId, name });
-      await _core.markChatDelivered?.({ friendId: push.fromFriendId, msgId: push.msgId }).catch(() => null);
-      W.NotificationSystem?.info?.(`💬 ${name}: новое сообщение`, 5000);
-      continue;
     }
 
-    if (push.kind === 'VOICE_CALL') {
-      let name = 'Друг';
-      try {
-        const prof = await _core.getProfile(push.fromFriendId);
-        if (prof?.displayName) name = prof.displayName;
-      } catch {}
+    this._renderIcons();
+    this._bindEvents();
 
-      W.Modals?.choice?.({
-        title: '📞 Входящий звонок',
-        textHtml: `<b>${W.Utils?.escapeHtml?.(name) || name}</b> звонит вам.<br><br>Открыть голосовой чат?`,
-        actions: [
-          {
-            key: 'answer',
-            text: 'Ответить',
-            primary: true,
-            onClick: async () => {
-              const room = await _core
-                .getRoom(push.roomId, push.roomSecret)
-                .catch(() => null);
-              if (!room?.room || room.room.status === 'closed') {
-                W.NotificationSystem?.warning?.('Звонок уже завершён');
-                return;
-              }
-              return openFriendsVoiceCall(push.fromFriendId, {
-                callId: push.callId || push.pushId || '',
-                roomId: push.roomId,
-                roomSecret: push.roomSecret
-              });
-            }
-          },
-          { key: 'reject', text: 'Отклонить', onClick: () => {} }
-        ]
-      });
-      continue;
-    }
+    W.addEventListener('yandex:auth:changed', event => {
+      this._renderIcons();
 
-    if (push.kind === 'GAME_INVITE') {
-      let name = 'Друг';
-      try {
-        const prof = await _core.getProfile(push.fromFriendId);
-        if (prof?.displayName) name = prof.displayName;
-      } catch {}
-
-      W.Modals?.choice?.({
-        title: '🎮 Вызов на дуэль',
-        textHtml: `<b>${W.Utils?.escapeHtml?.(name) || name}</b> приглашает вас в игру <b>Война Сердец</b>.<br><br>Принять вызов?`,
-        actions: [
-          {
-            key: 'accept',
-            text: 'Принять',
-            primary: true,
-            onClick: async () => {
-              if (!push.joinToken) {
-                W.NotificationSystem?.warning?.(
-                  'Игровое приглашение уже устарело'
-                );
-                return;
-              }
-
-              const u = new URL(W.location.href);
-              u.searchParams.set('gcGame', push.gameId);
-              u.searchParams.set('join', push.joinToken);
-              W.history.pushState(null, '', u.toString());
-              W.AlbumsManager?.loadAlbum?.(W.APP_CONFIG?.SPECIAL_GAMES_KEY || '__games__');
-              W.NotificationSystem?.success?.('Подключаемся к бою...');
-            }
-          },
-          { key: 'reject', text: 'Позже', onClick: () => {} }
-        ]
-      });
-    }
-  }
-};
-
-const startPresenceHeartbeat = () => {
-  clearInterval(_heartbeatTimer);
-
-  const beat = async () => {
-    if (
-      D.hidden ||
-      !isFriendsRuntimeActive() ||
-      !_core?.isReady?.() ||
-      _heartbeatBusy
-    ) return;
-
-    _heartbeatBusy = true;
-    try {
-      await _core.heartbeat({ gameId: '', roomId: '' });
-    } catch {
-      // Presence heartbeat является best-effort.
-    } finally {
-      _heartbeatBusy = false;
-    }
-  };
-
-  beat();
-  _heartbeatTimer = setInterval(beat, 90000);
-};
-
-const syncWebPushIfAllowed = async () => {
-  if (!_core?.isReady?.()) return;
-  if (!('Notification' in W) || W.Notification.permission !== 'granted') return;
-
-  const standalone = W.matchMedia?.('(display-mode: standalone)')?.matches || W.navigator.standalone === true;
-  const key = `vf_webpush_sync_${_core.identity?.friendId || 'me'}`;
-  const last = Number(localStorage.getItem(key) || 0);
-  const force = standalone && Date.now() - last > 24 * 60 * 60 * 1000;
-
-  if (_webPushReady && !force) return;
-
-  try {
-    const mod = await import('../push/web-push.js');
-    const prev = _webPushReady;
-    const res = await mod.syncWebPushSubscription({ core: _core, ask: false, force });
-    _webPushReady = !!res?.ok;
-    if (res?.ok) localStorage.setItem(key, String(Date.now()));
-    if (prev !== _webPushReady) _ui?.refresh?.({ force: true });
-  } catch {}
-};
-
-const startPushPolling = () => {
-  clearTimeout(_pushTimer);
-
-  const poll = async () => {
-    if (D.hidden || !isFriendsRuntimeActive() || !_core?.isReady?.() || _pushBusy) return;
-    _pushBusy = true;
-    try {
-      const items = await _core.getPushes();
-      _pushFails = 0;
-      if (items.length) {
-        await handlePushes(items);
-        await _core.ackPushes(items.map(x => x.pushId).filter(Boolean));
-      }
-    } catch {
-      _pushFails++;
-    } finally {
-      _pushBusy = false;
-    }
-  };
-
-  const loop = async () => {
-    if (D.hidden || !isFriendsRuntimeActive() || !_core?.isReady?.()) {
-      stopFriendsBackgroundTasks();
-      return;
-    }
-
-    await poll();
-    clearTimeout(_pushTimer);
-    _pushTimer = setTimeout(
-      loop,
-      Math.min(90000, 30000 + _pushFails * 15000)
-    );
-  };
-  loop();
-};
-
-export const issueSocialSession = async ({
-  force = false
-} = {}) => {
-  const result = await getSocialSession({ force });
-  _socialSessionRetryAt = 0;
-  return result;
-};
-
-const applyIdentity = async () => {
-  if (!_core) return;
-  const prof = readYandexProfile();
-  
-  const url = new URL(W.location.href);
-  const addId = url.searchParams.get('addFriend') || W.sessionStorage.getItem('pending_friend_id');
-  const addKey = url.searchParams.get('key') || W.sessionStorage.getItem('pending_friend_key');
-
-  if (!prof.active || !prof.yandexId) {
-    _core.setIdentity({ friendId: '', yandexLinked: false });
-    W.__vfIdentity = null;
-    _lastFriendId = '';
-    stopFriendsBackgroundTasks();
-    _ui?.refresh?.();
-    renderUnauthorizedExperience();
-    
-    // Если есть инвайт, но юзер не авторизован - показываем окно и ждём входа
-    if (addId && addKey && !W.sessionStorage.getItem('pending_friend_id')) {
-      try {
-        const info = await _core.getInviteInfo(addId, addKey);
-        const inviterName = info?.fromProfile?.displayName || 'Пользователь';
-        W.Modals?.choice?.({
-          title: '👋 Заявка в друзья',
-          textHtml: `<b>${W.Utils?.escapeHtml?.(inviterName)}</b> приглашает вас в друзья.<br><br>Авторизуйтесь через Яндекс Аккаунт, чтобы принять заявку.`,
-          actions: [
-            { key: 'login', text: 'Войти через Яндекс', primary: true, onClick: () => {
-                W.sessionStorage.setItem('pending_friend_id', addId);
-                W.sessionStorage.setItem('pending_friend_key', addKey);
-                W.YandexAuth?.login?.();
-            }},
-            { key: 'cancel', text: 'Отмена', onClick: () => {} }
-          ]
-        });
-      } catch (e) {
-        W.NotificationSystem?.warning?.('Приглашение устарело или недействительно');
-      }
-      url.searchParams.delete('addFriend');
-      url.searchParams.delete('key');
-      W.history.replaceState(null, '', url.toString());
-    }
-    return;
-  }
-
-  let session;
-
-  try {
-    session = await issueSocialSession();
-  } catch (error) {
-    const message = String(error?.message || '');
-    const status = Number(error?.status || 0);
-    const authFailed =
-      status === 401 ||
-      /oauth|required|expired|bad_social_session|account_changed/i
-        .test(message);
-
-    if (authFailed) {
-      invalidateSocialSession();
-    }
-
-    const backoff =
-      getSocialServerBackoffState();
-
-    _socialSessionRetryAt = backoff.active
-      ? backoff.retryAt
-      : Date.now() + 30000;
-
-    _core.setIdentity({
-      friendId: '',
-      yandexLinked: false
-    });
-    W.__vfIdentity = null;
-    stopFriendsBackgroundTasks();
-
-    console.error(
-      '[Friends] social session failed:',
-      error
-    );
-    renderFriendsServiceError(error);
-    return false;
-  }
-
-  const id = _core.setIdentity({
-    friendId: session.friendId,
-    displayName: session.profile?.displayName || prof.displayName,
-    avatar: session.profile?.avatarUrl || prof.avatar,
-    yandexLinked: true,
-    socialSession: session.socialSession,
-    sessionExpiresAt: session.expiresAt,
-    deviceStableId: localStorage.getItem('deviceStableId') || ''
-  });
-
-  W.__vfIdentity = {
-    friendId: id.friendId,
-    displayName: id.displayName,
-    avatar: id.avatar,
-    yandexLinked: true
-  };
-
-  renderAuthorizedExperience();
-
-  if (id?.friendId && id.friendId !== _lastFriendId) {
-    try {
-      await _core.register();
-      _lastFriendId = id.friendId;
-    } catch (error) {
-      const message = String(error?.message || 'crypto_register_failed');
-      console.error('[Friends] registration failed:', error);
-
-      W.NotificationSystem?.warning?.(
-        message.includes('chat_e2ee_disabled')
-          ? 'Защищённый чат временно отключён на сервере'
-          : 'Не удалось зарегистрировать устройство шифрования. Повторим при следующем открытии Friends'
-      );
-    }
-
-    // Если есть отложенный или URL инвайт — принимаем
-    if (addId && addKey) {
-      try {
-        await _core.acceptInvite({ inviteId: addId, secret: addKey });
-        W.NotificationSystem?.success?.('Друг успешно добавлен! 🤝');
-      } catch (e) {
-        const msg = e.message === 'self_friend_forbidden' ? 'Нельзя добавить в друзья самого себя' : 'Приглашение устарело или недействительно';
-        W.NotificationSystem?.warning?.(msg);
-      }
-      W.sessionStorage.removeItem('pending_friend_id');
-      W.sessionStorage.removeItem('pending_friend_key');
-      url.searchParams.delete('addFriend');
-      url.searchParams.delete('key');
-      W.history.replaceState(null, '', url.toString());
-    }
-
-    _ui?.refresh?.({ force: true });
-    resumeFriendsBackgroundTasks();
-    syncWebPushIfAllowed();
-    W.Vi3WebPush = {
-      enable: () => import('../push/web-push.js').then(m => m.enableWebPush(_core))
-    };
-  } else {
-    _ui?.refresh?.();
-  }
-};
-
-const enableWebPushFromUi = async () => {
-  if (!_core?.isReady?.()) {
-    W.NotificationSystem?.warning?.('Сначала войдите через Яндекс');
-    return { ok: false, reason: 'friends_not_ready' };
-  }
-
-  try {
-    const mod = await import('../push/web-push.js');
-    const res = await mod.enableWebPush(_core);
-    _webPushReady = !!res?.ok;
-    _ui?.refresh?.({ force: true });
-    return res;
-  } catch (err) {
-    return { ok: false, reason: err?.message || 'enable_failed' };
-  }
-};
-
-const onGameInvite = async ({ friendId, gameId }) => {
-  D.querySelector('.vf-modal-ov')?.remove();
-  
-  const u = new URL(W.location.href);
-  u.searchParams.set('gcGame', gameId);
-  u.searchParams.set('inviteFriend', friendId);
-  W.history.pushState(null, '', u.toString());
-  
-  W.AlbumsManager?.loadAlbum?.(W.APP_CONFIG?.SPECIAL_GAMES_KEY || '__games__');
-  W.NotificationSystem?.success?.('Запускаем игру...');
-};
-export const getFriendsWebPushEnabled = () =>
-  !!_webPushReady;
-
-export const enableFriendsWebPush = () =>
-  enableWebPushFromUi();
-
-export const setFriendsEmbeddedActive = async ({
-  contextId = '',
-  active = false
-} = {}) => {
-  const id = String(contextId || '').trim();
-  if (!id) throw new Error('friends_embed_context_required');
-
-  if (active) {
-    _embeddedFriendsContexts.add(id);
-    await resumeFriendsBackgroundTasks();
-  } else {
-    _embeddedFriendsContexts.delete(id);
-
-    if (!isFriendsRuntimeActive()) {
-      stopFriendsBackgroundTasks();
-    }
-  }
-
-  return {
-    ok: true,
-    active: _embeddedFriendsContexts.has(id),
-    contexts: _embeddedFriendsContexts.size
-  };
-};
-
-export const getFriendsCoreService = async () => {
-  if (!_core) {
-    const { FriendsCore } = await import(FRIENDS_CORE_URL);
-    _core = new FriendsCore();
-  }
-
-  if (!_core.isReady()) {
-    await applyIdentity();
-  }
-
-  if (!_core.isReady()) {
-    throw new Error('friends_identity_required');
-  }
-
-  if (
-    _core.identity?.friendId &&
-    _core.identity.friendId !== _lastFriendId
-  ) {
-    await _core.register();
-    _lastFriendId = _core.identity.friendId;
-  }
-
-  return _core;
-};
-
-export const mountFriendsBlock = async ({ container } = {}) => {
-  if (!container) return false;
-  _container = container;
-
-  const [{ FriendsCore }, { mountFriendsUI }] = await Promise.all([
-    import(FRIENDS_CORE_URL),
-    import(FRIENDS_UI_URL)
-  ]);
-
-  _core = _core || new FriendsCore();
-  loadUnread();
-  _ui = mountFriendsUI(container, _core, {
-    onGameInvite,
-    onEnableWebPush: enableWebPushFromUi,
-    getWebPushEnabled: () => _webPushReady,
-    getUnread: friendId => {
-      const v = _unread[friendId];
-      return Number(typeof v === 'object' ? v.count : v || 0);
-    },
-    onUnreadClick: friendId => openFriendsChat(friendId),
-    onChatOpened: async friendId => {
-      await _core.markChatRead?.({ friendId }).catch(() => null);
-      clearUnread(friendId, { refresh: false });
-    }
-  });
-
-  await applyIdentity();
-
-  const url = new URL(W.location.href);
-  const chatWith = url.searchParams.get('chatWith');
-  const voiceWith = url.searchParams.get('voiceWith');
-
-  if (chatWith && _core?.isReady?.()) {
-    setTimeout(() => openFriendsChat(chatWith), 350);
-    url.searchParams.delete('chatWith');
-    url.searchParams.delete('openFriends');
-    W.history.replaceState(null, '', url.toString());
-  }
-
-  if (voiceWith && _core?.isReady?.()) {
-    resumeFriendsBackgroundTasks();
-    ['voiceWith', 'callId', 'openFriends']
-      .forEach(key => url.searchParams.delete(key));
-    W.history.replaceState(null, '', url.toString());
-  }
-
-  if (!_bound) {
-    _bound = true;
-    W.addEventListener('yandex:auth:changed', () => {
-      invalidateSocialSession();
-      applyIdentity().catch(() => {});
-    });
-    D.addEventListener('visibilitychange', () => {
-      if (D.hidden) {
-        stopFriendsBackgroundTasks();
-        return;
-      }
-
-      if (isFriendsRuntimeActive() && _core?.isReady?.()) {
-        resumeFriendsBackgroundTasks();
-        _ui?.refresh?.();
-      }
-    });
-
-    W.addEventListener('album:changed', event => {
-      const friendsKey = W.APP_CONFIG?.SPECIAL_FRIENDS_KEY || FRIENDS_KEY;
       if (
-        event.detail?.key !== friendsKey &&
-        !_embeddedFriendsContexts.size
+        event.detail?.status !== 'active' &&
+        this.curr === SHARDS
       ) {
-        stopFriendsBackgroundTasks();
-        return;
-      }
-
-      resumeFriendsBackgroundTasks();
-
-      if (event.detail?.key === friendsKey) {
-        _ui?.refresh?.();
+        this.loadAlbum(SHOWCASE);
       }
     });
 
-    const onSwPushClick = async event => {
-      const data = event.data || {};
-      if (data.type !== 'PUSH_NOTIFICATION_CLICK') return;
+    const defaultKey =
+      C.ICON_ALBUMS_ORDER?.find(item => !item.key.startsWith('__'))?.key ||
+      W.albumsIndex?.[0]?.key;
+    const initialKey = localStorage.getItem('currentAlbum') || defaultKey;
 
-      try {
-        const url = new URL(
-          data.url || W.location.href,
-          W.location.href
-        );
-        const kind = String(data.kind || '');
+    if (initialKey) await this.loadAlbum(initialKey);
 
-        if (kind === 'CHAT_MESSAGE') {
-          const friendId =
-            url.searchParams.get('chatWith') ||
-            data.fromFriendId ||
-            '';
-
-          if (friendId) await openFriendsChat(friendId);
-          return;
-        }
-
-        if (kind === 'VOICE_CALL' || kind === 'GAME_INVITE') {
-          const friendsKey =
-            W.APP_CONFIG?.SPECIAL_FRIENDS_KEY ||
-            FRIENDS_KEY;
-
-          if (!isFriendsSectionActive()) {
-            await W.AlbumsManager?.loadAlbum?.(friendsKey);
-          }
-
-          await resumeFriendsBackgroundTasks();
-        }
-      } catch {}
-    };
-
-    navigator.serviceWorker?.addEventListener?.('message', onSwPushClick);
-    W.addEventListener('message', onSwPushClick);
+    W.addEventListener('quality:changed', () => {
+      this.cache.forEach(album => delete album._pTracks);
+    });
   }
 
-  return true;
-};
+  _renderIcons() {
+    const root = $('album-icons');
+    if (!root) return;
 
-export default { mountFriendsBlock };
+    root.innerHTML = renderAlbumIconRows({
+      config: C,
+      albumsIndex: W.albumsIndex || [],
+      mobile: isMobileUA(),
+      profileKey: PROFILE,
+      logo: LOGO,
+      escapeHtml: escHtml
+    });
+
+    this.albumCarousel?.destroy?.();
+    this.albumCarousel = mountAlbumCarousel({
+      root: $('album-icons-albums'),
+      onSettled: key => {
+        const item = C.ICON_ALBUMS_ORDER?.find(entry => entry.key === key);
+        if (item?.title) this.renderAlbumTitle(item.title);
+        if (this.curr !== key) this.loadAlbum(key);
+      }
+    });
+  }
+
+  _bindEvents() {
+    if (this._eventsBound) return;
+    this._eventsBound = true;
+
+    this._bindAlbumIconEvents();
+    bindAlbumTrackActions({
+      root: $('track-list'),
+      getCurrentAlbum: () => this.curr,
+      getAlbum: key => this.cache.get(key),
+      getCover: key => this.covers.get(key),
+      setPlayingAlbum: key => { this.playing = key; },
+      highlightCurrentTrack: (index, meta) => this.highlightCurrentTrack(index, meta),
+      logo: LOGO
+    });
+
+    W.playerCore?.onFavoritesChanged(detail => {
+      const uid = String(detail?.uid || '').trim();
+      if (!uid) return;
+
+      const selector = detail?.albumKey
+        ? `.like-star[data-album="${CSS.escape(detail.albumKey)}"][data-uid="${CSS.escape(uid)}"]`
+        : `.like-star[data-uid="${CSS.escape(uid)}"]`;
+
+      D.querySelectorAll(selector).forEach(element =>
+        setFavoriteStarState(element, !!detail?.liked)
+      );
+    });
+  }
+
+  _bindAlbumIconEvents() {
+    const root = $('album-icons');
+    if (!root) return;
+
+    let longPressTimer = 0;
+    let suppressTouchClickUntil = 0;
+
+    const cancelLongPress = () => {
+      clearTimeout(longPressTimer);
+      longPressTimer = 0;
+    };
+
+    root.addEventListener('touchstart', event => {
+      const key = event.target.closest('.album-icon')?.dataset.album;
+      if (!key || key.startsWith('__')) return;
+
+      cancelLongPress();
+      longPressTimer = setTimeout(() => {
+        longPressTimer = 0;
+        suppressTouchClickUntil = Date.now() + 450;
+        W.ShowcaseManager?.openColorPicker?.(null, key);
+      }, 600);
+    }, { passive: true });
+
+    root.addEventListener('touchmove', () => {
+      suppressTouchClickUntil = Date.now() + 350;
+      cancelLongPress();
+    }, { passive: true });
+
+    root.addEventListener('touchend', cancelLongPress, { passive: true });
+    root.addEventListener('touchcancel', cancelLongPress, { passive: true });
+
+    root.addEventListener('contextmenu', event => {
+      const key = event.target.closest('.album-icon')?.dataset.album;
+      if (!key || key.startsWith('__')) return;
+
+      event.preventDefault();
+      W.ShowcaseManager?.openColorPicker?.(null, key);
+    });
+
+    root.addEventListener('click', event => {
+      if (Date.now() < suppressTouchClickUntil) return;
+
+      const key = event.target.closest('.album-icon')?.dataset.album;
+      if (!key) return;
+
+      if (key.startsWith('__')) {
+        this.albumCarousel?.cancelPendingSelection?.();
+      }
+
+      if (this.curr === key && !key.startsWith('__')) {
+        this._toggleGalleryVisibility();
+        return;
+      }
+
+      this.loadAlbum(key);
+    });
+  }
+
+  _toggleGalleryVisibility() {
+    this.galVis = !this.galVis;
+
+    try {
+      localStorage.setItem(GALLERY_VISIBLE_KEY, this.galVis ? '1' : '0');
+    } catch {}
+
+    const coverWrap = $('cover-wrap');
+    if (coverWrap) coverWrap.style.display = this.galVis ? '' : 'none';
+
+    W.NotificationSystem?.info(
+      this.galVis ? '🖼️ Галерея показана' : '🚫 Галерея скрыта'
+    );
+  }
+
+  async loadAlbum(key) {
+    if (this.loading) {
+      this.pendingAlbum = key;
+      return false;
+    }
+
+    this.loading = true;
+
+    if (String(key).startsWith('__')) {
+      this.albumCarousel?.cancelPendingSelection?.();
+    }
+
+    try {
+      this._prepareAlbumScreen(key);
+
+      const trackList = $('track-list');
+      const socialLinks = $('social-links');
+
+      if (SPECIAL_LOADERS[key]) {
+        await this._loadSpecialAlbum(key);
+      } else {
+        await this._loadRegularAlbum(key, trackList, socialLinks);
+      }
+
+      this._commitLoadedAlbum(key, trackList);
+      return true;
+    } catch (error) {
+      console.error(error);
+      W.NotificationSystem?.error('Ошибка загрузки');
+      return false;
+    } finally {
+      this.loading = false;
+
+      const next = this.pendingAlbum;
+      this.pendingAlbum = null;
+
+      if (next && next !== this.curr) {
+        queueMicrotask(() => this.loadAlbum(next));
+      }
+    }
+  }
+
+  _prepareAlbumScreen(key) {
+    D.body.classList.toggle('profile-view', key === PROFILE);
+    D.body.classList.toggle('games-view', key === GAMES);
+    D.body.classList.toggle('friends-view', key === FRIENDS);
+
+    const trackList = $('track-list');
+    const socialLinks = $('social-links');
+    const playerBlock = $('lyricsplayerblock');
+
+    if (playerBlock && trackList?.contains(playerBlock)) {
+      D.body.appendChild(playerBlock);
+    }
+
+    if (trackList) trackList.innerHTML = '';
+    if (socialLinks) socialLinks.innerHTML = '';
+
+    W.GalleryManager?.clear?.();
+  }
+
+  async _loadSpecialAlbum(key) {
+    const module = await import('./albums/specials.js');
+    const functionName = SPECIAL_LOADERS[key];
+    const loader = module?.[functionName];
+
+    if (typeof loader !== 'function') {
+      throw new Error(`Missing ${functionName}`);
+    }
+
+    await loader(this);
+  }
+
+  async _loadRegularAlbum(key, trackList, socialLinks) {
+    if (this.cache.has(key)) clearAlbumPlaybackTracks(this.cache.get(key));
+
+    await W.TrackRegistry?.ensurePopulated?.();
+
+    let album = this.cache.get(key);
+    if (!album) {
+      const config = W.TrackRegistry?.getAlbumConfig?.(key);
+      if (!config) throw new Error(`Missing ${key}`);
+
+      album = {
+        ...config,
+        tracks: W.TrackRegistry?.getTracksForAlbum?.(key) || []
+      };
+      this.cache.set(key, album);
+    }
+
+    await W.GalleryManager?.loadGallery?.(key);
+    this.covers.set(
+      key,
+      await W.GalleryManager?.getFirstCoverUrl?.(key) || LOGO
+    );
+
+    this._renderCoverFallback();
+    this._applyGalleryVisibility();
+    this.renderAlbumTitle(album.title || '—');
+    this._renderSocialLinks(album, socialLinks);
+    renderAlbumTracks({ root: trackList, albumKey: key, tracks: album.tracks, escapeHtml: escHtml, isFavorite: uid => W.playerCore?.isFavorite?.(uid) });
+    this.highlightCurrentTrack();
+    W.PlayerUI?.updateMiniHeader?.();
+  }
+
+  _renderCoverFallback() {
+    const coverSlot = $('cover-slot');
+    if (coverSlot && (W.GalleryManager?.getItemsCount?.() || 0) <= 0) {
+      coverSlot.innerHTML = `<img src="${LOGO}" alt="Cover">`;
+    }
+  }
+
+  _applyGalleryVisibility() {
+    const coverWrap = $('cover-wrap');
+    if (coverWrap) coverWrap.style.display = this.galVis ? '' : 'none';
+  }
+
+  _renderSocialLinks(album, root) {
+    if (!root) return;
+
+    root.innerHTML = (album.links || [])
+      .filter(link => link?.url)
+      .map(link =>
+        `<a href="${escHtml(link.url)}" target="_blank" rel="noopener noreferrer">${escHtml(link.label)}</a>`
+      )
+      .join('');
+  }
+
+  _commitLoadedAlbum(key, trackList) {
+    const previousKey = this.curr;
+    this.curr = key;
+    localStorage.setItem('currentAlbum', key);
+    W.dispatchEvent(new CustomEvent('album:changed', {
+      detail: { key, previousKey }
+    }));
+    D.body.classList.toggle('news-view', key === NEWS);
+
+    D.querySelectorAll('.album-icon').forEach(element => {
+      element.classList.toggle('active', element.dataset.album === key);
+    });
+
+    const albumRow = $('album-icons-albums');
+    if (albumRow) {
+      const special = String(key).startsWith('__');
+      albumRow.dataset.active = special ? '' : key;
+
+      if (!special) {
+        this.albumCarousel?.setCurrent?.(key, {
+          animate: true,
+          notify: false,
+          persist: true,
+          reason: 'album_loaded'
+        });
+      }
+    }
+
+    trackList?.classList.remove('filtered');
+    W.PlayerUI?.switchAlbumInstantly?.(key);
+    W.FavoritesOnlyActions?.syncFavoritesOnlyUiFrame?.();
+  }
+
+  highlightCurrentTrack() {
+    D.querySelectorAll('.current').forEach(element => {
+      const supported =
+        ['track', 'showcase-track', 'profile-list-item', 'sm-top-row']
+          .some(className => element.classList.contains(className)) ||
+        element.tagName === 'LI';
+
+      if (supported) element.classList.remove('current');
+    });
+
+    const uid = W.playerCore?.getCurrentTrackUid?.();
+    if (!uid) return;
+
+    D.querySelectorAll(`[data-uid="${CSS.escape(uid)}"]`).forEach(element => {
+      const supported =
+        ['track', 'showcase-track', 'profile-list-item', 'sm-top-row']
+          .some(className => element.classList.contains(className)) ||
+        element.tagName === 'LI';
+
+      if (supported) element.classList.add('current');
+    });
+  }
+
+  getCurrentAlbum() {
+    return this.curr;
+  }
+
+  getPlayingAlbum() {
+    return this.playing;
+  }
+
+  setPlayingAlbum(key) {
+    this.playing = key;
+  }
+
+  getPlayingAlbumTracks() {
+    return W.PlaybackContextSource?.getSourcePlaylistForContext?.(this.playing) || [];
+  }
+
+  getAlbumSourcePlaylist(key) {
+    return W.PlaybackContextSource?.getSourcePlaylistForContext?.(key) || [];
+  }
+
+  renderAlbumTitle(title, modifier) {
+    const element = $('active-album-title');
+    if (!element) return;
+
+    element.textContent = title;
+    element.className = `active-album-title ${modifier || ''}`;
+  }
+}
+
+W.AlbumsManager = new AlbumsManager();
+
+export default W.AlbumsManager;

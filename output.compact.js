@@ -1,305 +1,245 @@
-/* GENERATED_FROM=input.js SOURCE_SHA256=98ceb87cc9599796ea0e0dc8a2c71f1372aa8f3196b0e02d98759581ac8b9a32 FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
-// /Friends/friends-core.js
-// Data + identity + network для модуля Друзья. Без DOM.
-import { FriendsCrypto } from './friends-crypto.js?v=9.1.9';
-const SIGNALING_URL = 'https://functions.yandexcloud.net/d4e2epg33mkshjoar6av';
-export const CHAT_E2EE_V2 = true;
-const safe = v => String(v == null ? '' : v).trim();
-const jsonParse = raw => {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
+/* GENERATED_FROM=input.js SOURCE_SHA256=aa4b950ccb8a0e644331690127f964c35c1dee3b5f0ac269aa3ae2adde0bd76e FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
+// /Friends/friends-crypto.js
+// E2EE V2: non-extractable ECDH P-256 private key в IndexedDB,
+// AES-256-GCM payload и отдельный envelope для каждого активного устройства.
+const DB_NAME = 'Vi3FriendsCrypto';
+const DB_VERSION = 1;
+const STORE = 'deviceKeys';
+const te = new TextEncoder();
+const td = new TextDecoder();
+const safe = value => String(value == null ? '' : value).trim();
+const b64url = value => {
+  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+  let raw = '';
+  bytes.forEach(byte => {
+    raw += String.fromCharCode(byte);
+  });
+  return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 };
-const sha256Hex = async text => {
-  if (!crypto?.subtle) {
-    let h = 0x811c9dc5;
-    const s = safe(text);
-    for (let i = 0; i < s.length; i++) {
-      h ^= s.charCodeAt(i);
-      h = Math.imul(h, 0x01000193);
-    }
-    return `weak${(h >>> 0).toString(16).padStart(8, '0')}`;
-  }
-  const data = new TextEncoder().encode(safe(text));
-  const buf = await crypto.subtle.digest('SHA-256', data);
-  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+const unb64url = value => {
+  const raw = safe(value).replace(/-/g, '+').replace(/_/g, '/');
+  const padded = raw + '='.repeat((4 - (raw.length % 4)) % 4);
+  return Uint8Array.from(atob(padded), char => char.charCodeAt(0));
 };
-export const makeChatRoomId = async (a, b) => {
-  const pair = [safe(a), safe(b)].sort().join('|');
-  return `c_${(await sha256Hex(`chat:${pair}`)).slice(0, 20)}`;
-};
-export class FriendsCore {
-  constructor({ signalingUrl = SIGNALING_URL } = {}) {
-    this.signalingUrl = signalingUrl;
-    this.identity = null;
-    this._cache = { friends: [], at: 0 };
-    this.onError = () => {};
-    this.chatE2eeV2 = CHAT_E2EE_V2;
-    this.crypto = new FriendsCrypto({ request: (action, data) => this._req(action, data) });
-  }
-  // Identity приходит только от основного приложения.
-  setIdentity(identity = {}) {
-    this.identity = {
-      friendId: safe(identity.friendId),
-      displayName: safe(identity.displayName || 'Слушатель'),
-      avatar: safe(identity.avatar || ''),
-      yandexLinked: !!identity.yandexLinked,
-      deviceStableId: safe(identity.deviceStableId || ''),
-      socialSession: safe(identity.socialSession || ''),
-      sessionExpiresAt: Number(identity.sessionExpiresAt || 0)
+const randomBytes = length => crypto.getRandomValues(new Uint8Array(length));
+const openDb = () =>
+  new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onupgradeneeded = event => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains(STORE)) {
+        db.createObjectStore(STORE, { keyPath: 'ownerId' });
+      }
     };
-    this.crypto.setIdentity(this.identity);
-    return this.identity;
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+const dbGet = async ownerId => {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(STORE, 'readonly').objectStore(STORE).get(ownerId);
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error);
+  });
+};
+const dbPut = async row => {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).put(row);
+    tx.oncomplete = () => resolve(row);
+    tx.onerror = () => reject(tx.error);
+  });
+};
+const sha256 = async value => new Uint8Array(await crypto.subtle.digest('SHA-256', value instanceof Uint8Array ? value : te.encode(String(value))));
+const fingerprintOf = async publicJwk => b64url(await sha256(`${safe(publicJwk?.crv)}:${safe(publicJwk?.x)}:${safe(publicJwk?.y)}`));
+const generateDeviceKey = async ownerId => {
+  // Экспортируемый keypair существует только во время создания.
+  // В IndexedDB сохраняется повторно импортированный extractable:false private key.
+  const temporary = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const [privateJwk, publicJwk] = await Promise.all([crypto.subtle.exportKey('jwk', temporary.privateKey), crypto.subtle.exportKey('jwk', temporary.publicKey)]);
+  const privateKey = await crypto.subtle.importKey('jwk', privateJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+  const deviceId = `ecd_${crypto.randomUUID().replace(/-/g, '')}`;
+  const fingerprint = await fingerprintOf(publicJwk);
+  return dbPut({ ownerId, deviceId, privateKey, publicJwk, fingerprint, createdAt: Date.now() });
+};
+const dbDelete = async ownerId => {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).delete(ownerId);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+};
+const importPublicKey = publicJwk => crypto.subtle.importKey('jwk', publicJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+const deriveWrapKey = async ({ privateKey, publicJwk, salt, info }) => {
+  const publicKey = await importPublicKey(publicJwk);
+  const secret = await crypto.subtle.deriveBits({ name: 'ECDH', public: publicKey }, privateKey, 256);
+  const hkdfKey = await crypto.subtle.importKey('raw', secret, 'HKDF', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt, info: te.encode(info) }, hkdfKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+};
+const roomIdOf = (a, b) => [safe(a), safe(b)].sort().join(':');
+const makeAad = ({ kind, room, fromFriendId, toFriendId, clientMsgId, subjectMsgId, senderDeviceId }) => b64url(te.encode(JSON.stringify({ v: 2, kind, room, fromFriendId, toFriendId, clientMsgId, subjectMsgId, senderDeviceId })));
+export class FriendsCrypto {
+  constructor({ request = null } = {}) {
+    this.request = request;
+    this.identity = null;
+    this.device = null;
   }
-  isReady() {
-    return !!(this.identity?.friendId && this.identity?.yandexLinked && this.identity?.socialSession && Number(this.identity?.sessionExpiresAt || 0) > Date.now());
+  setIdentity(identity = {}) {
+    this.identity = { friendId: safe(identity.friendId), displayName: safe(identity.displayName || ''), deviceStableId: safe(identity.deviceStableId || '') };
+    this.device = null;
   }
-  async _req(action, data = {}) {
-    if (!this.isReady()) throw new Error('friends_identity_required');
-    let res;
-    try {
-      res = await fetch(this.signalingUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Vi3-Session': this.identity.socialSession },
-        credentials: 'omit',
-        mode: 'cors',
-        body: JSON.stringify({ action, displayName: this.identity.displayName, avatarUrl: this.identity.avatar, ...data })
-      });
-    } catch (err) {
-      this.onError(err);
-      throw new Error('network_unreachable');
+  isSupported() {
+    return !!(crypto?.subtle && indexedDB && this.identity?.friendId && typeof this.request === 'function');
+  }
+  async ensureDevice() {
+    if (!this.isSupported()) throw new Error('crypto_not_supported');
+    if (this.device) return this.device;
+    const ownerId = this.identity.friendId;
+    this.device = (await dbGet(ownerId)) || (await generateDeviceKey(ownerId));
+    const result = await this.request('crypto_device_register', { deviceId: this.device.deviceId, publicJwk: this.device.publicJwk, fingerprint: this.device.fingerprint, label: this.identity.displayName || 'Устройство', deviceStableId: this.identity.deviceStableId });
+    if (!result?.ok) throw new Error('crypto_device_register_failed');
+    return this.device;
+  }
+  async listDevices(friendId) {
+    const result = await this.request('crypto_device_list', { friendId: safe(friendId) });
+    return Array.isArray(result?.items) ? result.items : [];
+  }
+  async encryptPayload({ friendId, payload, kind = 'message', clientMsgId = '', subjectMsgId = '' } = {}) {
+    const device = await this.ensureDevice();
+    const fromFriendId = this.identity.friendId;
+    const toFriendId = safe(friendId);
+    if (!toFriendId) throw new Error('crypto_friend_required');
+    const devices = await this.listDevices(toFriendId);
+    const participantIds = new Set([fromFriendId, toFriendId]);
+    const uniqueDevices = [...new Map(devices.filter(item => participantIds.has(safe(item?.ownerId)) && safe(item?.deviceId) && item?.publicJwk).map(item => [`${safe(item.ownerId)}:${safe(item.deviceId)}`, item])).values()];
+    const myDevices = uniqueDevices.filter(item => safe(item.ownerId) === fromFriendId);
+    const peerDevices = uniqueDevices.filter(item => safe(item.ownerId) === toFriendId);
+    if (!myDevices.length) {
+      throw new Error('crypto_sender_devices_missing');
     }
-    const json = jsonParse(await res.text()) || {};
-    if (!res.ok || json.ok === false) {
-      const err = new Error(`${action}: ${json.error || json.reason || `http_${res.status}`}`);
-      err.status = res.status;
-      err.action = action;
-      this.onError(err);
-      throw err;
+    if (!peerDevices.length) {
+      throw new Error('crypto_peer_not_ready');
     }
-    return json;
+    const room = roomIdOf(fromFriendId, toFriendId);
+    const normalizedClientId = safe(clientMsgId) || `e2e_${crypto.randomUUID().replace(/-/g, '')}`;
+    const aad = makeAad({ kind, room, fromFriendId, toFriendId, clientMsgId: normalizedClientId, subjectMsgId: safe(subjectMsgId), senderDeviceId: device.deviceId });
+    const messageKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+    const rawMessageKey = new Uint8Array(await crypto.subtle.exportKey('raw', messageKey));
+    const iv = randomBytes(12);
+    const kdfSalt = randomBytes(32);
+    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: unb64url(aad) }, messageKey, te.encode(JSON.stringify(payload || {})));
+    const envelopes = [];
+    for (const target of uniqueDevices) {
+      const ownerId = safe(target.ownerId);
+      const targetDeviceId = safe(target.deviceId);
+      if (!ownerId || !targetDeviceId || !target.publicJwk) continue;
+      const info = `vi3-chat-envelope-v2|${normalizedClientId}|` + `${device.deviceId}|${ownerId}|${targetDeviceId}`;
+      const wrapKey = await deriveWrapKey({ privateKey: device.privateKey, publicJwk: target.publicJwk, salt: kdfSalt, info });
+      const wrapIv = randomBytes(12);
+      const wrappedKey = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIv, additionalData: unb64url(aad) }, wrapKey, rawMessageKey);
+      envelopes.push({ ownerId, deviceId: targetDeviceId, wrapIv: b64url(wrapIv), wrappedKey: b64url(wrappedKey) });
+    }
+    if (!envelopes.length) throw new Error('crypto_envelopes_missing');
+    return { version: 2, algorithm: 'ECDH-P256+HKDF-SHA256+AES-256-GCM', senderDeviceId: device.deviceId, senderPublicJwk: device.publicJwk, senderFingerprint: device.fingerprint, aad, iv: b64url(iv), kdfSalt: b64url(kdfSalt), ciphertext: b64url(ciphertext), envelopes, clientMsgId: normalizedClientId };
   }
-  async register() {
-    await this._req('player_register', { displayName: this.identity.displayName });
-    await this.syncProfile();
-    await this.crypto.ensureDevice();
+  async decryptMessage(message = {}) {
+    if (Number(message.cryptoVersion || message.crypto?.version) !== 2) {
+      throw new Error('chat_crypto_version_unsupported');
+    }
+    const device = await this.ensureDevice();
+    const pack = message.crypto || {};
+    const envelope = (pack.envelopes || []).find(item => safe(item.ownerId) === this.identity.friendId && safe(item.deviceId) === device.deviceId);
+    if (!envelope) throw new Error('crypto_envelope_not_found');
+    const info = `vi3-chat-envelope-v2|${safe(pack.clientMsgId)}|` + `${safe(pack.senderDeviceId)}|${this.identity.friendId}|${device.deviceId}`;
+    const wrapKey = await deriveWrapKey({ privateKey: device.privateKey, publicJwk: pack.senderPublicJwk, salt: unb64url(pack.kdfSalt), info });
+    const rawMessageKey = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64url(envelope.wrapIv), additionalData: unb64url(pack.aad) }, wrapKey, unb64url(envelope.wrappedKey));
+    const messageKey = await crypto.subtle.importKey('raw', rawMessageKey, { name: 'AES-GCM' }, false, ['decrypt']);
+    const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64url(pack.iv), additionalData: unb64url(pack.aad) }, messageKey, unb64url(pack.ciphertext));
+    const data = JSON.parse(td.decode(plaintext));
+    const tombstone = data?.type === 'tombstone';
+    return {
+      ...message,
+      text: tombstone ? 'Сообщение удалено' : safe(data?.text),
+      replyToMsgId: tombstone ? '' : safe(data?.replyToMsgId),
+      replyText: tombstone ? '' : safe(data?.replyText),
+      reactions: tombstone ? {} : data?.reactions || {},
+      deletedAt: tombstone ? Number(data?.deletedAt || message.deletedAt || Date.now()) : Number(message.deletedAt || 0),
+      cryptoVersion: 2,
+      encrypted: true,
+      decryptFailed: false
+    };
+  }
+  async decryptMessages(items = []) {
+    return Promise.all(
+      (Array.isArray(items) ? items : []).map(async item => {
+        try {
+          return await this.decryptMessage(item);
+        } catch {
+          return { ...item, text: '🔒 Не удалось расшифровать сообщение на этом устройстве', replyText: '', reactions: {}, encrypted: true, decryptFailed: true };
+        }
+      })
+    );
+  }
+  async getLocalDeviceInfo() {
+    const ownerId = this.identity?.friendId;
+    if (!ownerId) return null;
+    const device = this.device || (await dbGet(ownerId));
+    if (!device) return null;
+    return { ownerId, deviceId: device.deviceId, publicJwk: device.publicJwk, fingerprint: device.fingerprint, createdAt: device.createdAt, privateKeyPresent: !!device.privateKey, privateKeyExtractable: !!device.privateKey?.extractable };
+  }
+  async resetLocalDevice() {
+    const ownerId = this.identity?.friendId;
+    if (!ownerId) throw new Error('crypto_identity_required');
+    await dbDelete(ownerId);
+    this.device = null;
     return true;
   }
-  async syncProfile() {
-    return this._req('profile_set', { displayName: this.identity.displayName, avatarUrl: this.identity.avatar });
-  }
-  async getFriendList({ force = false } = {}) {
-    if (!force && this._cache.friends.length && Date.now() - this._cache.at < 30000) {
-      return this._cache.friends;
+  async buildSafetyNumber(friendId) {
+    const targetId = safe(friendId);
+    const ownerId = this.identity?.friendId;
+    if (!ownerId || !targetId) {
+      throw new Error('crypto_friend_required');
     }
-    const res = await this._req('friend_list', {});
-    const items = Array.isArray(res.items) ? res.items : [];
-    this._cache = { friends: items, at: Date.now() };
-    return items;
-  }
-  // Presence только по требованию (батч).
-  async heartbeat({ gameId = '', roomId = '' } = {}) {
-    return this._req('presence_heartbeat', { deviceId: this.identity.deviceStableId || 'web', gameId: safe(gameId), roomId: safe(roomId) });
-  }
-  async getPresence(friendIds = []) {
-    const ids = friendIds.map(safe).filter(Boolean).slice(0, 50);
-    if (!ids.length) return {};
-    const res = await this._req('presence_batch', { friendIds: ids });
-    return res.presence || {};
-  }
-  async sendChatMessage({ toFriendId, text, replyToMsgId = '', replyText = '', clientMsgId = '' }) {
-    const cryptoPack = await this.crypto.encryptPayload({ friendId: toFriendId, clientMsgId, kind: 'message', payload: { type: 'message', text: safe(text).slice(0, 1000), replyToMsgId: safe(replyToMsgId), replyText: safe(replyText).slice(0, 160), reactions: {} } });
-    return this._req('chat_send_v2', { toFriendId: safe(toFriendId), clientMsgId: cryptoPack.clientMsgId, crypto: cryptoPack });
-  }
-  async reactChatMessage({ friendId, msgId, emoji, message = null }) {
-    if (Number(message?.cryptoVersion || 0) !== 2) {
-      throw new Error('chat_e2ee_message_required');
+    const items = await this.listDevices(targetId);
+    const participants = new Set([ownerId, targetId]);
+    const rows = items
+      .filter(item => participants.has(safe(item.ownerId)) && safe(item.deviceId) && safe(item.fingerprint))
+      .map(item => ({ ownerId: safe(item.ownerId), deviceId: safe(item.deviceId), fingerprint: safe(item.fingerprint) }))
+      .sort((a, b) => `${a.ownerId}:${a.deviceId}`.localeCompare(`${b.ownerId}:${b.deviceId}`));
+    if (!rows.some(item => item.ownerId === ownerId) || !rows.some(item => item.ownerId === targetId)) {
+      throw new Error('crypto_peer_not_ready');
     }
-    let current = message;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (current.decryptFailed || current.deletedAt) {
-        throw new Error('chat_message_not_editable');
-      }
-      const reactions = { ...(current.reactions || {}) };
-      const me = this.identity.friendId;
-      const value = safe(emoji).slice(0, 8);
-      let mine = Array.isArray(reactions[me]) ? [...reactions[me]] : reactions[me] ? [reactions[me]] : [];
-      mine = mine.includes(value) ? mine.filter(item => item !== value) : [...mine, value].slice(-3);
-      if (mine.length) reactions[me] = mine;
-      else delete reactions[me];
-      const cryptoPack = await this.crypto.encryptPayload({ friendId, kind: 'reaction', subjectMsgId: msgId, payload: { type: 'message', text: safe(current.text).slice(0, 1000), replyToMsgId: safe(current.replyToMsgId), replyText: safe(current.replyText).slice(0, 160), reactions } });
-      try {
-        const result = await this._req('chat_update_v2', { friendId: safe(friendId), msgId: safe(msgId), expectedRevision: Number(current.revision || 1), crypto: cryptoPack });
-        return { ...result, reactions };
-      } catch (error) {
-        if (!String(error?.message || '').includes('chat_revision_conflict') || attempt >= 2) {
-          throw error;
-        }
-        current = await this.getChatMessage({ friendId, msgId });
-        if (!current) throw new Error('chat_message_not_found');
-      }
-    }
-    throw new Error('chat_revision_conflict');
-  }
-  async deleteChatMessage({ friendId, msgId, message = null }) {
-    if (Number(message?.cryptoVersion || 0) !== 2) {
-      throw new Error('chat_e2ee_message_required');
-    }
-    const deletedAt = Date.now();
-    const cryptoPack = await this.crypto.encryptPayload({ friendId, kind: 'tombstone', subjectMsgId: msgId, payload: { type: 'tombstone', deletedAt } });
-    return this._req('chat_delete_v2', { friendId: safe(friendId), msgId: safe(msgId), expectedRevision: Number(message?.revision || 1), deletedAt, crypto: cryptoPack });
-  }
-  async getChatMessages({ friendId, after = 0 } = {}) {
-    const result = await this._req('chat_poll', { friendId: safe(friendId), after: Number(after || 0) });
-    const items = Array.isArray(result.items) ? result.items : [];
-    return this.crypto.decryptMessages(items);
-  }
-  async getChatMessage({ friendId, msgId } = {}) {
-    const result = await this._req('chat_message_get', { friendId: safe(friendId), msgId: safe(msgId) });
-    if (!result.message) return null;
-    return this.crypto.decryptMessage(result.message);
-  }
-  async getOwnCryptoDevices() {
-    const result = await this._req('crypto_device_self_list', {});
-    return Array.isArray(result.items) ? result.items : [];
-  }
-  async getCryptoDevices(friendId) {
-    return this.crypto.listDevices(friendId);
-  }
-  async getLocalCryptoDevice() {
-    return this.crypto.getLocalDeviceInfo();
-  }
-  async revokeCryptoDevice(deviceId) {
-    const local = await this.crypto.getLocalDeviceInfo();
-    const result = await this._req('crypto_device_revoke', { deviceId: safe(deviceId) });
-    if (local?.deviceId === safe(deviceId)) {
-      await this.crypto.resetLocalDevice();
-    }
-    return result;
-  }
-  async resetCryptoDevices() {
-    const result = await this._req('crypto_device_reset', {});
-    await this.crypto.resetLocalDevice();
-    await this.crypto.ensureDevice();
-    return result;
-  }
-  async getSafetyNumber(friendId) {
-    return this.crypto.buildSafetyNumber(friendId);
+    const canonical = JSON.stringify({ v: 2, participants: [ownerId, targetId].sort(), devices: rows });
+    const digest = await sha256(canonical);
+    const digits = [...digest]
+      .map(byte => String(byte).padStart(3, '0'))
+      .join('')
+      .slice(0, 60);
+    const groups = digits.match(/.{1,5}/g) || [];
+    return { version: 2, friendId: targetId, safetyId: b64url(digest), display: groups.join(' '), groups, devices: rows, uri: `vi3friends://verify?v=2&a=${encodeURIComponent(ownerId)}&b=${encodeURIComponent(targetId)}&s=${encodeURIComponent(b64url(digest))}` };
   }
   getSafetyVerification(friendId) {
-    return this.crypto.getSafetyVerification(friendId);
+    const key = `vf:safety:v2:${safe(this.identity?.friendId)}:${safe(friendId)}`;
+    try {
+      return JSON.parse(localStorage.getItem(key) || 'null');
+    } catch {
+      return null;
+    }
   }
   setSafetyVerified(friendId, safety) {
-    return this.crypto.setSafetyVerified(friendId, safety);
+    const key = `vf:safety:v2:${safe(this.identity?.friendId)}:${safe(friendId)}`;
+    const row = { safetyId: safe(safety?.safetyId), verifiedAt: Date.now() };
+    localStorage.setItem(key, JSON.stringify(row));
+    return row;
   }
-  async clearChat(friendId) {
-    return this._req('chat_clear', { friendId: safe(friendId) });
-  }
-  async getChatSettings(friendId) {
-    const res = await this._req('chat_settings_get', { friendId: safe(friendId) });
-    return res.settings || { retentionDays: 30, clearedBefore: 0 };
-  }
-  async setChatRetention(friendId, retentionDays) {
-    return this._req('chat_settings_set', { friendId: safe(friendId), retentionDays: Number(retentionDays) });
-  }
-  async purgeChatForBoth(friendId) {
-    return this._req('chat_purge_both', { friendId: safe(friendId) });
-  }
-  async markChatDelivered({ friendId, msgId = '' } = {}) {
-    return this._req('chat_delivery', { friendId: safe(friendId), msgId: safe(msgId) });
-  }
-  async markChatRead({ friendId, msgId = '' } = {}) {
-    return this._req('chat_read', { friendId: safe(friendId), msgId: safe(msgId) });
-  }
-  async getRtcConfig() {
-    return this._req('rtc_config', {});
-  }
-  async getVoiceHistory(friendId) {
-    const res = await this._req('voice_history', { friendId: safe(friendId) });
-    return Array.isArray(res.items) ? res.items : [];
-  }
-  async createVoiceCall({ toFriendId, peerId } = {}) {
-    return this._req('voice_call_create', { toFriendId: safe(toFriendId), peerId: safe(peerId) });
-  }
-  async joinVoiceCall({ friendId, callId = '', roomId, roomSecret, peerId } = {}) {
-    return this._req('voice_call_join', { friendId: safe(friendId), callId: safe(callId), roomId: safe(roomId), roomSecret: safe(roomSecret), peerId: safe(peerId) });
-  }
-  async endVoiceCall({ friendId, callId = '', roomId = '', roomSecret = '', status = 'ended', durationSec = 0 } = {}) {
-    return this._req('voice_call_end', { friendId: safe(friendId), callId: safe(callId), roomId: safe(roomId), roomSecret: safe(roomSecret), status: safe(status), durationSec: Number(durationSec || 0) });
-  }
-  async getRoom(roomId, roomSecret = '') {
-    return this._req('room_get', { roomId: safe(roomId), roomSecret: safe(roomSecret) });
-  }
-  async sendVoiceSignal({ roomId, roomSecret, fromPeerId, toPeerId, type, data } = {}) {
-    return this._req('signal_send', { roomId: safe(roomId), roomSecret: safe(roomSecret), fromPeerId: safe(fromPeerId), toPeerId: safe(toPeerId), type: safe(type), payload: data });
-  }
-  async pollVoiceSignals({ roomId, roomSecret, peerId } = {}) {
-    const res = await this._req('signal_poll', { roomId: safe(roomId), roomSecret: safe(roomSecret), peerId: safe(peerId) });
-    return Array.isArray(res.messages) ? res.messages : [];
-  }
-  async removeFriend(friendId) {
-    this._cache.at = 0;
-    return this._req('friend_remove', { targetId: safe(friendId) });
-  }
-  async createInvite() {
-    const res = await this._req('friend_invite_create', {});
-    const url = `${location.origin}/?addFriend=${encodeURIComponent(res.inviteId)}&key=${encodeURIComponent(res.secret)}`;
-    return { ...res, url, code: shortCode(res.inviteId) };
-  }
-  async acceptInvite({ inviteId, secret }) {
-    this._cache.at = 0;
-    return this._req('friend_invite_accept', { inviteId: safe(inviteId), secret: safe(secret) });
-  }
-  async getInviteInfo(inviteId, secret) {
-    const res = await fetch(this.signalingUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'friend_invite_get', inviteId: safe(inviteId), secret: safe(secret) }) });
-    const json = await res.json();
-    if (!json.ok) throw new Error(json.error || 'invite_not_found');
-    return json.invite;
-  }
-  async sendPush({ toFriendId, kind = 'GENERIC', text = '', gameId = '' } = {}) {
-    return this._req('push_send', { toFriendId: safe(toFriendId), kind: safe(kind || 'GENERIC').slice(0, 40), text: safe(text).slice(0, 300), gameId: safe(gameId) });
-  }
-  async getPushes() {
-    const device = await this.crypto.ensureDevice();
-    const res = await this._req('push_poll', { deviceId: device.deviceId });
-    return Array.isArray(res.items) ? res.items : [];
-  }
-  async ackPushes(pushIds = []) {
-    const ids = [...new Set((Array.isArray(pushIds) ? pushIds : [pushIds]).map(safe).filter(Boolean))].slice(0, 100);
-    if (!ids.length) return { ok: true, acked: 0 };
-    const device = await this.crypto.ensureDevice();
-    return this._req('push_ack', { deviceId: device.deviceId, pushIds: ids });
-  }
-  async getProfile(targetId) {
-    const res = await this._req('profile_get', { targetId: safe(targetId) });
-    return res.profile || null;
-  }
-  async getWebPushConfig() {
-    return this._req('webpush_config', {});
-  }
-  async subscribeWebPush(subscription) {
-    return this._req('webpush_subscribe', { subscription, userAgent: navigator.userAgent || '' });
-  }
-  async unsubscribeWebPush(subscriptionOrEndpoint) {
-    const endpoint = typeof subscriptionOrEndpoint === 'string' ? subscriptionOrEndpoint : subscriptionOrEndpoint?.endpoint || '';
-    return this._req('webpush_unsubscribe', { endpoint });
-  }
-  async createNearbyFriendCode() {
-    return this._req('nearby_friend_create', {});
-  }
-  async joinNearbyFriendCode(code) {
-    this._cache.at = 0;
-    return this._req('nearby_friend_join', { code: safe(code).replace(/\D/g, '').slice(0, 6) });
-  }
-  async ackVoiceSignals({ roomId, roomSecret, peerId, seqs = [] } = {}) {
-    return this._req('signal_ack', { roomId: safe(roomId), roomSecret: safe(roomSecret), peerId: safe(peerId), seqs: [...new Set((Array.isArray(seqs) ? seqs : []).map(safe).filter(Boolean))].slice(0, 200) });
+  async revokeCurrentDevice() {
+    const device = await this.ensureDevice();
+    const result = await this.request('crypto_device_revoke', { deviceId: device.deviceId });
+    await this.resetLocalDevice();
+    return result;
   }
 }
-const shortCode = inviteId =>
-  safe(inviteId)
-    .replace(/[^a-z0-9]/gi, '')
-    .slice(-6)
-    .toUpperCase();
-export default FriendsCore;
+export default FriendsCrypto;

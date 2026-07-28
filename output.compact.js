@@ -1,116 +1,277 @@
-/* GENERATED_FROM=input.js SOURCE_SHA256=97af088504ffd9a14e654740b466f1caa3d6d72abdf1032811495fd8a3d5456e FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
-const MAX_TURN_LOG = 80;
-const trimList = list => (Array.isArray(list) ? list.slice(-MAX_TURN_LOG) : []);
-const makeViolation = (reason, details = {}) => ({ reason, details, at: Date.now() });
-export const createNetworkTurnState = () => ({ ok: true, expectedShotId: '', expectedShotX: -1, expectedShotY: -1, sentShotIds: [], receivedShotIds: [], resolvedShotIds: [], violations: [], note: '' });
-export const ensureNetworkTurnState = state => {
-  if (!state.networkTurn) state.networkTurn = createNetworkTurnState();
-  state.networkTurn.expectedShotId = String(state.networkTurn.expectedShotId || '');
-  state.networkTurn.expectedShotX = Number.isInteger(Number(state.networkTurn.expectedShotX)) ? Number(state.networkTurn.expectedShotX) : -1;
-  state.networkTurn.expectedShotY = Number.isInteger(Number(state.networkTurn.expectedShotY)) ? Number(state.networkTurn.expectedShotY) : -1;
-  state.networkTurn.sentShotIds = trimList(state.networkTurn.sentShotIds);
-  state.networkTurn.receivedShotIds = trimList(state.networkTurn.receivedShotIds);
-  state.networkTurn.resolvedShotIds = trimList(state.networkTurn.resolvedShotIds);
-  state.networkTurn.violations = trimList(state.networkTurn.violations);
-  return state.networkTurn;
-};
-export const recordTurnViolation = (state, reason, details = {}) => {
-  const turn = ensureNetworkTurnState(state);
-  turn.ok = false;
-  turn.note = reason;
-  turn.violations = trimList([...turn.violations, makeViolation(reason, details)]);
-  return { ok: false, reason, details };
-};
-export const canSendNetworkShot = ({ state, x, y }) => {
-  const turn = ensureNetworkTurnState(state);
-  const cell = state.enemyBoard?.[y]?.[x];
-  if (state.phase !== 'player') {
-    return recordTurnViolation(state, 'shot_not_your_turn', { phase: state.phase, x, y });
+/* GENERATED_FROM=input.js SOURCE_SHA256=c10735cbd7018d4026ee688b7b4810c49e4d94598f77b9bb804c57caac0040ed FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
+import { createMessage, MessageType, PROTOCOL_VERSION } from '../game/protocol.js';
+export class WarHeartsSession {
+  constructor({ gameId, player }) {
+    this.gameId = gameId;
+    this.player = player;
+    this.bridge = null;
+    this.ready = false;
+    this.room = null;
+    this.onStatus = () => {};
+    this.onChat = () => {};
+    this.onGameData = () => {};
+    this.onRoom = () => {};
+    this.onConnect = () => {};
+    this.onDisconnect = () => {};
+    this.onIceDiagnostics = () => {};
+    this.lastError = '';
   }
-  if (state.network?.awaitingShotResult || turn.expectedShotId) {
-    return recordTurnViolation(state, 'shot_result_still_pending', { expectedShotId: turn.expectedShotId, x, y });
+  async init() {
+    this.onStatus({ label: 'bridge...', online: false });
+    try {
+      const url = new URL('/Games/common/network-bridge.js', window.location.href);
+      url.searchParams.set('rev', '20260728-network-5');
+      const mod = await import(url.href);
+      const NetworkBridge = mod.NetworkBridge;
+      this.bridge = new NetworkBridge({ gameId: this.gameId, playerId: this.player.id, displayName: this.player.name });
+      this.bridge.onStatus = info => {
+        if (info?.ice) this.onIceDiagnostics(info.ice);
+        this.onStatus(info);
+      };
+      this.bridge.onIceDiagnostics = info => this.onIceDiagnostics(info);
+      this.bridge.onRoom = info => {
+        this.room = info;
+        this.onRoom(info);
+      };
+      this.bridge.onConnect = info => {
+        this.ready = true;
+        this.onStatus({ label: 'online', online: true });
+        this.onConnect(info || {});
+      };
+      this.bridge.onChat = msg => this.handleData(msg);
+      this.bridge.onData = data => {
+        if (data?.type === MessageType.CHAT_MESSAGE || data?.type === 'CHAT_MESSAGE') return;
+        this.handleData(data);
+      };
+      this.bridge.onError = info => {
+        const transient = !!info?.transient || /signal/i.test(String(info?.label || info?.message || ''));
+        if (transient && !this.ready) {
+          this.onStatus({ label: 'signal retry', online: false, transient: true });
+          return;
+        }
+        this.ready = false;
+        this.onStatus({ label: 'net err', online: false });
+        this.onDisconnect({ reason: 'network_error' });
+      };
+      this.bridge.onDisconnect = info => {
+        this.ready = false;
+        this.onStatus({ label: 'offline', online: false });
+        this.onDisconnect(info || { reason: 'disconnect' });
+      };
+      this.bridge.onClose = info => {
+        this.ready = false;
+        this.onStatus({ label: 'closed', online: false });
+        this.onDisconnect(info || { reason: 'closed' });
+      };
+      await this.bridge.init();
+      const joined = await this.bridge.connectFromUrl();
+      this.lastError = '';
+      this.onStatus({ label: joined ? 'joining' : 'ready', online: false });
+      return true;
+    } catch (err) {
+      try {
+        await this.bridge?.close?.();
+      } catch {}
+      this.bridge = null;
+      this.ready = false;
+      this.lastError = err?.message || String(err || 'network_bridge_init_failed');
+      this.onStatus({ label: 'mock', online: false, error: this.lastError });
+      return false;
+    }
   }
-  if (!cell) {
-    return recordTurnViolation(state, 'shot_outside_enemy_board', { x, y });
+  async createNearbyGameCode() {
+    if (!this.bridge) throw new Error('network_bridge_unavailable');
+    if (!this.room) {
+      await this.createInvite();
+    }
+    return this.bridge.createNearbyGameCode();
   }
-  if (cell.status) {
-    return recordTurnViolation(state, 'shot_to_open_cell', { x, y, status: cell.status });
+  // ─── LAN Wi-Fi: создание и подключение к комнате ──────────────────────────────
+  async createLanRoom() {
+    if (!this.bridge) throw new Error('network_bridge_unavailable');
+    const room = await this.bridge.connectAsHost({ forceLocalOnly: true, ranked: true });
+    if (room.ranked !== true) throw new Error('ranked_room_required');
+    let registered = null;
+    let code = '';
+    for (let attempt = 0; attempt < 5 && !registered?.ok; attempt++) {
+      code = this.bridge.generateLanCode?.() || String(Math.floor(100000 + Math.random() * 900000));
+      registered = await this.bridge.registerLanCode?.(code, room.roomId, room.roomSecret, true, true).catch(() => null);
+    }
+    if (!registered?.ok) throw new Error('lan_code_register_failed');
+    this.room = { role: 'host', roomId: room.roomId, roomSecret: room.roomSecret, code, ranked: true, localOnly: true, matchMode: 'ranked', joinUrl: room.joinUrl };
+    return { ...this.room, expiresAt: registered.expiresAt };
   }
-  return { ok: true, reason: 'ok' };
-};
-export const recordOutgoingShot = ({ state, shotId, x, y, seq }) => {
-  const turn = ensureNetworkTurnState(state);
-  turn.expectedShotId = String(shotId || '');
-  turn.expectedShotX = Number(x);
-  turn.expectedShotY = Number(y);
-  turn.sentShotIds = trimList([...turn.sentShotIds, String(shotId || '')]);
-  turn.note = `ожидается SHOT_RESULT ${shotId}`;
-  return { ok: true, shotId, x, y, seq };
-};
-export const clearOutgoingShotExpectation = state => {
-  const turn = ensureNetworkTurnState(state);
-  turn.expectedShotId = '';
-  turn.expectedShotX = -1;
-  turn.expectedShotY = -1;
-  turn.note = '';
-};
-export const verifyIncomingShot = ({ state, shotId, x, y }) => {
-  const turn = ensureNetworkTurnState(state);
-  const id = String(shotId || '');
-  const cell = state.myBoard?.[y]?.[x];
-  if (state.phase !== 'computer') {
-    return recordTurnViolation(state, 'incoming_shot_not_peer_turn', { phase: state.phase, shotId: id, x, y });
+  async resolveLanRoom(code) {
+    if (!this.bridge) throw new Error('network_bridge_unavailable');
+    const cleanCode = String(code || '')
+      .replace(/\D/g, '')
+      .slice(0, 6);
+    if (!cleanCode) throw new Error('lan_code_required');
+    const roomInfo = await this.bridge.getLanRoomByCode?.(cleanCode);
+    if (!roomInfo?.roomId || !roomInfo?.roomSecret) throw new Error('lan_room_not_found');
+    return { ...roomInfo, code: cleanCode, ranked: !!roomInfo.ranked, localOnly: roomInfo.localOnly !== false, matchMode: roomInfo.ranked ? 'ranked' : 'casual' };
   }
-  if (!id) {
-    return recordTurnViolation(state, 'incoming_shot_without_id', { x, y });
+  async joinLanRoom(code) {
+    if (!this.bridge) throw new Error('network_bridge_unavailable');
+    const roomInfo = await this.resolveLanRoom(code);
+    if (roomInfo.ranked !== true || roomInfo.matchMode !== 'ranked') {
+      throw new Error('ranked_room_required');
+    }
+    this.room = { role: 'guest', roomId: roomInfo.roomId, roomSecret: roomInfo.roomSecret, code: roomInfo.code, ranked: true, localOnly: true, matchMode: 'ranked', expiresAt: roomInfo.expiresAt || 0 };
+    await this.bridge.connectAsGuest({ roomId: roomInfo.roomId, roomSecret: roomInfo.roomSecret, forceLocalOnly: true, ranked: true, rankedOverride: true });
+    if (this.bridge.ranked !== true) {
+      throw new Error('ranked_room_required');
+    }
+    this.room = { ...this.room, ranked: true, localOnly: true, matchMode: 'ranked' };
+    return this.room;
   }
-  if (turn.receivedShotIds.includes(id)) {
-    return recordTurnViolation(state, 'duplicate_incoming_shot', { shotId: id, x, y });
+  async joinNearbyGameCode(code) {
+    if (!this.bridge) throw new Error('network_bridge_unavailable');
+    const res = await this.bridge.getNearbyGame(code);
+    if (!res?.roomId || !res?.roomSecret) throw new Error('nearby_game_not_found');
+    await this.bridge.connectAsGuest({ roomId: res.roomId, roomSecret: res.roomSecret });
+    return res;
   }
-  if (!cell) {
-    return recordTurnViolation(state, 'incoming_shot_outside_board', { shotId: id, x, y });
+  async createInvite() {
+    if (!this.bridge) {
+      throw new Error('network_bridge_unavailable');
+    }
+    const room = await this.bridge.connectAsHost({ ranked: true, forceLocalOnly: false });
+    if (room.ranked !== true) {
+      throw new Error('ranked_room_required');
+    }
+    const invite = { id: room.roomId, roomId: room.roomId, roomSecret: room.roomSecret, url: room.joinUrl, ranked: true, localOnly: false, matchMode: 'ranked', expiresAt: Date.now() + 120000 };
+    this.room = invite;
+    return invite;
   }
-  if (cell.status) {
-    return recordTurnViolation(state, 'incoming_shot_to_open_cell', { shotId: id, x, y, status: cell.status });
+  handleData(data) {
+    if (!data || typeof data !== 'object') return;
+    if (data.type === MessageType.CHAT_MESSAGE || data.type === 'CHAT_MESSAGE') {
+      this.onChat({ from: data.payload?.from || 'Соперник', text: String(data.payload?.text || '').slice(0, 300), at: data.at || Date.now() });
+      return;
+    }
+    if (data.v !== PROTOCOL_VERSION) {
+      this.onStatus({ label: 'protocol mismatch', online: false, error: 'game_protocol_mismatch' });
+      return;
+    }
+    if (Object.values(MessageType).includes(data.type)) {
+      this.onGameData(data);
+    }
   }
-  return { ok: true, reason: 'ok' };
-};
-export const recordIncomingShot = ({ state, shotId }) => {
-  const turn = ensureNetworkTurnState(state);
-  turn.receivedShotIds = trimList([...turn.receivedShotIds, String(shotId || '')]);
-  turn.note = '';
-  return { ok: true };
-};
-export const verifyIncomingShotResult = ({ state, shotId, x, y, result }) => {
-  const turn = ensureNetworkTurnState(state);
-  const id = String(shotId || '');
-  if (!state.network?.awaitingShotResult && !turn.expectedShotId) {
-    return recordTurnViolation(state, 'unexpected_shot_result', { shotId: id });
+  send(data) {
+    if (!this.bridge || !this.ready) return false;
+    try {
+      return !!this.bridge.send(data);
+    } catch {
+      this.ready = false;
+      this.onStatus({ label: 'send err', online: false });
+      this.onDisconnect({ reason: 'send_error' });
+      return false;
+    }
   }
-  if (!id) {
-    return recordTurnViolation(state, 'shot_result_without_id', {});
+  sendChat(text) {
+    const msg = createMessage(MessageType.CHAT_MESSAGE, { from: this.player.name, text });
+    if (!this.bridge || !this.ready) return false;
+    try {
+      return this.bridge.sendChat ? !!this.bridge.sendChat(text, this.player.name) : this.send(msg);
+    } catch {
+      this.ready = false;
+      this.onStatus({ label: 'chat err', online: false });
+      this.onDisconnect({ reason: 'chat_send_error' });
+      return false;
+    }
   }
-  if (turn.expectedShotId && id !== turn.expectedShotId) {
-    return recordTurnViolation(state, 'shot_result_id_mismatch', { expectedShotId: turn.expectedShotId, actualShotId: id });
+  sendGame(type, payload = {}) {
+    return this.send(createMessage(type, { gameId: this.gameId, from: { id: this.player.id, name: this.player.name }, ...payload }));
   }
-  if (Number(x) !== Number(turn.expectedShotX) || Number(y) !== Number(turn.expectedShotY)) {
-    return recordTurnViolation(state, 'shot_result_coordinate_mismatch', { expectedX: turn.expectedShotX, expectedY: turn.expectedShotY, actualX: Number(x), actualY: Number(y), shotId: id });
+  sendReady(payload = {}) {
+    return this.sendGame(MessageType.READY, payload);
   }
-  if (!['miss', 'hit', 'sunk'].includes(String(result || ''))) {
-    return recordTurnViolation(state, 'shot_result_value_invalid', { shotId: id, result });
+  sendBoardCommit(payload = {}) {
+    return this.sendGame(MessageType.BOARD_COMMIT, payload);
   }
-  if (turn.resolvedShotIds.includes(id)) {
-    return recordTurnViolation(state, 'duplicate_shot_result', { shotId: id });
+  sendBoardReveal(payload = {}) {
+    return this.sendGame(MessageType.BOARD_REVEAL, payload);
   }
-  return { ok: true, reason: 'ok' };
-};
-export const recordIncomingShotResult = ({ state, shotId }) => {
-  const turn = ensureNetworkTurnState(state);
-  const id = String(shotId || '');
-  turn.expectedShotId = '';
-  turn.expectedShotX = -1;
-  turn.expectedShotY = -1;
-  turn.resolvedShotIds = trimList([...turn.resolvedShotIds, id]);
-  turn.note = '';
-  return { ok: true };
-};
+  sendShot(payload = {}) {
+    return this.sendGame(MessageType.SHOT, payload);
+  }
+  sendShotResult(payload = {}) {
+    return this.sendGame(MessageType.SHOT_RESULT, payload);
+  }
+  sendMatchFinished(payload = {}) {
+    return this.sendGame(MessageType.MATCH_FINISHED, payload);
+  }
+  async getProfile(friendId) {
+    if (!this.bridge) {
+      throw new Error('network_bridge_unavailable');
+    }
+    return this.bridge.getProfile(friendId);
+  }
+  async prepareRankedMatch() {
+    if (!this.bridge) {
+      throw new Error('network_bridge_unavailable');
+    }
+    const result = await this.bridge.prepareRankedMatch();
+    this.ranked = { matchId: result?.match?.matchId || '', playerId: result?.playerId || '', peerPlayerId: result?.peerPlayerId || '', status: result?.match?.status || '' };
+    return result;
+  }
+  async prepareRankedStake(matchId) {
+    if (!this.bridge) {
+      throw new Error('network_bridge_unavailable');
+    }
+    return this.bridge.prepareRankedStake(matchId);
+  }
+  async commitRankedRps({ matchId, round, commit } = {}) {
+    if (!this.bridge) {
+      throw new Error('network_bridge_unavailable');
+    }
+    return this.bridge.commitRankedRps({ matchId, round, commit });
+  }
+  async revealRankedRps({ matchId, round, choice, salt } = {}) {
+    if (!this.bridge) {
+      throw new Error('network_bridge_unavailable');
+    }
+    return this.bridge.revealRankedRps({ matchId, round, choice, salt });
+  }
+  async submitRankedMatch({ matchId, submission } = {}) {
+    if (!this.bridge) {
+      throw new Error('network_bridge_unavailable');
+    }
+    return this.bridge.submitRankedMatch({ matchId, submission });
+  }
+  async getRankedMatchStatus(matchId) {
+    if (!this.bridge) {
+      throw new Error('network_bridge_unavailable');
+    }
+    return this.bridge.getRankedMatchStatus(matchId);
+  }
+  async getRankedStats() {
+    if (!this.bridge) {
+      throw new Error('network_bridge_unavailable');
+    }
+    return this.bridge.getRankedStats();
+  }
+  async abortRankedMatch({ matchId, reason = 'disconnect' } = {}) {
+    if (!this.bridge) {
+      throw new Error('network_bridge_unavailable');
+    }
+    return this.bridge.abortRankedMatch({ matchId, reason });
+  }
+  async sendGameInvite({ toFriendId, roomId, roomSecret } = {}) {
+    if (!this.bridge) {
+      throw new Error('network_bridge_unavailable');
+    }
+    return this.bridge.sendGameInvite({ toFriendId, gameId: this.gameId, roomId, roomSecret });
+  }
+  async close() {
+    try {
+      await this.bridge?.close?.();
+    } catch {
+      // ignore bridge close errors
+    }
+    this.ready = false;
+    this.room = null;
+    this.onStatus({ label: 'offline', online: false });
+  }
+}

@@ -1,1114 +1,826 @@
-/**
- * common/network-bridge.js
- * Общий WebRTC + Yandex Cloud Function signaling bridge для всех игр.
- * Используется из /Games/war_hearts/ и будущих игр.
- */
+// UID.001_(Playback safety invariant)_(game-app не управляет музыкой)_(нет audio/WebAudio/playback commands)
+// UID.006_(Lazy isolated micro-app)_(работает внутри iframe или standalone preview)_(основной app загружает его по клику)
+// UID.082_(Local truth vs external telemetry split)_(получаем только safe snapshot)_(не читаем localStorage/IndexedDB/token)
+// UID.094_(No-paralysis rule)_(ошибка Game Center не ломает основное приложение)_(только postMessage + fixed 9:16 image menu)
 
-const safe = v => String(v == null ? '' : v).trim();
-const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
-const jsonParse = raw => {
-  try { return JSON.parse(raw); } catch { return null; }
-};
+(function () {
+  'use strict';
 
-const makeId = prefix => `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-const rpcPending = new Map();
+  const $ = id => document.getElementById(id);
 
-window.addEventListener('message', event => {
-  if (
-    window.parent !== window &&
-    event.source !== window.parent
-  ) return;
-
-  const data = event.data || {};
-
-  if (
-    data.kind !== 'vitrina:game-host' ||
-    data.type !== 'GC_SIGNALING_RESPONSE'
-  ) return;
-
-  const payload = data.payload || {};
-  const requestId = safe(payload.requestId);
-  const pending = rpcPending.get(requestId);
-
-  if (!pending) return;
-
-  rpcPending.delete(requestId);
-  clearTimeout(pending.timer);
-
-  if (!payload.ok) {
-    const error = new Error(
-      payload.error || 'game_rpc_failed'
-    );
-    error.status = Number(payload.status || 500);
-    pending.reject(error);
-    return;
-  }
-
-  pending.resolve(payload.result || {});
-});
-
-const requestHost = (action, data = {}) => {
-  const bridgeId = safe(window.__GC_BRIDGE_ID);
-  if (!bridgeId || window.parent === window) {
-    return Promise.reject(
-      new Error('game_parent_bridge_required')
-    );
-  }
-
-  const requestId = makeId('rpc');
-
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      rpcPending.delete(requestId);
-      reject(new Error('game_rpc_timeout'));
-    }, 20000);
-
-    rpcPending.set(requestId, {
-      resolve,
-      reject,
-      timer
-    });
-
-    window.parent.postMessage({
-      kind: 'vitrina:game',
-      bridgeId,
-      capabilityToken: safe(
-        window.__GC_CAPABILITY_TOKEN
-      ),
-      type: 'GC_SIGNALING_REQUEST',
-      payload: {
-        requestId,
-        action,
-        data,
-        capabilityToken: safe(
-          window.__GC_CAPABILITY_TOKEN
-        )
-      }
-    }, '*');
-  });
-};
-const getIceServers = () => {
-  const custom = window.VI3_RTC_ICE_SERVERS;
-  if (Array.isArray(custom) && custom.length) return custom;
-
-  return [
-    { urls: 'stun:stun.sipnet.ru:3478' },
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' }
-  ];
-};
-
-const getCandidateType = candidate => {
-  const text = String(candidate?.candidate || candidate || '');
-  return (text.match(/ typ ([a-z0-9]+)/i) || [])[1] || '';
-};
-
-export class NetworkBridge {
-  constructor(myIdOrOptions = {}) {
-    const opts = typeof myIdOrOptions === 'object'
-      ? myIdOrOptions
-      : { playerId: myIdOrOptions };
-
-    this.gameId = safe(opts.gameId || 'generic');
-    this.playerId = safe(opts.playerId || opts.myId || '');
-    this.displayName = safe(opts.displayName || 'Игрок');
-
-    this.roomId = '';
-    this.roomSecret = '';
-    this.joinToken = '';
-    this.peerId = '';
-    this.remotePeerId = '';
-    this.role = '';
-
-    this.peer = null;
-    this.dataChannel = null;
-    this.pollTimer = 0;
-    this.heartbeatTimer = 0;
-    this.audioStream = null;
-    this.audioSender = null;
-    this.remoteAudio = null;
-    this.pendingIce = [];
-    this.connected = false;
-    this.closed = false;
-    this.disconnectTimer = 0;
-    this.iceRestartAttempts = 0;
-    this.iceServers = getIceServers();
-    this.iceDiagnostics = {
-      host: false,
-      srflx: false,
-      relay: false,
-      selected: '',
-      usesTurn: false,
-      updatedAt: 0
-    };
-
-    this.onConnect = () => {};
-    this.onDisconnect = () => {};
-    this.onData = () => {};
-    this.onChat = () => {};
-    this.onStatus = () => {};
-    this.onRoom = () => {};
-    this.onError = () => {};
-    this.onIceDiagnostics = () => {};
-  }
-
-  async _req(action, data = {}) {
-    let lastError = null;
-
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        return await requestHost(action, {
-          displayName: this.displayName,
-          gameId: this.gameId,
-          ...data
-        });
-      } catch (error) {
-        lastError = error;
-
-        if (
-          attempt > 0 ||
-          !/timeout|network|unreachable/i.test(
-            String(error?.message || '')
-          )
-        ) {
-          break;
-        }
-
-        await wait(350);
-      }
+  const GAME_REGISTRY = {
+    war_hearts: {
+      id: 'war_hearts',
+      title: 'Война Сердец',
+      path: './war_hearts/',
+      door: 'arena:war_hearts',
+      allow: 'fullscreen; microphone'
     }
+  };
 
-    throw lastError || new Error('game_rpc_failed');
-  }
-
-  _emitStatus(label, online = false, extra = {}) {
-    this.onStatus({ label, online, ice: this.iceDiagnostics, ...extra });
-  }
-
-  _markIceCandidate(candidate) {
-    const type = getCandidateType(candidate);
-
-    if (type === 'host') this.iceDiagnostics.host = true;
-    if (type === 'srflx') this.iceDiagnostics.srflx = true;
-    if (type === 'relay') {
-      this.iceDiagnostics.relay = true;
-      this.iceDiagnostics.usesTurn = true;
+  const state = {
+    bridgeId: '',
+    snapshot: null,
+    screen: 'tower',
+    activeGameId: '',
+    friendsEmbed: null,
+    capabilities: {
+      tower: '',
+      games: {}
     }
+  };
 
-    this.iceDiagnostics.updatedAt = Date.now();
-    this.onIceDiagnostics({ ...this.iceDiagnostics });
-  }
+  const isStandalone = () => window.parent === window;
 
-  async _refreshSelectedCandidatePair() {
-    if (!this.peer?.getStats) return this.iceDiagnostics;
-
+  const send = (type, payload = {}) => {
+    if (!state.bridgeId || isStandalone()) return false;
     try {
-      const stats = await this.peer.getStats();
-      let selectedPair = null;
-
-      stats.forEach(report => {
-        if (report.type === 'transport' && report.selectedCandidatePairId) {
-          selectedPair = stats.get(report.selectedCandidatePairId);
-        }
-        if (report.type === 'candidate-pair' && report.selected) {
-          selectedPair = report;
-        }
-      });
-
-      if (!selectedPair) return this.iceDiagnostics;
-
-      const local = stats.get(selectedPair.localCandidateId);
-      const remote = stats.get(selectedPair.remoteCandidateId);
-      const localType = local?.candidateType || '';
-      const remoteType = remote?.candidateType || '';
-
-      this.iceDiagnostics.selected = [localType, remoteType].filter(Boolean).join('↔');
-      this.iceDiagnostics.usesTurn = localType === 'relay' || remoteType === 'relay' || this.iceDiagnostics.relay;
-      this.iceDiagnostics.updatedAt = Date.now();
-
-      this.onIceDiagnostics({ ...this.iceDiagnostics });
-    } catch {}
-
-    return this.iceDiagnostics;
-  }
-
-  async init() {
-    await this._loadRtcConfig();
-
-    await this._req('player_register', {
-      displayName: this.displayName
-    });
-    await this.heartbeat();
-    this._startHeartbeat();
-    this._emitStatus('ready', false);
-    return true;
-  }
-
-  async _loadRtcConfig() {
-    try {
-      const res = await this._req('rtc_config', {});
-      if (Array.isArray(res.iceServers) && res.iceServers.length) {
-        this.iceServers = res.iceServers;
-      }
+      window.parent.postMessage({ kind: 'vitrina:game', bridgeId: state.bridgeId, type, payload }, '*');
+      return true;
     } catch {
-      this.iceServers = getIceServers();
+      return false;
     }
-    return this.iceServers;
-  }
+  };
 
-  async heartbeat() {
-    return this._req('presence_heartbeat', {
-      deviceId: 'web',
-      gameId: this.gameId,
-      roomId: this.roomId || ''
-    });
-  }
-
-  async getLeaderboard() {
-    return this._req('leaderboard_v2_get', {});
-  }
-
-  async prepareRankedMatch() {
-    if (!this.roomId || !this.roomSecret) {
-      throw new Error('room_required');
+  const postToGameFrame = (frame, type, payload = {}) => {
+    if (!frame?.contentWindow) return false;
+    try {
+      frame.contentWindow.postMessage({
+        kind: 'vitrina:game-host',
+        bridgeId: state.bridgeId,
+        type,
+        payload
+      }, '*');
+      return true;
+    } catch {
+      return false;
     }
+  };
 
-    return this._req('ranked_match_prepare', {
-      roomId: this.roomId,
-      roomSecret: this.roomSecret
-    });
-  }
+  const getGameCapability = gameId =>
+    String(
+      state.capabilities.games?.[
+        String(gameId || '').trim()
+      ] || ''
+    );
 
-  async prepareRankedStake(matchId) {
-    return this._req('ranked_stake_prepare', {
-      matchId: safe(matchId)
-    });
-  }
+  const showToast = text => {
+    const toast = $('toast');
+    if (!toast) return;
+    toast.textContent = text;
+    toast.hidden = false;
+    clearTimeout(showToast.timer);
+    showToast.timer = setTimeout(() => {
+      toast.hidden = true;
+    }, 1300);
+  };
 
-  async commitRankedRps({
-    matchId,
-    round,
-    commit
-  } = {}) {
-    return this._req('ranked_rps_commit', {
-      matchId: safe(matchId),
-      round: Number(round || 1),
-      commit: safe(commit)
-    });
-  }
+  const fmtNum = value => {
+    const n = Number(value || 0);
+    if (!Number.isFinite(n)) return '0';
+    if (n >= 1000000) return `${(n / 1000000).toFixed(1).replace('.', ',')}M`;
+    if (n >= 1000) return `${Math.round(n / 100) / 10}K`.replace('.', ',');
+    return String(Math.round(n));
+  };
 
-  async revealRankedRps({
-    matchId,
-    round,
-    choice,
-    salt
-  } = {}) {
-    return this._req('ranked_rps_reveal', {
-      matchId: safe(matchId),
-      round: Number(round || 1),
-      choice: safe(choice),
-      salt: safe(salt)
-    });
-  }
+  const setBridgeLabel = text => {
+    const el = $('bridge-pill');
+    if (el) el.textContent = text;
+  };
 
-  async submitRankedMatch({
-    matchId,
-    submission
-  } = {}) {
-    return this._req('ranked_match_submit', {
-      matchId: safe(matchId),
-      submission
-    });
-  }
+  const fitWorld = () => {
+    const scene = $('scene');
+    const world = $('world');
+    if (!scene || !world) return;
 
-  async getRankedMatchStatus(matchId) {
-    return this._req('ranked_match_status', {
-      matchId: safe(matchId)
-    });
-  }
+    const r = scene.getBoundingClientRect();
+    const ratio = 9 / 16;
 
-  async abortRankedMatch({
-    matchId,
-    reason = 'disconnect'
-  } = {}) {
-    return this._req('ranked_match_abort', {
-      matchId: safe(matchId),
-      reason: safe(reason)
-    });
-  }
+    let w = r.width;
+    let h = w / ratio;
 
-  async getProfile(friendId) {
-    const result = await this._req('profile_get', {
-      friendId: safe(friendId)
-    });
-    return result.profile || null;
-  }
-
-  async sendGameInvite({
-    toFriendId,
-    gameId = this.gameId,
-    roomId,
-    roomSecret
-  } = {}) {
-    if (
-      roomId &&
-      roomSecret &&
-      (
-        this.roomId !== roomId ||
-        this.roomSecret !== roomSecret
-      )
-    ) {
-      this.roomId = safe(roomId);
-      this.roomSecret = safe(roomSecret);
+    if (h > r.height) {
+      h = r.height;
+      w = h * ratio;
     }
 
-    const join = await this.createJoinToken({
-      invitedPlayerId: toFriendId
-    });
+    world.style.width = `${Math.floor(w)}px`;
+    world.style.height = `${Math.floor(h)}px`;
+  };
 
-    return this._req('push_send', {
-      toFriendId: safe(toFriendId),
-      kind: 'GAME_INVITE',
-      gameId: safe(gameId),
-      joinToken: join.token
-    });
-  }
+  const applySnapshot = snapshot => {
+    state.snapshot = snapshot || state.snapshot || {};
 
-  async setRoomMode({ ranked = false, localOnly = true } = {}) {
-    if (!this.roomId || !this.roomSecret) throw new Error('room_required');
+    const user = state.snapshot?.user || {};
+    const wallet = state.snapshot?.wallet || {};
+    const shards = $('shards-count');
 
-    const res = await this._req('room_set_mode', {
-      roomId: this.roomId,
-      roomSecret: this.roomSecret,
-      ranked: !!ranked,
-      localOnly: !!localOnly
-    });
-
-    this.ranked = !!res.ranked;
-    this.forceLocalOnly = !!res.localOnly;
-
-    return res;
-  }
-
-  async createNearbyGameCode() {
-    if (!this.roomId) await this.connectAsHost();
-
-    const res = await this._req('nearby_game_create', {
-      gameId: this.gameId,
-      roomId: this.roomId,
-      roomSecret: this.roomSecret,
-      peerId: this.peerId
-    });
-
-    return {
-      ...res,
-      roomId: this.roomId,
-      roomSecret: this.roomSecret,
-      joinUrl: this.buildJoinUrl()
-    };
-  }
-
-  async getNearbyGame(code) {
-    return this._req('nearby_game_join', {
-      code: safe(code).replace(/\D/g, '').slice(0, 6),
-      gameId: this.gameId
-    });
-  }
-
-  async createRoom() {
-    const hostPeerId = makeId('host');
-    const res = await this._req('room_create', {
-      gameId: this.gameId,
-      peerId: hostPeerId
-    });
-
-    this.role = 'host';
-    this.roomId = res.roomId;
-    this.roomSecret = res.roomSecret;
-    this.peerId = res.hostPeerId;
-    this.remotePeerId = res.guestPeerId;
-
-    const join = await this.createJoinToken();
-    this.joinToken = join.token;
-
-    this.onRoom({
-      role: this.role,
-      roomId: this.roomId,
-      roomSecret: this.roomSecret,
-      joinUrl: this.buildJoinUrl()
-    });
-
-    return {
-      ...res,
-      joinUrl: this.buildJoinUrl()
-    };
-  }
-
-  async createJoinToken({
-    invitedPlayerId = ''
-  } = {}) {
-    if (!this.roomId || !this.roomSecret) {
-      throw new Error('room_required');
+    if (shards) {
+      shards.textContent = fmtNum(wallet.shards || 0);
+      shards.title = wallet.available
+        ? 'Баланс Осколков'
+        : 'Экономика готовится к запуску';
     }
 
-    return this._req('room_join_token_create', {
-      roomId: this.roomId,
-      roomSecret: this.roomSecret,
-      invitedPlayerId: safe(invitedPlayerId)
-    });
-  }
-
-  async joinRoom({ roomId, roomSecret }) {
-    const res = await this._req('room_join', {
-      roomId,
-      roomSecret
-    });
-
-    this.role = 'guest';
-    this.roomId = res.roomId;
-    this.roomSecret = roomSecret;
-    this.peerId = res.guestPeerId;
-    this.remotePeerId = res.hostPeerId;
-
-    this.onRoom({
-      role: this.role,
-      roomId: this.roomId,
-      roomSecret: this.roomSecret
-    });
-
-    return res;
-  }
-
-  buildJoinUrl(joinToken = this.joinToken) {
-    const u = new URL('/Games/', window.location.href);
-    u.searchParams.set('gcGame', this.gameId);
-
-    if (joinToken) {
-      u.searchParams.set('join', joinToken);
+    const avatarBox = $('avatar-box');
+    if (avatarBox && user.avatar) {
+      avatarBox.innerHTML = `<img src="${String(user.avatar).replace(/"/g, '&quot;')}" alt="">`;
     }
+  };
 
-    return u.toString();
-  }
+  const exitGame = async () => {
+    showToast('Выход в основное приложение');
+    closePanel();
+    send('GC_CLOSE', { reason: 'user_exit', at: Date.now() });
+    fitWorld();
+  };
+  const openFriendsTab = async () => {
+    const panel = getPanel();
+    if (!panel) return;
 
-  _initPeer() {
-    try { this.dataChannel?.close?.(); } catch {}
-    try { this.peer?.close?.(); } catch {}
+    const gameHost = $('bt-game-host');
+    if (gameHost) gameHost.hidden = true;
 
-    this.peer = null;
-    this.dataChannel = null;
-    this.connected = false;
-    this.pendingIce = [];
-    this.iceDiagnostics = {
-      host: false,
-      srflx: false,
-      relay: false,
-      selected: '',
-      usesTurn: false,
-      updatedAt: 0
-    };
+    state.screen = 'friends';
 
-    // ВАЖНО: STUN всегда включён. Браузеры маскируют host-кандидаты через mDNS (.local),
-    // и без STUN два устройства в одной Wi-Fi часто не находят друг друга.
-    // srflx-кандидаты с одинаковым внешним IP всё равно дают прямое локальное соединение.
-    const peerConfig = {
-      iceServers: this.iceServers || getIceServers(),
-      iceCandidatePoolSize: 8,
-      iceTransportPolicy: 'all',
-      bundlePolicy: 'max-bundle',
-      rtcpMuxPolicy: 'require'
-    };
+    document.querySelectorAll('.bt-nav-item')
+      .forEach(button => button.classList.remove('is-active'));
 
-    this.peer = new RTCPeerConnection(peerConfig);
+    $('nav-friends')?.classList.add('is-active');
+
+    const title = document.querySelector('.bt-title h1');
+    if (title) title.textContent = 'Друзья';
+
+    document.querySelectorAll('.bt-hotspot')
+      .forEach(node => {
+        node.style.display = 'none';
+      });
+
+    panel.hidden = false;
+    panel.classList.add('bt-panel-friends');
+    panel.innerHTML = `
+      <div class="bt-friends-host"></div>
+    `;
 
     try {
-      const transceiver = this.peer.addTransceiver('audio', {
-        direction: 'sendrecv'
-      });
-      this.audioSender = transceiver.sender;
-    } catch {
-      this.audioSender = null;
-    }
+      const moduleUrl = new URL(
+        './common/friends-embed.js?v=9.1.8',
+        document.baseURI
+      ).href;
 
-    this.peer.onicecandidate = e => {
-      if (!e.candidate) return;
+      const module = await import(moduleUrl);
 
-      // Никогда не фильтруем кандидаты: симметричный полный набор у host и guest
-      // даёт максимальный шанс прямого соединения в одной Wi-Fi.
-      this._markIceCandidate(e.candidate);
-      if (!this.roomId || !this.remotePeerId) return;
+      state.friendsEmbed?.destroy?.();
 
-      this._sendSignal('ice', e.candidate).catch(error => {
-        this._emitStatus('ice retry', false, {
-          transient: true,
-          signalType: 'ice',
-          error: error?.message || String(error || '')
-        });
-      });
-    };
+      state.friendsEmbed = await module.mountCanonicalFriends({
+        root: panel.querySelector('.bt-friends-host'),
+        identity: state.snapshot?.friend || {},
+        build: '9.1.8',
+        onGameInvite: ({ friendId, gameId }) => {
+          closePanel();
 
-    this.peer.onconnectionstatechange = () => {
-      const st = this.peer?.connectionState || 'unknown';
+          const url = new URL(window.location.href);
+          url.searchParams.set('inviteFriend', friendId);
+          window.history.replaceState(
+            null,
+            '',
+            url.toString()
+          );
 
-      if (st === 'connected') {
-        clearTimeout(this.disconnectTimer);
-        this.disconnectTimer = 0;
-        this.iceRestartAttempts = 0;
-        this.connected = true;
-
-        this._refreshSelectedCandidatePair()
-          .finally(() => this._emitStatus('online', true));
-
-        return;
-      }
-
-      if (st === 'disconnected') {
-        this._emitStatus('reconnecting', false, {
-          transient: true
-        });
-
-        clearTimeout(this.disconnectTimer);
-        this.disconnectTimer = setTimeout(() => {
-          if (
-            !this.closed &&
-            this.peer?.connectionState === 'disconnected'
-          ) {
-            this.connected = false;
-            this.onDisconnect({
-              state: 'disconnected_timeout'
-            });
-          }
-        }, 10000);
-
-        return;
-      }
-
-      if (st === 'failed') {
-        this.connected = false;
-        this._emitStatus('ice failed', false);
-
-        if (
-          this.role === 'guest' &&
-          this.iceRestartAttempts < 1
-        ) {
-          this.iceRestartAttempts++;
-          this._makeAndSendOffer('ice-restart', {
-            iceRestart: true
-          }).catch(error => {
-            this.onError(error);
-          });
-          return;
+          openGame(gameId || 'war_hearts');
         }
-
-        this.onDisconnect({ state: st });
-        return;
-      }
-
-      if (st === 'closed') {
-        this.connected = false;
-        this._emitStatus('closed', false);
-        this.onDisconnect({ state: st });
-      }
-    };
-
-    this.peer.ondatachannel = e => {
-      this._bindDataChannel(e.channel);
-    };
-
-    this.peer.ontrack = e => {
-      this._attachRemoteAudio(e.streams?.[0]);
-    };
-
-    this.peer.onnegotiationneeded = async () => {
-      if (this.closed || !this.peer || !this.remotePeerId || this.role !== 'host') return;
-      if (!this.connected) return; // Предотвращаем WebRTC glare: Хост не отправляет оффер до установки P2P соединения
-      try {
-        await this._makeAndSendOffer('renegotiate');
-      } catch (err) {
-        this.onError(err);
-      }
-    };
-  }
-
-  _bindDataChannel(channel) {
-    this.dataChannel = channel;
-    this.dataChannel.onopen = () => {
-      this.connected = true;
-      this._emitStatus('online', true);
-      this.onConnect({
-        roomId: this.roomId,
-        role: this.role
       });
-    };
-    this.dataChannel.onclose = () => {
-      this.connected = false;
-      if (!this.closed) {
-        this.onDisconnect({
-          state: 'datachannel_closed'
-        });
-      }
-    };
-    this.dataChannel.onmessage = e => {
-      const data = jsonParse(e.data);
-      if (!data) return;
-      if (data.type === 'CHAT_MESSAGE') this.onChat(data);
-      this.onData(data);
-    };
-  }
-
-  _attachRemoteAudio(stream) {
-    if (!stream) return;
-    let audio = document.getElementById('remote-voice');
-    if (!audio) {
-      audio = document.createElement('audio');
-      audio.id = 'remote-voice';
-      audio.autoplay = true;
-      audio.playsInline = true;
-      audio.style.display = 'none';
-      document.body.appendChild(audio);
+    } catch (error) {
+      panel.innerHTML = `
+        <div class="bt-friends-error">
+          Не удалось загрузить Друзья:
+          ${String(error?.message || 'unknown_error')}
+        </div>
+      `;
     }
-    audio.srcObject = stream;
-    this.remoteAudio = audio;
-  }
+  };
 
-  async _sendSignal(type, data) {
-    this._emitStatus(`send ${type}`, false, { signalType: type });
+  const switchTab = tab => {
+    closePanel();
+    document.querySelectorAll('.bt-nav-item').forEach(btn => btn.classList.remove('is-active'));
+    
+    const bgImg = $('bg-image');
+    const titleH1 = document.querySelector('.bt-title h1');
+    const hotspots = document.querySelectorAll('.bt-hotspot');
 
-    const res = await this._req('signal_send', {
-      roomId: this.roomId,
-      roomSecret: this.roomSecret,
-      fromPeerId: this.peerId,
-      toPeerId: this.remotePeerId,
-      type,
-      payload: { type, data }
-    });
+    if (tab === 'friends') {
+      openFriendsTab();
+      return;
+    } else {
+      state.friendsEmbed?.destroy?.();
+      state.friendsEmbed = null;
 
-    this._emitStatus(`${type} sent`, false, { signalType: type });
-    return res;
-  }
+      const panel = $('bt-panel');
+      panel?.classList.remove('bt-panel-friends');
 
-  async _makeAndSendOffer(
-    reason = 'offer',
-    options = {}
-  ) {
-    if (!this.peer || this.closed) {
-      throw new Error('peer_unavailable');
+      $('nav-tower')?.classList.add('is-active');
+      if (titleH1) titleH1.textContent = 'Башня';
+      if (bgImg) bgImg.src = './assets/tower/bg.webp';
+      hotspots.forEach(h => h.style.display = '');
+    }
+  };
+
+  const getPanel = () => {
+    let panel = $('bt-panel');
+    if (panel) return panel;
+
+    const scene = $('scene');
+    if (!scene) return null;
+
+    panel = document.createElement('section');
+    panel.className = 'bt-panel';
+    panel.id = 'bt-panel';
+    panel.hidden = true;
+    scene.appendChild(panel);
+
+    return panel;
+  };
+
+  const closePanel = () => {
+    const panel = $('bt-panel');
+    if (panel) {
+      panel.hidden = true;
+      panel.innerHTML = '';
     }
 
-    const offer = await this.peer.createOffer({
-      iceRestart: options.iceRestart === true
-    });
+    // ВАЖНО: активную игру не уничтожаем. Только скрываем, чтобы iframe жил в памяти.
+    const gameHost = $('bt-game-host');
+    if (gameHost) gameHost.hidden = true;
 
-    await this.peer.setLocalDescription(offer);
+    state.screen = 'tower';
+  };
 
-    await this._sendSignal('offer', {
-      sdp: this.peer.localDescription,
-      reason,
-      iceRestart: options.iceRestart === true
-    });
-  }
+  const closeGameHost = () => {
+    const gameHost = $('bt-game-host');
+    if (gameHost) {
+      gameHost.hidden = true;
+      gameHost.innerHTML = '';
+    }
 
-  async _handleSignal(msg) {
-    const rawPayload = msg?.payload;
-    const payload = typeof rawPayload === 'string'
-      ? jsonParse(rawPayload)
-      : rawPayload;
+    state.activeGameId = '';
+    state.screen = 'tower';
 
-    const type = safe(
-      msg?.type ||
-      payload?.type
-    );
-    const data =
-      msg?.data ??
-      payload?.data ??
-      null;
+    const panel = $('bt-panel');
+    if (panel) {
+      panel.hidden = true;
+      panel.innerHTML = '';
+    }
 
-    if (!this.peer || !type || !data) return;
+    fitWorld();
+  };
 
-    if (type === 'offer') {
-      this._emitStatus('offer received', false, { signalType: 'offer' });
-      const desc = data?.sdp || data;
-      await this.peer.setRemoteDescription(new RTCSessionDescription(desc));
+  const openGame = gameId => {
+    const game = GAME_REGISTRY[gameId];
+    if (!game) return;
 
-      for (const c of this.pendingIce.splice(0)) {
-        await this.peer.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
-      }
+    const scene = $('scene');
+    if (!scene) return;
 
-      const answer = await this.peer.createAnswer();
-      await this.peer.setLocalDescription(answer);
-      await this._sendSignal('answer', this.peer.localDescription);
+    const panel = $('bt-panel');
+    if (panel) panel.hidden = true;
+
+    let gameHost = $('bt-game-host');
+    if (!gameHost) {
+      gameHost = document.createElement('section');
+      gameHost.className = 'bt-game-host';
+      gameHost.id = 'bt-game-host';
+      scene.appendChild(gameHost);
+    }
+
+    state.screen = 'game';
+    state.activeGameId = game.id;
+    gameHost.dataset.gameId = game.id;
+    gameHost.hidden = false;
+
+    // Если iframe этой игры уже жив — не пересоздаём.
+    const existingFrame = gameHost.querySelector(`.bt-game-frame[data-game-id="${game.id}"]`);
+    if (existingFrame) {
+      showToast(`Возвращаем ${game.title}`);
+      fitWorld();
+
+      postToGameFrame(existingFrame, 'GC_INIT', {
+        bridgeId: state.bridgeId,
+        gameId: game.id,
+        capabilityToken: getGameCapability(game.id),
+        snapshot: state.snapshot,
+        at: Date.now()
+      });
+      postToGameFrame(existingFrame, 'GC_RESTORE_GAME', { gameId: game.id, at: Date.now() });
+      if (state.snapshot) postToGameFrame(existingFrame, 'GC_SNAPSHOT', state.snapshot);
+
       return;
     }
 
-    if (type === 'answer') {
-      this._emitStatus('answer received', false, {
-        signalType: 'answer'
-      });
+      const launchUrl = new URL(game.path, window.location.href);
+      const params = new URLSearchParams(window.location.search);
 
-      const desc = data?.sdp || data;
+      launchUrl.searchParams.set('host', 'game_center');
 
-      if (
-        !this.peer.remoteDescription ||
-        this.peer.remoteDescription.type !== 'answer'
-      ) {
-        await this.peer.setRemoteDescription(
-          new RTCSessionDescription(desc)
+      if (params.get('join')) {
+        launchUrl.searchParams.set(
+          'join',
+          params.get('join')
         );
       }
 
-      for (const c of this.pendingIce.splice(0)) {
-        await this.peer.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+      if (params.get('inviteFriend')) {
+        launchUrl.searchParams.set(
+          'inviteFriend',
+          params.get('inviteFriend')
+        );
       }
+
+    const safeLaunchUrl = launchUrl.toString().replace(/"/g, '&quot;');
+    const safeTitle = game.title.replace(/"/g, '&quot;');
+    const safeGameId = game.id.replace(/"/g, '&quot;');
+
+    gameHost.innerHTML = `
+      <iframe
+        class="bt-game-frame"
+        data-game-id="${safeGameId}"
+        title="${safeTitle}"
+        src="${safeLaunchUrl}"
+        sandbox="allow-scripts allow-forms allow-popups"
+        allow="${game.allow || 'fullscreen'}"
+        allowfullscreen
+        referrerpolicy="no-referrer"
+      ></iframe>
+    `;
+
+    const frame = gameHost.querySelector('.bt-game-frame');
+    const postToGame = () => {
+      postToGameFrame(frame, 'GC_INIT', {
+        bridgeId: state.bridgeId,
+        gameId: game.id,
+        capabilityToken: getGameCapability(game.id),
+        snapshot: state.snapshot,
+        at: Date.now()
+      });
+      postToGameFrame(frame, 'GC_RESTORE_GAME', { gameId: game.id, at: Date.now() });
+      if (state.snapshot) postToGameFrame(frame, 'GC_SNAPSHOT', state.snapshot);
+    };
+
+    frame?.addEventListener('load', () => {
+      postToGame();
+      setTimeout(postToGame, 160);
+    }, { once: true });
+
+    showToast(`Открываем ${game.title}`);
+    send('GC_DOOR_CLICKED', { door: game.door || game.id, gameId: game.id, at: Date.now() });
+    fitWorld();
+  };
+
+  const restoreActiveGame = preferredGameId => {
+    const gameHost = $('bt-game-host');
+    const activeId = preferredGameId || state.activeGameId || gameHost?.dataset?.gameId || '';
+
+    if (gameHost) {
+      const frame = activeId
+        ? gameHost.querySelector(`.bt-game-frame[data-game-id="${activeId}"]`)
+        : gameHost.querySelector('.bt-game-frame');
+
+      if (frame) {
+        const panel = $('bt-panel');
+        if (panel) {
+          panel.hidden = true;
+          panel.innerHTML = '';
+        }
+
+        gameHost.hidden = false;
+        gameHost.style.display = '';
+        document.body.dataset.mode = 'play';
+        state.screen = 'game';
+        if (activeId) {
+          state.activeGameId = activeId;
+          gameHost.dataset.gameId = activeId;
+        }
+
+        showToast('Возвращаемся в игру');
+
+        postToGameFrame(frame, 'GC_INIT', {
+          bridgeId: state.bridgeId,
+          gameId: activeId,
+          capabilityToken: getGameCapability(activeId),
+          snapshot: state.snapshot,
+          at: Date.now()
+        });
+        postToGameFrame(frame, 'GC_RESTORE_GAME', { gameId: activeId, at: Date.now() });
+        if (state.snapshot) postToGameFrame(frame, 'GC_SNAPSHOT', state.snapshot);
+
+        fitWorld();
+        return;
+      }
+    }
+
+    if (activeId && GAME_REGISTRY[activeId]) {
+      openGame(activeId);
       return;
     }
 
-    if (type === 'ice') {
-      this._emitStatus('ice received', false, { signalType: 'ice' });
-      this._markIceCandidate(data);
-      if (!this.peer.remoteDescription) {
-        this.pendingIce.push(data);
-        return;
-      }
-      await this.peer.addIceCandidate(new RTCIceCandidate(data)).catch(() => {});
-    }
-  }
-
-  _startPolling(intervalMs = 800) {
-    this.stopPolling();
-
-    let busy = false;
-    let fails = 0;
-
-    const tick = async () => {
-      if (this.closed || !this.roomId || !this.peerId) {
-        this.pollTimer = 0;
-        return;
-      }
-
-      if (document.hidden) {
-        this.pollTimer = setTimeout(tick, Math.max(1600, intervalMs * 2));
-        return;
-      }
-
-      if (busy) {
-        this.pollTimer = setTimeout(tick, intervalMs);
-        return;
-      }
-
-      busy = true;
-
-      try {
-        const res = await this._req('signal_poll', {
-          roomId: this.roomId,
-          roomSecret: this.roomSecret,
-          peerId: this.peerId
-        });
-
-        fails = 0;
-
-        for (const msg of res.messages || []) {
-          await this._handleSignal(msg);
-        }
-      } catch (err) {
-        fails++;
-        this._emitStatus(fails > 2 ? 'signal retry' : 'signal wait', false, {
-          transient: true,
-          error: err?.message || String(err || '')
-        });
-
-        // Важно: signal_poll может кратко падать на мобильной сети.
-        // Не вызываем onError до открытия DataChannel, иначе игра сама помечает P2P как разорванный.
-        if (this.connected && (fails === 3 || fails % 8 === 0)) this.onError(err);
-      } finally {
-        busy = false;
-        const backoff = Math.min(5000, intervalMs + fails * 450);
-        this.pollTimer = setTimeout(tick, fails ? backoff : intervalMs);
-      }
-    };
-
-    this.pollTimer = setTimeout(tick, 20);
-  }
-
-  stopPolling() {
-    clearTimeout(this.pollTimer);
-    this.pollTimer = 0;
-  }
-
-  _startHeartbeat() {
-    if (this.heartbeatTimer) return;
-    this.heartbeatTimer = setInterval(() => {
-      if (!document.hidden) {
-        this.heartbeat().catch((err) => {
-          if (err && err.status >= 500) {
-            clearInterval(this.heartbeatTimer);
-            this.heartbeatTimer = 0;
-            this.onError(err);
-          }
-        });
-      }
-    }, 25000);
-  }
-
-  async connectAsHost(opts = {}) {
-    this.closed = false;
-    this.forceLocalOnly = !!opts.forceLocalOnly;
-    this.ranked = !!opts.ranked;
-
-    if (!this.roomId) await this.createRoom();
-
-    this.role = 'host';
-
-    if (
-      Object.prototype.hasOwnProperty.call(opts, 'ranked') ||
-      Object.prototype.hasOwnProperty.call(opts, 'forceLocalOnly')
-    ) {
-      const mode = await this.setRoomMode({
-        ranked: this.ranked,
-        localOnly: this.forceLocalOnly
-      });
-
-      this.ranked = !!mode.ranked;
-      this.forceLocalOnly = !!mode.localOnly;
+    if (GAME_REGISTRY.war_hearts) {
+      openGame('war_hearts');
+      return;
     }
 
-    this._initPeer();
+    state.screen = 'tower';
+    fitWorld();
+  };
 
-    // Даже в LAN-режиме signaling остаётся нужен для обмена SDP/ICE.
-    // Интервал не должен создавать сотни serverless-вызовов в минуту.
-    this._startPolling(this.forceLocalOnly ? 650 : 900);
-    this._emitStatus(
-      this.forceLocalOnly ? 'lan waiting' : 'waiting',
-      false,
-      {
-        localOnly: this.forceLocalOnly,
-        ranked: this.ranked
-      }
-    );
+  const openFame = async () => {
+    const panel = getPanel();
+    if (!panel) return;
 
-    return {
-      roomId: this.roomId,
-      roomSecret: this.roomSecret,
-      joinUrl: this.buildJoinUrl(),
-      localOnly: this.forceLocalOnly,
-      ranked: this.ranked
-    };
-  }
+    state.screen = 'fame';
+    panel.hidden = false;
+    panel.innerHTML = `
+      <div class="bt-panel-head">
+        <button class="bt-panel-back" type="button" data-panel-close aria-label="Закрыть">✕</button>
+        <div>
+          <h2>Зал Славы</h2>
+          <p>Лучшие игроки арены (рейтинг ELO)</p>
+        </div>
+      </div>
+      <div class="bt-games-list" id="fame-list">
+        <div style="text-align:center; padding: 20px; color: var(--bt-muted);">Загрузка рейтинга...</div>
+      </div>
+    `;
 
-  async connectAsGuest({ roomId, roomSecret, forceLocalOnly = false, ranked = false, rankedOverride = null }) {
-    this.closed = false;
-    this.forceLocalOnly = !!forceLocalOnly;
-    this.ranked = !!ranked;
-
-    const joined = await this.joinRoom({ roomId, roomSecret });
-    this.ranked = !!(joined?.ranked ?? this.ranked);
-    this.forceLocalOnly = !!(joined?.localOnly ?? this.forceLocalOnly);
-
-    if (rankedOverride !== null && !!rankedOverride !== this.ranked) {
-      const mode = await this.setRoomMode({
-        ranked: !!rankedOverride,
-        localOnly: this.forceLocalOnly
-      });
-      this.ranked = !!mode.ranked;
-      this.forceLocalOnly = !!mode.localOnly;
-    }
-
-    this.role = 'guest';
-    this._initPeer();
-
-    // Guest первым создаёт DataChannel и отправляет initial offer.
-    const ch = this.peer.createDataChannel('game', {
-      ordered: true,
-      maxRetransmits: 5
-    });
-
-    this._bindDataChannel(ch);
-    await this._makeAndSendOffer('initial');
-
-    this._startPolling(this.forceLocalOnly ? 650 : 900);
-    this._emitStatus(this.forceLocalOnly ? 'lan connecting' : 'connecting', false, {
-      localOnly: this.forceLocalOnly,
-      ranked: this.ranked
-    });
-
-    return true;
-  }
-
-  async connectFromUrl() {
-    const url = new URL(window.location.href);
-    const joinToken = safe(
-      url.searchParams.get('join')
-    );
-
-    if (!joinToken) return false;
-
-    const redeemed = await this._req(
-      'room_join_token_redeem',
-      { joinToken }
-    );
-
-    if (
-      !redeemed?.roomId ||
-      !redeemed?.roomSecret
-    ) {
-      throw new Error(
-        redeemed?.reason ||
-        'room_join_token_invalid'
-      );
-    }
-
-    await this.connectAsGuest({
-      roomId: redeemed.roomId,
-      roomSecret: redeemed.roomSecret
-    });
-
-    url.searchParams.delete('join');
-    window.history.replaceState(
-      null,
-      '',
-      url.toString()
-    );
-
-    return true;
-  }
-
-  send(data) {
-    if (this.dataChannel?.readyState !== 'open') return false;
-    this.dataChannel.send(JSON.stringify(data));
-    return true;
-  }
-
-  sendChat(text, from = this.displayName) {
-    return this.send({
-      type: 'CHAT_MESSAGE',
-      payload: {
-        from,
-        text: safe(text).slice(0, 300)
-      },
-      at: Date.now()
-    });
-  }
-
-  async toggleVoice(enable) {
-    if (!this.peer) return false;
-
-    if (!enable && !this.audioStream) {
-      return true;
-    }
-
-    if (!this.audioStream) {
-      this.audioStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
-      });
-
-      const track = this.audioStream.getAudioTracks()[0];
-      if (track) {
-        track.enabled = false;
-        if (this.audioSender?.replaceTrack) {
-          await this.audioSender.replaceTrack(track);
-        } else {
-          this.peer.addTrack(track, this.audioStream);
-        }
-      }
-    }
-
-    const track = this.audioStream.getAudioTracks()[0];
-    if (track) track.enabled = !!enable;
+    panel.querySelector('[data-panel-close]')?.addEventListener('click', closePanel);
+    send('GC_DOOR_CLICKED', { door: 'fame', at: Date.now() });
 
     try {
-      await this.remoteAudio?.play?.();
-    } catch {}
+      const url = new URL('./common/network-bridge.js', window.location.href).href;
+      const { NetworkBridge } = await import(url);
+      const bridge = new NetworkBridge({ gameId: 'war_hearts', displayName: state.snapshot?.user?.displayName || 'Гость' });
+      const res = await bridge.getLeaderboard();
+      
+      const list = panel.querySelector('#fame-list');
+      if (!list) return;
 
-    this.send({
-      type: 'VOICE_STATE',
-      payload: { active: !!enable },
-      at: Date.now()
+      if (!res.leaders?.length) {
+        list.innerHTML = `<div style="text-align:center; padding: 20px; color: var(--bt-muted);">Пока нет сыгранных матчей. Будьте первыми!</div>`;
+        return;
+      }
+
+      list.innerHTML = res.leaders.map((p, i) => `
+        <div class="bt-game-card" style="min-height: 70px; grid-template-columns: 42px 1fr auto; padding: 10px;">
+          <div class="bt-game-icon" style="width:42px; height:42px; font-size:18px; border-radius:12px;">${
+            p.avatarUrl ? `<img src="${String(p.avatarUrl).replace(/"/g, '&quot;')}" style="width:100%;height:100%;border-radius:12px;object-fit:cover">` : (i === 0 ? '👑' : i === 1 ? '🥈' : i === 2 ? '🥉' : '👤')
+          }</div>
+          <div class="bt-game-info">
+            <h3 style="font-size: 15px; margin: 0 0 3px;">${i + 1}. ${String(p.displayName || 'Игрок').replace(/</g, '&lt;')}</h3>
+            <p style="font-size: 11px;">Побед: ${p.wins} / Боёв: ${p.matches}</p>
+          </div>
+          <div style="font-weight:900; color:#4daaff; font-size:16px; margin-left: 10px;">${p.rating}</div>
+        </div>
+      `).join('');
+
+    } catch (e) {
+      const list = panel.querySelector('#fame-list');
+      if (list) list.innerHTML = `<div style="text-align:center; padding: 20px; color: #ff3159;">Ошибка загрузки: ${e.message}</div>`;
+    }
+  };
+
+  const openArena = () => {
+    const panel = getPanel();
+    if (!panel) return;
+
+    state.screen = 'arena';
+    panel.hidden = false;
+    panel.innerHTML = `
+      <div class="bt-panel-head">
+        <button class="bt-panel-back" type="button" data-panel-close aria-label="Закрыть">✕</button>
+        <div>
+          <h2>Арена Турниров</h2>
+          <p>Выберите игру для дуэли или тренировки</p>
+        </div>
+      </div>
+
+      <div class="bt-games-list">
+        <button class="bt-game-card" type="button" data-game="war_hearts">
+          <div class="bt-game-icon">💔</div>
+          <div class="bt-game-info">
+            <h3>Война Сердец</h3>
+            <p>Морской бой 10×10 в стилистике разбитых сердец. Дуэль, чат, голос и режим против компьютера.</p>
+            <div class="bt-game-tags">
+              <span>P2P</span>
+              <span>10×10</span>
+              <span>Voice</span>
+              <span>Demo AI</span>
+            </div>
+          </div>
+          <div class="bt-game-arrow">›</div>
+        </button>
+
+        <div class="bt-game-card bt-game-card-soon" aria-disabled="true">
+          <div class="bt-game-icon">🏆</div>
+          <div class="bt-game-info">
+            <h3>Скоро новая дуэль</h3>
+            <p>Следующая мини-игра появится отдельным модулем в Game Center.</p>
+            <div class="bt-game-tags">
+              <span>soon</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    panel.querySelector('[data-panel-close]')?.addEventListener('click', closePanel);
+    panel.querySelector('[data-game="war_hearts"]')?.addEventListener('click', () => openGame('war_hearts'));
+
+    showToast('Арена Турниров');
+    send('GC_DOOR_CLICKED', { door: 'arena', at: Date.now() });
+  };
+
+  const bindBridge = () => {
+    window.addEventListener('message', e => {
+      if (
+        window.parent !== window &&
+        e.source !== window.parent
+      ) return;
+
+      const d = e.data || {};
+      if (d.kind !== 'vitrina:game-host') return;
+
+      if (d.type === 'GC_INIT') {
+        state.bridgeId =
+          d.bridgeId ||
+          d.payload?.bridgeId ||
+          state.bridgeId ||
+          '';
+
+        window.__GC_BRIDGE_ID = state.bridgeId;
+
+        const capabilities =
+          d.payload?.capabilities &&
+          typeof d.payload.capabilities === 'object'
+            ? d.payload.capabilities
+            : {};
+
+        state.capabilities = {
+          tower: String(capabilities.tower || ''),
+          games:
+            capabilities.games &&
+            typeof capabilities.games === 'object'
+              ? { ...capabilities.games }
+              : {}
+        };
+
+        window.__GC_CAPABILITY_TOKEN =
+          state.capabilities.tower;
+
+        setBridgeLabel(
+          state.bridgeId
+            ? 'bridge: connected'
+            : 'bridge: no id'
+        );
+
+        applySnapshot(d.payload?.snapshot);
+        send('GC_READY', { at: Date.now(), userAgent: navigator.userAgent.slice(0, 80) });
+        send('GC_REQUEST_SNAPSHOT');
+
+        if (d.payload?.gameId) restoreActiveGame(d.payload.gameId);
+        return;
+      }
+
+      // После iOS/Safari restore JS-state мог сброситься. Если пришёл новый bridgeId — принимаем его.
+      if (!state.bridgeId && d.bridgeId) {
+        state.bridgeId = d.bridgeId;
+        setBridgeLabel('bridge: restored');
+      }
+
+      if (state.bridgeId && d.bridgeId && d.bridgeId !== state.bridgeId) return;
+
+      if (d.type === 'GC_SNAPSHOT' || d.type === 'GC_HOST_STATE') {
+        applySnapshot(d.payload);
+        const gameIframe = document.querySelector('.bt-game-frame');
+        if (gameIframe) postToGameFrame(gameIframe, 'GC_SNAPSHOT', d.payload);
+        return;
+      }
+      if (d.type === 'GC_SIGNALING_RESPONSE') {
+        const gameIframe = document.querySelector(
+          '.bt-game-frame'
+        );
+
+        if (gameIframe) {
+          postToGameFrame(
+            gameIframe,
+            'GC_SIGNALING_RESPONSE',
+            d.payload || {}
+          );
+        }
+        return;
+      }
+      if (d.type === 'GC_FRIENDS_RESPONSE') {
+        const gameIframe = document.querySelector(
+          '.bt-game-frame'
+        );
+
+        if (gameIframe) {
+          postToGameFrame(
+            gameIframe,
+            'GC_FRIENDS_RESPONSE',
+            d.payload || {}
+          );
+        }
+        return;
+      }
+      if (d.type === 'GC_RESTORE_GAME') {
+        restoreActiveGame(d.payload?.gameId || state.activeGameId || 'war_hearts');
+        return;
+      }
     });
 
-    return true;
-  }
+    if (isStandalone()) {
+      setBridgeLabel('standalone');
+      applySnapshot({
+        user: { displayName: 'Standalone' },
+        progress: {
+          level: 1,
+          xp: 0,
+          achievementsUnlocked: 0,
+          achievementsTotal: 0
+        },
+        wallet: {
+          available: false,
+          shards: 0,
+          locked: 0,
+          version: 0
+        },
+        player: { title: '' }
+      });
+    }
+  };
 
-// ─── LAN Wi-Fi: генерация и регистрация кодов ──────────────────────────────
-generateLanCode() {
-  // Только цифры: легко продиктовать другу голосом.
-  let code = '';
-  for (let i = 0; i < 6; i++) code += String(Math.floor(Math.random() * 10));
-  return code;
-}
+  const bindScrollProxy = () => {
+    const scene = $('scene');
+    if (!scene) return;
 
-async registerLanCode(
-  code,
-  roomId,
-  roomSecret,
-  ranked,
-  localOnly = true
-) {
-  return this._req('lan_code_register', {
-    code: String(code).replace(/\D/g, '').slice(0, 6),
-    roomId,
-    roomSecret,
-    ranked: !!ranked,
-    localOnly: !!localOnly,
-    matchMode: ranked ? 'ranked' : 'casual',
-    ttlMs: 300000
-  });
-}
+    scene.addEventListener('wheel', event => {
+      send('GC_PARENT_SCROLL', {
+        deltaY: event.deltaY,
+        at: Date.now()
+      });
+    }, { passive: true });
+  };
 
-async getLanRoomByCode(code) {
-const cleanCode = String(code || '').replace(/\D/g, '').slice(0, 6);
-if (!cleanCode) throw new Error('lan_code_required');
-const res = await this._req('lan_code_resolve', { code: cleanCode });
-if (!res?.roomId || !res?.roomSecret) throw new Error('lan_room_not_found');
-return {
-  roomId: res.roomId,
-  roomSecret: res.roomSecret,
-  ranked: !!res.ranked,
-  localOnly: !!res.localOnly,
-  matchMode: res.matchMode || (res.ranked ? 'ranked' : 'casual'),
-  expiresAt: res.expiresAt || 0
-};
-}
+  const bindHotspots = () => {
+    $('exit-game')?.addEventListener('click', e => {
+      e.preventDefault(); e.stopPropagation();
+      exitGame();
+    });
 
-async close() {
-    this.closed = true;
-    this.stopPolling();
+    document.querySelectorAll('[data-tab]').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.preventDefault(); e.stopPropagation();
+        switchTab(btn.dataset.tab);
+      });
+    });
 
-    clearTimeout(this.disconnectTimer);
-    this.disconnectTimer = 0;
+    document.querySelectorAll('[data-door]').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.preventDefault(); e.stopPropagation();
 
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-    this.heartbeatTimer = 0;
+        const door = btn.dataset.door || 'unknown';
+        const label = btn.getAttribute('aria-label') || door;
 
-    if (this.roomId && this.roomSecret) {
-      try {
-        await this._req('room_close', {
-          roomId: this.roomId,
-          roomSecret: this.roomSecret
+        if (door === 'arena') {
+          openArena();
+          return;
+        }
+
+        if (door === 'fame') {
+          openFame();
+          return;
+        }
+
+        showToast(`${label}: скоро откроется`);
+        send('GC_DOOR_CLICKED', { door, at: Date.now() });
+      });
+    });
+  };
+
+  const init = () => {
+    document.body.dataset.mode = 'play';
+    
+    // Слушаем сигналы от внутренней игры
+    window.addEventListener('message', e => {
+      const d = e.data || {};
+      if (d.kind !== 'vitrina:game') return;
+
+      const gameIframe = document.querySelector('.bt-game-frame');
+      if (
+        gameIframe?.contentWindow &&
+        e.source !== gameIframe.contentWindow
+      ) return;
+      const gameId =
+        gameIframe?.dataset?.gameId ||
+        state.activeGameId ||
+        '';
+      if (d.type === 'GC_SIGNALING_REQUEST') {
+        send('GC_SIGNALING_REQUEST', {
+          ...(d.payload || {}),
+          capabilityToken: getGameCapability(gameId)
         });
-      } catch {}
+        return;
+      }
+
+      if (d.type === 'GC_FRIENDS_REQUEST') {
+        send('GC_FRIENDS_REQUEST', {
+          ...(d.payload || {}),
+          capabilityToken: getGameCapability(gameId)
+        });
+        return;
+      }
+      if (d.type === 'GC_CLOSE') {
+        closeGameHost();
+        return;
+      }
+
+      if (d.type === 'GC_COLLAPSE_GAME') {
+        state.screen = 'game';
+        if (gameId) state.activeGameId = gameId;
+
+        send('GC_COLLAPSE_GAME', {
+          ...(d.payload || {}),
+          gameId: state.activeGameId,
+          at: Date.now()
+        });
+        return;
+      }
+
+      if (d.type === 'GC_SAVE_DATA') {
+        send('GC_SAVE_DATA', {
+          ...(d.payload || {}),
+          capabilityToken: getGameCapability(gameId)
+        });
+        return;
+      }
+
+      if (d.type === 'GC_AUTH_LOGIN') {
+        send('GC_AUTH_LOGIN', d.payload || {});
+        return;
+      }
+
+      if (d.type === 'GC_READY' || d.type === 'GC_REQUEST_SNAPSHOT') {
+        state.screen = 'game';
+        if (gameId) state.activeGameId = gameId;
+
+        if (gameIframe) {
+          if (d.type === 'GC_READY') {
+            postToGameFrame(gameIframe, 'GC_INIT', {
+              bridgeId: state.bridgeId,
+              gameId: state.activeGameId,
+              capabilityToken:
+                getGameCapability(state.activeGameId),
+              snapshot: state.snapshot,
+              at: Date.now()
+            });
+            postToGameFrame(gameIframe, 'GC_RESTORE_GAME', { gameId: state.activeGameId, at: Date.now() });
+          }
+
+          if (state.snapshot) postToGameFrame(gameIframe, 'GC_SNAPSHOT', state.snapshot);
+        }
+      }
+    });
+
+    fitWorld();
+    bindBridge();
+    bindHotspots();
+    bindScrollProxy();
+
+    const launchParams = new URLSearchParams(window.location.search);
+
+    if (
+      launchParams.get('gcGame') === 'war_hearts' || launchParams.get('game') === 'war_hearts'
+    ) {
+      if (
+        launchParams.get('join') ||
+        launchParams.get('inviteFriend')
+      ) {
+        setTimeout(() => openGame('war_hearts'), 120);
+      }
     }
 
-    try { this.dataChannel?.close?.(); } catch {}
-    try { this.peer?.close?.(); } catch {}
+    let resizeTimer = 0;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(fitWorld, 80);
+    }, { passive: true });
 
-    this.audioStream?.getTracks?.().forEach(t => {
-      try { t.stop(); } catch {}
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) fitWorld();
     });
 
-    this.peer = null;
-    this.dataChannel = null;
-    this.audioStream = null;
-    this.connected = false;
-    this.roomId = '';
-    this.roomSecret = '';
-    this.joinToken = '';
-    this.peerId = '';
-    this.remotePeerId = '';
-    this.role = '';
-    this.pendingIce = [];
-  }
-}
+    const img = $('bg-image');
+    if (img?.complete) fitWorld();
+    else img?.addEventListener('load', fitWorld, { once: true });
+  };
 
-export default NetworkBridge;
+  init();
+})();

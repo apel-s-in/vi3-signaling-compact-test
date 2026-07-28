@@ -1,511 +1,305 @@
-/* GENERATED_FROM=input.js SOURCE_SHA256=7ceed49c4dfd51dfd681db5e8fe153d0be75c19d888f906895649dc81f9ec72a FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
-// /Friends/chat-text-ui.js
-// Текстовый чат: UI, optimistic-send, reply/quote, reactions, retry, adaptive polling.
-import { openCryptoDevicesUi } from './crypto-devices-ui.js?v=9.1.9';
-const esc = v => String(v || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' })[c]);
-const fmtChatTime = ts => {
-  const d = new Date(Number(ts || Date.now()));
-  const yy = String(d.getFullYear()).slice(-2);
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mi = String(d.getMinutes()).padStart(2, '0');
-  return `${yy}.${mm}.${dd} ${hh}:${mi}`;
+/* GENERATED_FROM=input.js SOURCE_SHA256=98ceb87cc9599796ea0e0dc8a2c71f1372aa8f3196b0e02d98759581ac8b9a32 FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
+// /Friends/friends-core.js
+// Data + identity + network для модуля Друзья. Без DOM.
+import { FriendsCrypto } from './friends-crypto.js?v=9.1.9';
+const SIGNALING_URL = 'https://functions.yandexcloud.net/d4e2epg33mkshjoar6av';
+export const CHAT_E2EE_V2 = true;
+const safe = v => String(v == null ? '' : v).trim();
+const jsonParse = raw => {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
 };
-const fmtStatusTime = ts => (Number(ts || 0) > 0 ? fmtChatTime(ts) : '—');
-const REACTION_EMOJIS = ['❤️', '👍', '🔥', '👏', '😱', '👎', '🥰'];
-export const openTextChatModal = ({ friendId, name = 'Друг', core, openModal, toast, confirmAction = async () => false, onActiveChatChange = () => {} } = {}) => {
-  if (!friendId || !core || typeof openModal !== 'function') return false;
-  let lastAt = 0;
-  let timer = 0;
-  let loadBusy = false;
-  let loadFails = 0;
-  let replyTo = null;
-  let sendBusy = false;
-  let cleanupObserver = null;
-  const seen = new Set();
-  const rowsByMsgId = new Map();
-  const rowsByClientId = new Map();
-  const messagesById = new Map();
-  const statusLabel = msg => {
-    if (msg.localStatus === 'failed') return '⚠️ не доставлено';
-    if (msg.readAt) return '✓✓ прочитано';
-    if (msg.deliveredAt) return '✓✓ доставлено';
-    if (msg.createdAt) return '✓ отправлено';
-    return '… отправка';
-  };
-  const statusDetails = msg => [`Отправлено: ${fmtStatusTime(msg.createdAt)}`, `Доставлено: ${fmtStatusTime(msg.deliveredAt)}`, `Прочитано: ${fmtStatusTime(msg.readAt)}`, msg.localStatus === 'failed' ? `Ошибка: ${msg.error || 'не отправлено'}` : ''].filter(Boolean).join('\n');
-  const ov = openModal(
-    `
-    <div class="vf-modal-head vf-chat-head">
-      <button class="vf-btn vf-sec vf-chat-gear" type="button" id="vf-chat-settings" title="Настройки">⚙</button>
-      <b>Чат с ${esc(name)}</b>
-      <button class="vf-btn vf-sec vf-chat-close" type="button" id="vf-chat-close" title="Закрыть">✕</button>
-    </div>
-    <div class="vf-chat-settings-panel" hidden>
-      <label class="vf-chat-retention">
-        <span>Хранить сообщения в этом диалоге</span>
-        <select id="vf-chat-retention">
-          <option value="1">1 день</option>
-          <option value="7">1 неделю</option>
-          <option value="30">1 месяц</option>
-        </select>
-      </label>
-      <button class="vf-btn vf-sec" type="button" id="vf-chat-crypto">🔐 Устройства и проверка ключей</button>
-      <button class="vf-btn vf-sec" type="button" id="vf-chat-clear">Очистить только у меня</button>
-      <button class="vf-btn vf-danger" type="button" id="vf-chat-purge-both">Удалить переписку у обоих</button>
-    </div>
-    <div class="vf-chat-log" aria-live="polite"></div>
-    <div class="vf-chat-reply" hidden>
-      <span></span>
-      <button type="button" class="vf-chat-reply-x">×</button>
-    </div>
-    <form class="vf-chat-form">
-      <textarea rows="1" maxlength="1000" placeholder="Сообщение..." autocomplete="off"></textarea>
-      <span class="vf-chat-counter" hidden></span>
-      <button class="vf-btn vf-chat-send" type="submit">▶</button>
-    </form>
-  `,
-    { closeOnBackdrop: false }
-  );
-  ov.querySelector('.vf-modal')?.classList.add('vf-chat-modal');
-  const log = ov.querySelector('.vf-chat-log');
-  const input = ov.querySelector('textarea');
-  const panel = ov.querySelector('.vf-chat-settings-panel');
-  const retentionSelect = ov.querySelector('#vf-chat-retention');
-  const replyBox = ov.querySelector('.vf-chat-reply');
-  const replyTextEl = replyBox.querySelector('span');
-  core
-    .getChatSettings(friendId)
-    .then(settings => {
-      if (retentionSelect) {
-        retentionSelect.value = String(settings?.retentionDays || 30);
-      }
-    })
-    .catch(() => {});
-  retentionSelect?.addEventListener('change', async () => {
+const sha256Hex = async text => {
+  if (!crypto?.subtle) {
+    let h = 0x811c9dc5;
+    const s = safe(text);
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return `weak${(h >>> 0).toString(16).padStart(8, '0')}`;
+  }
+  const data = new TextEncoder().encode(safe(text));
+  const buf = await crypto.subtle.digest('SHA-256', data);
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+};
+export const makeChatRoomId = async (a, b) => {
+  const pair = [safe(a), safe(b)].sort().join('|');
+  return `c_${(await sha256Hex(`chat:${pair}`)).slice(0, 20)}`;
+};
+export class FriendsCore {
+  constructor({ signalingUrl = SIGNALING_URL } = {}) {
+    this.signalingUrl = signalingUrl;
+    this.identity = null;
+    this._cache = { friends: [], at: 0 };
+    this.onError = () => {};
+    this.chatE2eeV2 = CHAT_E2EE_V2;
+    this.crypto = new FriendsCrypto({ request: (action, data) => this._req(action, data) });
+  }
+  // Identity приходит только от основного приложения.
+  setIdentity(identity = {}) {
+    this.identity = {
+      friendId: safe(identity.friendId),
+      displayName: safe(identity.displayName || 'Слушатель'),
+      avatar: safe(identity.avatar || ''),
+      yandexLinked: !!identity.yandexLinked,
+      deviceStableId: safe(identity.deviceStableId || ''),
+      socialSession: safe(identity.socialSession || ''),
+      sessionExpiresAt: Number(identity.sessionExpiresAt || 0)
+    };
+    this.crypto.setIdentity(this.identity);
+    return this.identity;
+  }
+  isReady() {
+    return !!(this.identity?.friendId && this.identity?.yandexLinked && this.identity?.socialSession && Number(this.identity?.sessionExpiresAt || 0) > Date.now());
+  }
+  async _req(action, data = {}) {
+    if (!this.isReady()) throw new Error('friends_identity_required');
+    let res;
     try {
-      await core.setChatRetention(friendId, Number(retentionSelect.value));
-      lastAt = 0;
-      seen.clear();
-      rowsByMsgId.clear();
-      rowsByClientId.clear();
-      messagesById.clear();
-      log.innerHTML = '';
-      await load();
-      toast?.('Срок хранения сохранён');
-    } catch (err) {
-      toast?.(`Ошибка: ${err.message}`);
-    }
-  });
-  const renderReply = () => {
-    if (!replyTo) {
-      replyBox.hidden = true;
-      replyTextEl.textContent = '';
-      return;
-    }
-    replyBox.hidden = false;
-    replyTextEl.textContent = `Ответ: ${replyTo.text}`;
-  };
-  const normalizeMyReactions = msg => {
-    let mine = msg?.reactions?.[core.identity?.friendId];
-    if (typeof mine === 'string') mine = mine ? [mine] : [];
-    return Array.isArray(mine) ? mine.filter(Boolean).slice(0, 3) : [];
-  };
-  const renderQuoteHtml = msg => (msg.replyToMsgId ? `<button type="button" class="vf-chat-quote" data-reply-to="${esc(msg.replyToMsgId)}"><span>↩ ответ</span><b>${esc(msg.replyText || 'Сообщение')}</b></button>` : '');
-  const renderReactions = reactions => {
-    const entries = Object.entries(reactions || {}).flatMap(([uid, raw]) => {
-      const arr = (Array.isArray(raw) ? raw : raw ? [raw] : []).filter(Boolean).slice(0, 3);
-      return arr.map(emoji => ({ uid, emoji }));
-    });
-    if (!entries.length) return '';
-    return `<div class="vf-chat-reactions">${entries.map(x => `<span class="${x.uid === core.identity?.friendId ? 'is-my' : 'is-peer'}">${esc(x.emoji)}</span>`).join('')}</div>`;
-  };
-  const renderMessageInner = msg => {
-    const mine = msg.fromFriendId === core.identity?.friendId;
-    return `
-      <div class="vf-chat-bubble" role="button" tabindex="0">
-        ${renderQuoteHtml(msg)}
-        <span class="vf-chat-text">${msg.encrypted ? '🔒 ' : ''}${esc(msg.text || '')}</span>
-        ${renderReactions(msg.reactions)}
-      </div>
-      ${
-        mine
-          ? `
-        <div class="vf-chat-statusline">
-          <button class="vf-chat-retry" type="button" ${msg.localStatus === 'failed' ? '' : 'hidden'}>↻</button>
-          <button class="vf-chat-status-btn" type="button">${esc(statusLabel(msg))}</button>
-        </div>
-      `
-          : `<div class="vf-chat-time">${fmtChatTime(msg.createdAt)}</div>`
-      }
-    `;
-  };
-  const getRowMessage = row => {
-    const msgId = row?.dataset?.msgId || '';
-    const clientMsgId = row?.dataset?.clientMsgId || '';
-    return messagesById.get(msgId) || messagesById.get(clientMsgId) || null;
-  };
-  const scrollToMessage = msgId => {
-    const row = rowsByMsgId.get(msgId) || rowsByClientId.get(msgId);
-    if (!row) {
-      toast?.('Исходное сообщение не найдено в загруженной истории');
-      return false;
-    }
-    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    row.classList.add('is-target');
-    setTimeout(() => row.classList.remove('is-target'), 1400);
-    return true;
-  };
-  const setRowKeys = (row, msg) => {
-    const prevMsgId = row.dataset.msgId || '';
-    const prevClientId = row.dataset.clientMsgId || '';
-    const nextMsgId = msg.msgId || prevMsgId || '';
-    const nextClientId = msg.clientMsgId || prevClientId || '';
-    if (prevMsgId && prevMsgId !== nextMsgId) rowsByMsgId.delete(prevMsgId);
-    if (prevClientId && prevClientId !== nextClientId) rowsByClientId.delete(prevClientId);
-    row.dataset.msgId = nextMsgId;
-    row.dataset.clientMsgId = nextClientId;
-    if (nextMsgId) {
-      rowsByMsgId.set(nextMsgId, row);
-      messagesById.set(nextMsgId, msg);
-    }
-    if (nextClientId) {
-      rowsByClientId.set(nextClientId, row);
-      messagesById.set(nextClientId, msg);
-    }
-  };
-  const updateMessage = msg => {
-    const row = (msg.msgId && rowsByMsgId.get(msg.msgId)) || (msg.clientMsgId && rowsByClientId.get(msg.clientMsgId)) || null;
-    if (!row) return false;
-    const prevMsgId = row.dataset.msgId || '';
-    const prevClientId = row.dataset.clientMsgId || '';
-    const cur = { ...(messagesById.get(prevMsgId) || messagesById.get(prevClientId) || {}), ...msg };
-    setRowKeys(row, cur);
-    row.innerHTML = renderMessageInner(cur);
-    return true;
-  };
-  const append = msg => {
-    const key = msg.clientMsgId || msg.msgId || `${msg.fromFriendId}:${msg.createdAt}:${msg.text}`;
-    if (seen.has(key) || (msg.clientMsgId && rowsByClientId.has(msg.clientMsgId)) || (msg.msgId && rowsByMsgId.has(msg.msgId))) {
-      updateMessage(msg);
-      return;
-    }
-    seen.add(key);
-    const mine = msg.fromFriendId === core.identity?.friendId;
-    const row = document.createElement('div');
-    row.className = `vf-chat-msg ${mine ? 'is-mine' : 'is-friend'}`;
-    row.innerHTML = renderMessageInner(msg);
-    setRowKeys(row, msg);
-    row.addEventListener('click', e => {
-      const quote = e.target.closest?.('[data-reply-to]');
-      if (quote && row.contains(quote)) {
-        e.preventDefault();
-        e.stopPropagation();
-        scrollToMessage(quote.dataset.replyTo || '');
-        return;
-      }
-      const retry = e.target.closest?.('.vf-chat-retry');
-      if (retry && row.contains(retry)) {
-        e.preventDefault();
-        e.stopPropagation();
-        retryMessage(getRowMessage(row));
-        return;
-      }
-      const status = e.target.closest?.('.vf-chat-status-btn');
-      if (status && row.contains(status)) {
-        e.preventDefault();
-        e.stopPropagation();
-        const cur = getRowMessage(row);
-        if (!cur) return;
-        const info = openModal(`
-          <div class="vf-modal-head">
-            <b>Статус сообщения</b>
-          </div>
-          <div class="vf-confirm-text" style="white-space:pre-line">
-            ${esc(statusDetails(cur))}
-          </div>
-          <div class="vf-actions">
-            <button class="vf-btn vf-sec" type="button" data-status-close>
-              Закрыть
-            </button>
-          </div>
-        `);
-        info.querySelector('[data-status-close]')?.addEventListener('click', () => info.vfClose?.());
-        return;
-      }
-      const bubble = e.target.closest?.('.vf-chat-bubble');
-      if (bubble && row.contains(bubble)) {
-        e.preventDefault();
-        const cur = getRowMessage(row);
-        if (cur) openMessageMenu(cur);
-      }
-    });
-    log.append(row);
-    log.scrollTop = log.scrollHeight;
-  };
-  const pushIncomingMessage = msg => {
-    if (!msg || msg.fromFriendId !== friendId) return false;
-    if (Number(msg.cryptoVersion || 0) === 2 && !msg.crypto) {
-      load().catch(() => false);
-      return true;
-    }
-    append({
-      msgId: msg.msgId || msg.pushId || `push-${Date.now()}`,
-      clientMsgId: msg.clientMsgId || '',
-      fromFriendId: msg.fromFriendId,
-      toFriendId: core.identity?.friendId,
-      text: msg.text || '',
-      replyToMsgId: msg.replyToMsgId || '',
-      replyText: msg.replyText || '',
-      reactions: msg.reactions || {},
-      createdAt: msg.createdAt || Date.now(),
-      deliveredAt: msg.deliveredAt || msg.createdAt || Date.now(),
-      readAt: msg.readAt || Date.now()
-    });
-    lastAt = Math.max(lastAt, Number(msg.createdAt || 0), Number(msg.updatedAt || 0));
-    log.scrollTop = log.scrollHeight;
-    return true;
-  };
-  const load = async () => {
-    if (loadBusy || document.hidden) return false;
-    loadBusy = true;
-    try {
-      const items = await core.getChatMessages({ friendId, after: lastAt });
-      loadFails = 0;
-      items.forEach(msg => {
-        lastAt = Math.max(lastAt, Number(msg.createdAt || 0), Number(msg.updatedAt || 0));
-        append(msg);
+      res = await fetch(this.signalingUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Vi3-Session': this.identity.socialSession },
+        credentials: 'omit',
+        mode: 'cors',
+        body: JSON.stringify({ action, displayName: this.identity.displayName, avatarUrl: this.identity.avatar, ...data })
       });
-      return items.length ? 'has-new' : true;
     } catch (err) {
-      loadFails = Math.min(loadFails + 1, 8);
-      if (Number(err?.status) === 429) loadFails = Math.max(loadFails, 5);
-      return false;
-    } finally {
-      loadBusy = false;
+      this.onError(err);
+      throw new Error('network_unreachable');
     }
-  };
-  let idleTicks = 0;
-  const scheduleLoad = () => {
-    clearTimeout(timer);
-    const base = idleTicks > 4 ? 30000 : 8000;
-    const delay = Math.min(45000, base + loadFails * 6000);
-    timer = setTimeout(async () => {
-      const got = await load();
-      idleTicks = got === 'has-new' ? 0 : idleTicks + 1;
-      scheduleLoad();
-    }, delay);
-  };
-  const sendText = async text => {
-    const sentReply = replyTo;
-    const localId = `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const localMsg = { msgId: localId, clientMsgId: localId, fromFriendId: core.identity?.friendId, text, replyToMsgId: sentReply?.msgId || '', replyText: sentReply?.text || '', createdAt: Date.now(), deliveredAt: 0, readAt: 0, localStatus: 'sending', cryptoVersion: 2, encrypted: true };
-    append(localMsg);
-    replyTo = null;
-    renderReply();
-    try {
-      const res = await core.sendChatMessage({ toFriendId: friendId, text, replyToMsgId: sentReply?.msgId || '', replyText: sentReply?.text || '', clientMsgId: localId });
-      const createdAt = res.createdAt || Date.now();
-      lastAt = Math.max(lastAt, Number(createdAt || 0));
-      const realMsg = { ...localMsg, msgId: res.msgId || localId, createdAt, deliveredAt: res?.webPush?.sent > 0 ? createdAt : 0, cryptoVersion: 2, encrypted: true, localStatus: '' };
-      seen.add(realMsg.msgId);
-      updateMessage(realMsg);
-    } catch (err) {
-      const raw = String(err?.message || 'send_failed');
-      const friendly = raw.includes('crypto_peer_not_ready')
-        ? 'Собеседник ещё не открыл обновлённый раздел «Друзья» и не зарегистрировал ключ шифрования'
-        : raw.includes('crypto_local_key_missing')
-          ? 'Локальный ключ шифрования потерян. Откройте настройки криптоустройств'
-          : raw.includes('crypto_envelope')
-            ? 'Не удалось подготовить ключи для всех устройств'
-            : raw.includes('chat_revision_conflict')
-              ? 'Сообщение изменилось на другом устройстве. Повторите действие'
-              : raw;
-      localMsg.localStatus = 'failed';
-      localMsg.error = friendly;
-      messagesById.set(localId, localMsg);
-      if (localMsg.clientMsgId) {
-        messagesById.set(localMsg.clientMsgId, localMsg);
+    const json = jsonParse(await res.text()) || {};
+    if (!res.ok || json.ok === false) {
+      const err = new Error(`${action}: ${json.error || json.reason || `http_${res.status}`}`);
+      err.status = res.status;
+      err.action = action;
+      this.onError(err);
+      throw err;
+    }
+    return json;
+  }
+  async register() {
+    await this._req('player_register', { displayName: this.identity.displayName });
+    await this.syncProfile();
+    await this.crypto.ensureDevice();
+    return true;
+  }
+  async syncProfile() {
+    return this._req('profile_set', { displayName: this.identity.displayName, avatarUrl: this.identity.avatar });
+  }
+  async getFriendList({ force = false } = {}) {
+    if (!force && this._cache.friends.length && Date.now() - this._cache.at < 30000) {
+      return this._cache.friends;
+    }
+    const res = await this._req('friend_list', {});
+    const items = Array.isArray(res.items) ? res.items : [];
+    this._cache = { friends: items, at: Date.now() };
+    return items;
+  }
+  // Presence только по требованию (батч).
+  async heartbeat({ gameId = '', roomId = '' } = {}) {
+    return this._req('presence_heartbeat', { deviceId: this.identity.deviceStableId || 'web', gameId: safe(gameId), roomId: safe(roomId) });
+  }
+  async getPresence(friendIds = []) {
+    const ids = friendIds.map(safe).filter(Boolean).slice(0, 50);
+    if (!ids.length) return {};
+    const res = await this._req('presence_batch', { friendIds: ids });
+    return res.presence || {};
+  }
+  async sendChatMessage({ toFriendId, text, replyToMsgId = '', replyText = '', clientMsgId = '' }) {
+    const cryptoPack = await this.crypto.encryptPayload({ friendId: toFriendId, clientMsgId, kind: 'message', payload: { type: 'message', text: safe(text).slice(0, 1000), replyToMsgId: safe(replyToMsgId), replyText: safe(replyText).slice(0, 160), reactions: {} } });
+    return this._req('chat_send_v2', { toFriendId: safe(toFriendId), clientMsgId: cryptoPack.clientMsgId, crypto: cryptoPack });
+  }
+  async reactChatMessage({ friendId, msgId, emoji, message = null }) {
+    if (Number(message?.cryptoVersion || 0) !== 2) {
+      throw new Error('chat_e2ee_message_required');
+    }
+    let current = message;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (current.decryptFailed || current.deletedAt) {
+        throw new Error('chat_message_not_editable');
       }
-      updateMessage(localMsg);
-      toast?.(`Не отправлено: ${friendly}`);
-    }
-  };
-  const retryMessage = async msg => {
-    if (!msg?.text) return;
-    const row = rowsByMsgId.get(msg.msgId) || rowsByClientId.get(msg.clientMsgId);
-    row?.remove();
-    if (msg.msgId) {
-      rowsByMsgId.delete(msg.msgId);
-      messagesById.delete(msg.msgId);
-      seen.delete(msg.msgId);
-    }
-    if (msg.clientMsgId) {
-      rowsByClientId.delete(msg.clientMsgId);
-      messagesById.delete(msg.clientMsgId);
-      seen.delete(msg.clientMsgId);
-    }
-    replyTo = msg.replyToMsgId ? { msgId: msg.replyToMsgId, text: msg.replyText || 'Сообщение' } : null;
-    await sendText(msg.text);
-  };
-  const openMessageMenu = msg => {
-    if (msg?.decryptFailed) {
-      toast?.('Сообщение нельзя изменить: ключ расшифровки недоступен');
-      return;
-    }
-    if (msg?.deletedAt) {
-      toast?.('Сообщение уже удалено');
-      return;
-    }
-    const menu = openModal(`
-      <div class="vf-chat-menu">
-        <div class="vf-chat-reacts">
-          ${REACTION_EMOJIS.map(x => `<button type="button" data-emoji="${esc(x)}" class="${normalizeMyReactions(msg).includes(x) ? 'is-selected' : ''}">${esc(x)}</button>`).join('')}
-        </div>
-        <button class="vf-btn vf-sec" type="button" data-m="reply">↩ Ответить</button>
-        <button class="vf-btn vf-sec" type="button" data-m="copy">📋 Копировать текст</button>
-        <button class="vf-btn vf-danger" type="button" data-m="delete">🗑 Удалить</button>
-      </div>
-    `);
-    menu.querySelectorAll('[data-emoji]').forEach(
-      b =>
-        (b.onclick = async () => {
-          try {
-            const res = await core.reactChatMessage({ friendId, msgId: msg.msgId, emoji: b.dataset.emoji, message: msg });
-            const cur = { ...(messagesById.get(msg.msgId) || msg), reactions: res.reactions || {} };
-            updateMessage(cur);
-            menu.vfClose?.();
-          } catch (err) {
-            toast?.(`Ошибка: ${err.message}`);
-          }
-        })
-    );
-    menu.querySelector('[data-m="reply"]').onclick = () => {
-      replyTo = { msgId: msg.msgId, text: String(msg.text || '').slice(0, 160) };
-      renderReply();
-      menu.vfClose?.();
-      input?.focus?.();
-    };
-    menu.querySelector('[data-m="copy"]').onclick = async () => {
-      await navigator.clipboard?.writeText?.(msg.text || '').catch(() => null);
-      menu.vfClose?.();
-      toast?.('Скопировано');
-    };
-    menu.querySelector('[data-m="delete"]').onclick = async () => {
-      const confirmed = await confirmAction({ title: 'Удалить сообщение?', text: 'Сообщение будет удалено у обоих собеседников.', confirmText: 'Удалить', dangerous: true });
-      if (!confirmed) return;
+      const reactions = { ...(current.reactions || {}) };
+      const me = this.identity.friendId;
+      const value = safe(emoji).slice(0, 8);
+      let mine = Array.isArray(reactions[me]) ? [...reactions[me]] : reactions[me] ? [reactions[me]] : [];
+      mine = mine.includes(value) ? mine.filter(item => item !== value) : [...mine, value].slice(-3);
+      if (mine.length) reactions[me] = mine;
+      else delete reactions[me];
+      const cryptoPack = await this.crypto.encryptPayload({ friendId, kind: 'reaction', subjectMsgId: msgId, payload: { type: 'message', text: safe(current.text).slice(0, 1000), replyToMsgId: safe(current.replyToMsgId), replyText: safe(current.replyText).slice(0, 160), reactions } });
       try {
-        const result = await core.deleteChatMessage({ friendId, msgId: msg.msgId, message: msg });
-        updateMessage({ ...msg, text: 'Сообщение удалено', replyToMsgId: '', replyText: '', reactions: {}, deletedAt: Number(result.at || Date.now()), updatedAt: Number(result.at || Date.now()), encrypted: true, cryptoVersion: 2 });
-        lastAt = Math.max(lastAt, Number(result.at || Date.now()));
-        menu.vfClose?.();
-      } catch (err) {
-        toast?.(`Ошибка: ${err.message}`);
+        const result = await this._req('chat_update_v2', { friendId: safe(friendId), msgId: safe(msgId), expectedRevision: Number(current.revision || 1), crypto: cryptoPack });
+        return { ...result, reactions };
+      } catch (error) {
+        if (!String(error?.message || '').includes('chat_revision_conflict') || attempt >= 2) {
+          throw error;
+        }
+        current = await this.getChatMessage({ friendId, msgId });
+        if (!current) throw new Error('chat_message_not_found');
       }
-    };
-  };
-  const close = () => {
-    clearTimeout(timer);
-    cleanupObserver?.disconnect?.();
-    onActiveChatChange(null);
-    ov.vfClose?.();
-  };
-  const counterEl = ov.querySelector('.vf-chat-counter');
-  const autoGrow = () => {
-    if (!input) return;
-    input.style.height = 'auto';
-    const cap = Math.max(160, Math.floor(window.innerHeight * 0.4));
-    input.style.height = `${Math.min(input.scrollHeight, cap)}px`;
-    input.classList.toggle('is-scroll', input.scrollHeight > cap);
-    if (counterEl) {
-      const left = 1000 - input.value.length;
-      counterEl.hidden = left > 200;
-      counterEl.textContent = String(left);
     }
-    log.scrollTop = log.scrollHeight;
-  };
-  ov.querySelector('#vf-chat-close').onclick = close;
-  ov.querySelector('#vf-chat-settings').onclick = () => {
-    panel.hidden = !panel.hidden;
-  };
-  ov.querySelector('.vf-chat-reply-x').onclick = () => {
-    replyTo = null;
-    renderReply();
-  };
-  ov.querySelector('#vf-chat-crypto').onclick = () => {
-    openCryptoDevicesUi({ core, friendId, name, openModal, toast, confirmAction });
-  };
-  ov.querySelector('#vf-chat-clear').onclick = async () => {
-    const confirmed = await confirmAction({ title: 'Очистить чат только у вас?', text: 'У собеседника сообщения останутся. Позже новые сообщения снова появятся в этом диалоге.', confirmText: 'Очистить' });
-    if (!confirmed) return;
-    try {
-      await core.clearChat(friendId);
-      lastAt = Date.now();
-      seen.clear();
-      rowsByMsgId.clear();
-      rowsByClientId.clear();
-      messagesById.clear();
-      log.innerHTML = '';
-      panel.hidden = true;
-      toast?.('Чат очищен только у вас');
-    } catch (err) {
-      toast?.(`Ошибка очистки: ${err.message}`);
+    throw new Error('chat_revision_conflict');
+  }
+  async deleteChatMessage({ friendId, msgId, message = null }) {
+    if (Number(message?.cryptoVersion || 0) !== 2) {
+      throw new Error('chat_e2ee_message_required');
     }
-  };
-  ov.querySelector('#vf-chat-purge-both').onclick = async () => {
-    const confirmed = await confirmAction({ title: 'Удалить переписку у обоих?', text: 'Вся переписка будет безвозвратно удалена у вас и у собеседника. Это действие нельзя отменить.', confirmText: 'Удалить у обоих', dangerous: true });
-    if (!confirmed) return;
-    try {
-      await core.purgeChatForBoth(friendId);
-      lastAt = Date.now();
-      seen.clear();
-      rowsByMsgId.clear();
-      rowsByClientId.clear();
-      messagesById.clear();
-      log.innerHTML = '';
-      panel.hidden = true;
-      toast?.('Переписка удалена у обоих');
-    } catch (err) {
-      toast?.(`Ошибка удаления: ${err.message}`);
+    const deletedAt = Date.now();
+    const cryptoPack = await this.crypto.encryptPayload({ friendId, kind: 'tombstone', subjectMsgId: msgId, payload: { type: 'tombstone', deletedAt } });
+    return this._req('chat_delete_v2', { friendId: safe(friendId), msgId: safe(msgId), expectedRevision: Number(message?.revision || 1), deletedAt, crypto: cryptoPack });
+  }
+  async getChatMessages({ friendId, after = 0 } = {}) {
+    const result = await this._req('chat_poll', { friendId: safe(friendId), after: Number(after || 0) });
+    const items = Array.isArray(result.items) ? result.items : [];
+    return this.crypto.decryptMessages(items);
+  }
+  async getChatMessage({ friendId, msgId } = {}) {
+    const result = await this._req('chat_message_get', { friendId: safe(friendId), msgId: safe(msgId) });
+    if (!result.message) return null;
+    return this.crypto.decryptMessage(result.message);
+  }
+  async getOwnCryptoDevices() {
+    const result = await this._req('crypto_device_self_list', {});
+    return Array.isArray(result.items) ? result.items : [];
+  }
+  async getCryptoDevices(friendId) {
+    return this.crypto.listDevices(friendId);
+  }
+  async getLocalCryptoDevice() {
+    return this.crypto.getLocalDeviceInfo();
+  }
+  async revokeCryptoDevice(deviceId) {
+    const local = await this.crypto.getLocalDeviceInfo();
+    const result = await this._req('crypto_device_revoke', { deviceId: safe(deviceId) });
+    if (local?.deviceId === safe(deviceId)) {
+      await this.crypto.resetLocalDevice();
     }
-  };
-  input?.addEventListener('input', autoGrow);
-  input?.addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      ov.querySelector('.vf-chat-form')?.requestSubmit?.();
-    }
-  });
-  ov.querySelector('.vf-chat-form').onsubmit = async e => {
-    e.preventDefault();
-    if (sendBusy) return;
-    const text = input.value.trim();
-    if (!text) return;
-    sendBusy = true;
-    input.value = '';
-    autoGrow();
-    try {
-      await sendText(text);
-    } finally {
-      sendBusy = false;
-    }
-  };
-  cleanupObserver = new MutationObserver(() => {
-    if (!document.body.contains(ov)) {
-      clearTimeout(timer);
-      cleanupObserver?.disconnect?.();
-      onActiveChatChange(null);
-    }
-  });
-  cleanupObserver.observe(document.body, { childList: true, subtree: true });
-  onActiveChatChange({ friendId, pushIncomingMessage, scrollToMessage });
-  load();
-  scheduleLoad();
-  setTimeout(() => {
-    autoGrow();
-    input?.focus?.();
-  }, 80);
-  return true;
-};
-export default { openTextChatModal };
+    return result;
+  }
+  async resetCryptoDevices() {
+    const result = await this._req('crypto_device_reset', {});
+    await this.crypto.resetLocalDevice();
+    await this.crypto.ensureDevice();
+    return result;
+  }
+  async getSafetyNumber(friendId) {
+    return this.crypto.buildSafetyNumber(friendId);
+  }
+  getSafetyVerification(friendId) {
+    return this.crypto.getSafetyVerification(friendId);
+  }
+  setSafetyVerified(friendId, safety) {
+    return this.crypto.setSafetyVerified(friendId, safety);
+  }
+  async clearChat(friendId) {
+    return this._req('chat_clear', { friendId: safe(friendId) });
+  }
+  async getChatSettings(friendId) {
+    const res = await this._req('chat_settings_get', { friendId: safe(friendId) });
+    return res.settings || { retentionDays: 30, clearedBefore: 0 };
+  }
+  async setChatRetention(friendId, retentionDays) {
+    return this._req('chat_settings_set', { friendId: safe(friendId), retentionDays: Number(retentionDays) });
+  }
+  async purgeChatForBoth(friendId) {
+    return this._req('chat_purge_both', { friendId: safe(friendId) });
+  }
+  async markChatDelivered({ friendId, msgId = '' } = {}) {
+    return this._req('chat_delivery', { friendId: safe(friendId), msgId: safe(msgId) });
+  }
+  async markChatRead({ friendId, msgId = '' } = {}) {
+    return this._req('chat_read', { friendId: safe(friendId), msgId: safe(msgId) });
+  }
+  async getRtcConfig() {
+    return this._req('rtc_config', {});
+  }
+  async getVoiceHistory(friendId) {
+    const res = await this._req('voice_history', { friendId: safe(friendId) });
+    return Array.isArray(res.items) ? res.items : [];
+  }
+  async createVoiceCall({ toFriendId, peerId } = {}) {
+    return this._req('voice_call_create', { toFriendId: safe(toFriendId), peerId: safe(peerId) });
+  }
+  async joinVoiceCall({ friendId, callId = '', roomId, roomSecret, peerId } = {}) {
+    return this._req('voice_call_join', { friendId: safe(friendId), callId: safe(callId), roomId: safe(roomId), roomSecret: safe(roomSecret), peerId: safe(peerId) });
+  }
+  async endVoiceCall({ friendId, callId = '', roomId = '', roomSecret = '', status = 'ended', durationSec = 0 } = {}) {
+    return this._req('voice_call_end', { friendId: safe(friendId), callId: safe(callId), roomId: safe(roomId), roomSecret: safe(roomSecret), status: safe(status), durationSec: Number(durationSec || 0) });
+  }
+  async getRoom(roomId, roomSecret = '') {
+    return this._req('room_get', { roomId: safe(roomId), roomSecret: safe(roomSecret) });
+  }
+  async sendVoiceSignal({ roomId, roomSecret, fromPeerId, toPeerId, type, data } = {}) {
+    return this._req('signal_send', { roomId: safe(roomId), roomSecret: safe(roomSecret), fromPeerId: safe(fromPeerId), toPeerId: safe(toPeerId), type: safe(type), payload: data });
+  }
+  async pollVoiceSignals({ roomId, roomSecret, peerId } = {}) {
+    const res = await this._req('signal_poll', { roomId: safe(roomId), roomSecret: safe(roomSecret), peerId: safe(peerId) });
+    return Array.isArray(res.messages) ? res.messages : [];
+  }
+  async removeFriend(friendId) {
+    this._cache.at = 0;
+    return this._req('friend_remove', { targetId: safe(friendId) });
+  }
+  async createInvite() {
+    const res = await this._req('friend_invite_create', {});
+    const url = `${location.origin}/?addFriend=${encodeURIComponent(res.inviteId)}&key=${encodeURIComponent(res.secret)}`;
+    return { ...res, url, code: shortCode(res.inviteId) };
+  }
+  async acceptInvite({ inviteId, secret }) {
+    this._cache.at = 0;
+    return this._req('friend_invite_accept', { inviteId: safe(inviteId), secret: safe(secret) });
+  }
+  async getInviteInfo(inviteId, secret) {
+    const res = await fetch(this.signalingUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'friend_invite_get', inviteId: safe(inviteId), secret: safe(secret) }) });
+    const json = await res.json();
+    if (!json.ok) throw new Error(json.error || 'invite_not_found');
+    return json.invite;
+  }
+  async sendPush({ toFriendId, kind = 'GENERIC', text = '', gameId = '' } = {}) {
+    return this._req('push_send', { toFriendId: safe(toFriendId), kind: safe(kind || 'GENERIC').slice(0, 40), text: safe(text).slice(0, 300), gameId: safe(gameId) });
+  }
+  async getPushes() {
+    const device = await this.crypto.ensureDevice();
+    const res = await this._req('push_poll', { deviceId: device.deviceId });
+    return Array.isArray(res.items) ? res.items : [];
+  }
+  async ackPushes(pushIds = []) {
+    const ids = [...new Set((Array.isArray(pushIds) ? pushIds : [pushIds]).map(safe).filter(Boolean))].slice(0, 100);
+    if (!ids.length) return { ok: true, acked: 0 };
+    const device = await this.crypto.ensureDevice();
+    return this._req('push_ack', { deviceId: device.deviceId, pushIds: ids });
+  }
+  async getProfile(targetId) {
+    const res = await this._req('profile_get', { targetId: safe(targetId) });
+    return res.profile || null;
+  }
+  async getWebPushConfig() {
+    return this._req('webpush_config', {});
+  }
+  async subscribeWebPush(subscription) {
+    return this._req('webpush_subscribe', { subscription, userAgent: navigator.userAgent || '' });
+  }
+  async unsubscribeWebPush(subscriptionOrEndpoint) {
+    const endpoint = typeof subscriptionOrEndpoint === 'string' ? subscriptionOrEndpoint : subscriptionOrEndpoint?.endpoint || '';
+    return this._req('webpush_unsubscribe', { endpoint });
+  }
+  async createNearbyFriendCode() {
+    return this._req('nearby_friend_create', {});
+  }
+  async joinNearbyFriendCode(code) {
+    this._cache.at = 0;
+    return this._req('nearby_friend_join', { code: safe(code).replace(/\D/g, '').slice(0, 6) });
+  }
+  async ackVoiceSignals({ roomId, roomSecret, peerId, seqs = [] } = {}) {
+    return this._req('signal_ack', { roomId: safe(roomId), roomSecret: safe(roomSecret), peerId: safe(peerId), seqs: [...new Set((Array.isArray(seqs) ? seqs : []).map(safe).filter(Boolean))].slice(0, 200) });
+  }
+}
+const shortCode = inviteId =>
+  safe(inviteId)
+    .replace(/[^a-z0-9]/gi, '')
+    .slice(-6)
+    .toUpperCase();
+export default FriendsCore;

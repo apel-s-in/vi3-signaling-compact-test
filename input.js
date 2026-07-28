@@ -1,261 +1,369 @@
-// UID.001_(Playback safety invariant)_(FavoritesManager не управляет playback)
-// UID.002_(UID-first core)_(избранное строго uid-based)
-// UID.003_(Event log truth)_(favorite tombstones для merge/restore)
-// UID.099_(Multi-device sync model)_(единый favorite-state contract)
+// Общая signed social session для Friends и Game Center.
 
-import {
-  favoriteStatus,
-  normalizeFavoriteItem,
-  normalizeFavoriteList
-} from '../analytics/favorite-state-contract.js';
+const SIGNALING_URL =
+  'https://functions.yandexcloud.net/d4e2epg33mkshjoar6av';
 
-const KEY = '__favorites_v2__';
-const uidOf = value => String(value || '').trim();
+let cachedSession = null;
+let cachedYandexId = '';
+let pendingSession = null;
+let pendingYandexId = '';
+let serverBackoffUntil = 0;
+let serverBackoffMs = 5000;
 
-export class FavoritesManager {
-  constructor() {
-    this._m = new Map();
-    this._s = new Set();
+const coalescedActions = new Set([
+  'achievement_reward_status',
+  'favorite_state_get',
+  'wallet_get'
+]);
+const actionRequests = new Map();
 
-    try {
-      const rows = JSON.parse(
-        localStorage.getItem(KEY) || '[]'
-      );
+const safe = value => String(value == null ? '' : value).trim();
 
-      normalizeFavoriteList(rows).forEach(item =>
-        this._m.set(item.uid, item)
-      );
-    } catch {}
+const isRealtimeAction = action =>
+  /^(room_|signal_|lan_code_|ranked_)/.test(action) ||
+  action === 'push_send';
+
+export const getSocialServerBackoffState = () => ({
+  active: Date.now() < serverBackoffUntil,
+  retryAt: serverBackoffUntil,
+  remainingMs: Math.max(0, serverBackoffUntil - Date.now())
+});
+
+const readProfile = () => {
+  const auth = window.YandexAuth;
+  const active =
+    auth?.getSessionStatus?.() === 'active' &&
+    auth?.isTokenAlive?.();
+
+  const profile = active
+    ? auth?.getProfile?.() || null
+    : null;
+
+  return {
+    active: !!active,
+    yandexId: safe(
+      profile?.yandexId ||
+      profile?.id ||
+      ''
+    ),
+    displayName: safe(
+      profile?.displayName ||
+      profile?.realName ||
+      profile?.login ||
+      'Слушатель'
+    ),
+    avatar: safe(profile?.avatar || '')
+  };
+};
+
+const readJson = async response => {
+  const text = await response.text();
+  try {
+    return JSON.parse(text || '{}') || {};
+  } catch {
+    return {};
+  }
+};
+
+const registerServerBackoff = response => {
+  if (
+    response.status !== 429 &&
+    ![502, 503, 504].includes(response.status)
+  ) {
+    return 0;
   }
 
-  isLiked(uid) {
-    const item = this._m.get(uidOf(uid));
+  const retryAfterSec = Number(
+    response.headers.get('Retry-After') || 0
+  );
+  const delayMs = Math.max(
+    serverBackoffMs,
+    retryAfterSec > 0
+      ? retryAfterSec * 1000
+      : 0
+  ) + Math.floor(Math.random() * 1000);
 
-    return !!item &&
-      favoriteStatus(item) === 'active';
+  serverBackoffUntil = Math.max(
+    serverBackoffUntil,
+    Date.now() + delayMs
+  );
+  serverBackoffMs = Math.min(
+    60000,
+    serverBackoffMs * 2
+  );
+
+  return delayMs;
+};
+
+export const invalidateSocialSession = ({
+  resetBackoff = false
+} = {}) => {
+  cachedSession = null;
+  cachedYandexId = '';
+  pendingSession = null;
+  pendingYandexId = '';
+
+  if (resetBackoff) {
+    serverBackoffUntil = 0;
+    serverBackoffMs = 5000;
+    actionRequests.clear();
+  }
+};
+
+export const getSocialSession = async ({ force = false } = {}) => {
+  const auth = window.YandexAuth;
+  const token = auth?.getToken?.();
+  const profile = readProfile();
+  const yandexId = profile.yandexId;
+
+  if (
+    !token ||
+    !auth?.isTokenAlive?.() ||
+    !yandexId
+  ) {
+    invalidateSocialSession();
+    throw new Error('yandex_oauth_required');
   }
 
-  getSnapshot() {
-    return [...this._m.values()];
+  if (
+    cachedYandexId &&
+    cachedYandexId !== yandexId
+  ) {
+    invalidateSocialSession();
   }
 
-  getItem(uid) {
-    return this._m.get(uidOf(uid)) || null;
+  if (
+    !force &&
+    cachedSession?.socialSession &&
+    cachedYandexId === yandexId &&
+    Number(cachedSession.expiresAt || 0) >
+      Date.now() + 120000
+  ) {
+    return cachedSession;
   }
 
-  replaceSnapshot(rows, {
-    reason = 'snapshot_replace'
-  } = {}) {
-    this._m = new Map(
-      normalizeFavoriteList(rows)
-        .map(item => [item.uid, item])
-    );
-
-    this._save();
-
-    try {
-      window.dispatchEvent(new CustomEvent(
-        'favorites:snapshot-applied',
-        {
-          detail: {
-            reason,
-            count: this._m.size
-          }
-        }
-      ));
-    } catch {}
-
-    return this.getSnapshot();
+  if (
+    pendingSession &&
+    pendingYandexId === yandexId
+  ) {
+    return pendingSession;
   }
 
-  readLikedSet() {
-    return new Set(
-      [...this._m.values()]
-        .filter(item => favoriteStatus(item) === 'active')
-        .map(item => item.uid)
-    );
-  }
+  pendingYandexId = yandexId;
 
-  _save() {
-    try {
-      localStorage.setItem(
-        KEY,
-        JSON.stringify(this.getSnapshot())
-      );
-    } catch {}
-  }
-
-  _emit(detail) {
-    this._s.forEach(callback => {
-      try {
-        callback(detail);
-      } catch {}
-    });
-  }
-
-  toggle(uid, {
-    source = 'album',
-    albumKey
-  } = {}) {
-    const cleanUid = uidOf(uid);
-    if (!cleanUid) return false;
-
-    const old = this._m.get(cleanUid);
-    const active = favoriteStatus(old) === 'active';
-    const at = Date.now();
-    const liked = !active;
-
-    const next = active
-      ? normalizeFavoriteItem({
-          ...old,
-          uid: cleanUid,
-          status:
-            source === 'favorites'
-              ? 'inactive'
-              : 'deleted',
-          updatedAt: at,
-          inactiveAt:
-            source === 'favorites'
-              ? at
-              : 0,
-          deletedAt:
-            source === 'favorites'
-              ? 0
-              : at
-        })
-      : normalizeFavoriteItem({
-          ...old,
-          uid: cleanUid,
-          status: 'active',
-          addedAt: old?.addedAt || at,
-          updatedAt: at,
-          sourceAlbum:
-            albumKey ||
-            old?.sourceAlbum ||
-            old?.albumKey ||
-            null,
-          albumKey:
-            albumKey ||
-            old?.albumKey ||
-            old?.sourceAlbum ||
-            null,
-          inactiveAt: 0,
-          deletedAt: 0
-        });
-
-    this._m.set(cleanUid, next);
-    this._save();
-
-    try {
-      window.eventLogger?.log?.(
-        'FAVORITE_CHANGED',
-        cleanUid,
-        {
-          liked,
-          source,
-          albumKey:
-            albumKey ||
-            old?.albumKey ||
-            old?.sourceAlbum ||
-            null,
-          inactive:
-            !liked && source === 'favorites',
-          deleted:
-            !liked && source !== 'favorites'
-        }
-      );
-
-      window.dispatchEvent(new CustomEvent(
-        'backup:domain-dirty',
-        {
-          detail: {
-            domain: 'favorites'
-          }
-        }
-      ));
-    } catch {}
-
-    this._emit({
-      uid: cleanUid,
-      liked
-    });
-
-    return liked;
-  }
-
-  remove(uid) {
-    const cleanUid = uidOf(uid);
-    const old = this._m.get(cleanUid);
-    if (!cleanUid || !old) return false;
-
-    const at = Date.now();
-
-    this._m.set(
-      cleanUid,
-      normalizeFavoriteItem({
-        ...old,
-        uid: cleanUid,
-        status: 'deleted',
-        inactiveAt: 0,
-        deletedAt: at,
-        updatedAt: at
+  pendingSession = (async () => {
+    const response = await fetch(SIGNALING_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'X-Yandex-OAuth': token
+      },
+      credentials: 'omit',
+      mode: 'cors',
+      body: JSON.stringify({
+        action: 'social_session_issue',
+        displayName: profile.displayName,
+        avatarUrl: profile.avatar,
+        deviceId:
+          localStorage.getItem('deviceStableId') ||
+          localStorage.getItem('deviceHash') ||
+          'web'
       })
-    );
-
-    this._save();
-    this._emit({
-      uid: cleanUid,
-      liked: false,
-      removed: true
     });
 
-    try {
-      window.dispatchEvent(new CustomEvent(
-        'backup:domain-dirty',
-        {
-          detail: {
-            domain: 'favorites'
-          }
-        }
-      ));
-    } catch {}
+    const result = await readJson(response);
+    registerServerBackoff(response);
 
-    return true;
-  }
-
-  purge(uid) {
-    const cleanUid = uidOf(uid);
-
-    if (!cleanUid || !this._m.delete(cleanUid)) {
-      return false;
+    if (
+      !response.ok ||
+      result.ok === false ||
+      !result.socialSession
+    ) {
+      const error = new Error(
+        result.error ||
+        result.reason ||
+        'social_session_issue_failed'
+      );
+      error.status = response.status;
+      error.action = 'social_session_issue';
+      error.retryAt = serverBackoffUntil;
+      throw error;
     }
 
-    this._save();
-    this._emit({
-      uid: cleanUid,
-      liked: false,
-      purged: true
-    });
+    const currentYandexId = readProfile().yandexId;
+
+    if (
+      !currentYandexId ||
+      currentYandexId !== yandexId
+    ) {
+      throw new Error(
+        'social_session_account_changed'
+      );
+    }
+
+    cachedSession = result;
+    cachedYandexId = yandexId;
+
+    window.ListeningReceipts
+      ?.ingestServerResult?.(result);
+
+    if (
+      result?.wallet ||
+      (Array.isArray(result?.loyaltyRewards) &&
+        result.loyaltyRewards.length)
+    ) {
+      import('../app/shards/reward-notifier.js')
+        .then(module =>
+          module.applyShardRewardResult?.(result)
+        )
+        .catch(() => null);
+    }
+
+    return result;
+  })();
+
+  try {
+    return await pendingSession;
+  } finally {
+    pendingSession = null;
+    pendingYandexId = '';
+  }
+};
+
+export const requestSocialAction = (
+  action,
+  data = {},
+  { retryAuth = true } = {}
+) => {
+  const cleanAction = safe(action);
+  const coalesced = coalescedActions.has(cleanAction);
+  const requestKey = coalesced ? cleanAction : '';
+
+  if (requestKey && actionRequests.has(requestKey)) {
+    return actionRequests.get(requestKey);
+  }
+
+  const run = async () => {
+    if (
+      Date.now() < serverBackoffUntil &&
+      !isRealtimeAction(cleanAction)
+    ) {
+      const error = new Error(
+        'social_server_backoff_active'
+      );
+      error.status = 429;
+      error.action = cleanAction;
+      error.retryAt = serverBackoffUntil;
+      throw error;
+    }
+
+    const session = await getSocialSession();
+
+    const request = async currentSession => {
+      const response = await fetch(SIGNALING_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'X-Vi3-Session': currentSession.socialSession
+        },
+        credentials: 'omit',
+        mode: 'cors',
+        body: JSON.stringify({
+          action: cleanAction,
+          ...data
+        })
+      });
+
+      const result = await readJson(response);
+
+      if (
+        response.status === 429 ||
+        [502, 503, 504].includes(response.status)
+      ) {
+        registerServerBackoff(response);
+      } else if (
+        response.ok &&
+        result.ok !== false &&
+        Date.now() >= serverBackoffUntil
+      ) {
+        serverBackoffUntil = 0;
+        serverBackoffMs = 5000;
+      }
+
+      if (!response.ok || result.ok === false) {
+        const error = new Error(
+          result.error ||
+          result.reason ||
+          `http_${response.status}`
+        );
+        error.status = response.status;
+        error.action = cleanAction;
+        throw error;
+      }
+
+      return result;
+    };
 
     try {
-      window.dispatchEvent(new CustomEvent(
-        'backup:domain-dirty',
-        {
-          detail: {
-            domain: 'favorites'
-          }
-        }
-      ));
-    } catch {}
+      return await request(session);
+    } catch (error) {
+      if (
+        retryAuth &&
+        Number(error?.status) === 401
+      ) {
+        const renewed = await getSocialSession({
+          force: true
+        });
 
-    return true;
+        return request(renewed);
+      }
+
+      throw error;
+    }
+  };
+
+  const pending = run().finally(() => {
+    if (
+      requestKey &&
+      actionRequests.get(requestKey) === pending
+    ) {
+      actionRequests.delete(requestKey);
+    }
+  });
+
+  if (requestKey) actionRequests.set(requestKey, pending);
+  return pending;
+};
+window.addEventListener(
+  'yandex:auth:changed',
+  event => {
+    const status = safe(event.detail?.status);
+    const nextYandexId = safe(
+      event.detail?.profile?.yandexId ||
+      event.detail?.profile?.id ||
+      readProfile().yandexId
+    );
+
+    if (
+      status === 'logged_out' ||
+      status === 'expired' ||
+      (
+        cachedYandexId &&
+        nextYandexId &&
+        cachedYandexId !== nextYandexId
+      )
+    ) {
+      invalidateSocialSession({
+        resetBackoff: true
+      });
+    }
   }
+);
 
-  subscribe(callback) {
-    this._s.add(callback);
-    return () => this._s.delete(callback);
-  }
-}
-
-export const Favorites = new FavoritesManager();
-window.FavoritesManager = Favorites;
+export default {
+  getSocialSession,
+  invalidateSocialSession,
+  requestSocialAction
+};

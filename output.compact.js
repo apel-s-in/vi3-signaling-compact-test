@@ -1,749 +1,635 @@
-/* GENERATED_FROM=input.js SOURCE_SHA256=64f3a7de5e5c40e9c0cd7a8a16104f24f4c8320931251981ea3720e2827e9d40 FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
-import { MessageType } from './protocol.js';
-import { verifyShotResultsAgainstReveal } from './shot-verifier.js';
-import { canSendNetworkShot, clearOutgoingShotExpectation, createNetworkTurnState, recordIncomingShot, recordIncomingShotResult, recordOutgoingShot, recordTurnViolation, verifyIncomingShot, verifyIncomingShotResult } from './turn-guard.js';
-import { applyRevealToBoard, createBoardCommit, createSalt, packBoardReveal, validateRevealLayout, verifyBoardCommit } from './fair-play.js';
-import { abortRankedMatch, playRankedRps, prepareRankedMatch, recordRankedShot, resetRankedState, setRankedFirstPlayer, submitRankedMatch } from './ranked-v2.js';
-const RPS_CHOICES = [
-  { id: 'rock', icon: '✊', label: 'Камень' },
-  { id: 'scissors', icon: '✌️', label: 'Ножницы' },
-  { id: 'paper', icon: '✋', label: 'Бумага' }
-];
-const getChoiceLabel = id => RPS_CHOICES.find(item => item.id === id)?.label || id;
-const clearModal = selector => {
-  document.querySelectorAll(selector).forEach(el => el.remove());
+/* GENERATED_FROM=input.js SOURCE_SHA256=52675907662dd613ba4bcf1204f1ed889d0d3b1ea1e28c9c531b6e0690e55329 FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
+/**
+ * common/network-bridge.js
+ * Общий WebRTC + Yandex Cloud Function signaling bridge для всех игр.
+ * Используется из /Games/war_hearts/ и будущих игр.
+ */
+const safe = v => String(v == null ? '' : v).trim();
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+const jsonParse = raw => {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
 };
-export const createNetworkCombat = ({
-  state,
-  session,
-  setScreen,
-  render,
-  toast,
-  addSystemMessage,
-  formatCellName,
-  getShipCellsAt,
-  isShipSunk,
-  markSunkPerimeter,
-  isBoardDefeated,
-  registerShotStats,
-  showBattleFx,
-  finishMatch,
-  resetMatchStats,
-  resetFairPlayForMatch,
-  scheduleSaveMatchDraft,
-  saveMatchDraftNow,
-  clearTimers,
-  makeEmptyBoard
-}) => {
-  let shotSeq = 0;
-  const setNetworkStatus = (text, status = 'info') => {
-    state.network.active = state.opponent?.type === 'network' || !!state.network.active;
-    state.network.status = status;
-    state.network.text = text;
-    state.network.peerName = state.opponent?.name || state.network.peerName || 'Соперник';
-    state.network.lastEventAt = Date.now();
-    if (status === 'offline' || status === 'error') {
-      state.network.connected = false;
-    }
-    render();
-  };
-  const ensureNetworkOpponent = () => {
-    if (!state.opponent || state.opponent.type !== 'network') {
-      state.opponent = { id: 'network-peer', name: state.network.peerName || 'Соперник', type: 'network' };
-    }
-    state.network.active = true;
-  };
-  const resetNetworkRound = () => {
-    shotSeq = 0;
-    state.network.myReady = false;
-    state.network.peerReady = false;
-    state.network.myCommitSent = false;
-    state.network.peerCommitReceived = false;
-    state.network.awaitingShotResult = false;
-    state.network.awaitingReveal = false;
-    state.network.myRevealSent = false;
-    state.network.rpsStarted = false;
-    state.network.rematchPending = false;
-    state.networkRps = { active: false, myChoice: '', peerChoice: '', round: 0 };
-  };
-  const startNetworkPreparation = ({ initiator = false, ranked = state.network?.ranked } = {}) => {
-    ensureNetworkOpponent();
-    if (!state.network.connected) {
-      setNetworkStatus('Ожидаем P2P-соединение с соперником...', 'waiting');
-      return;
-    }
-    clearTimers?.();
-    resetNetworkRound();
-    state.network.ranked = !!ranked;
-    state.network.matchMode = state.network.ranked ? 'ranked' : 'casual';
-    resetMatchStats();
-    resetFairPlayForMatch();
-    state.networkShots = { mine: [], peer: [], enemyTranscriptOk: null, note: '' };
-    state.networkTurn = createNetworkTurnState();
-    resetRankedState(state);
-    state.myBoard.forEach(row =>
-      row.forEach(cell => {
-        cell.status = '';
-      })
-    );
-    state.enemyBoard = makeEmptyBoard();
-    state.selectedTarget = null;
-    state.result = '';
-    state.phase = 'setup';
-    setNetworkStatus(initiator ? 'Сетевой бой: расставьте корабли и нажмите «Готов к бою».' : 'Соперник готовит бой. Расставьте корабли и подтвердите готовность.', 'setup');
-    setScreen('field');
-    scheduleSaveMatchDraft();
-  };
-  const markReady = async () => {
-    ensureNetworkOpponent();
-    if (state.network.myReady) {
-      setNetworkStatus('Готовность уже отправлена. Ожидаем соперника...', 'waiting');
-      return false;
-    }
-    if (state.network.ranked === true) {
+const makeId = prefix => `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+const rpcPending = new Map();
+window.addEventListener('message', event => {
+  if (window.parent !== window && event.source !== window.parent) return;
+  const data = event.data || {};
+  if (data.kind !== 'vitrina:game-host' || data.type !== 'GC_SIGNALING_RESPONSE') return;
+  const payload = data.payload || {};
+  const requestId = safe(payload.requestId);
+  const pending = rpcPending.get(requestId);
+  if (!pending) return;
+  rpcPending.delete(requestId);
+  clearTimeout(pending.timer);
+  if (!payload.ok) {
+    const error = new Error(payload.error || 'game_rpc_failed');
+    error.status = Number(payload.status || 500);
+    pending.reject(error);
+    return;
+  }
+  pending.resolve(payload.result || {});
+});
+const requestHost = (action, data = {}) => {
+  const bridgeId = safe(window.__GC_BRIDGE_ID);
+  if (!bridgeId || window.parent === window) {
+    return Promise.reject(new Error('game_parent_bridge_required'));
+  }
+  const requestId = makeId('rpc');
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      rpcPending.delete(requestId);
+      reject(new Error('game_rpc_timeout'));
+    }, 20000);
+    rpcPending.set(requestId, { resolve, reject, timer });
+    window.parent.postMessage({ kind: 'vitrina:game', bridgeId, capabilityToken: safe(window.__GC_CAPABILITY_TOKEN), type: 'GC_SIGNALING_REQUEST', payload: { requestId, action, data, capabilityToken: safe(window.__GC_CAPABILITY_TOKEN) } }, '*');
+  });
+};
+const getIceServers = () => {
+  const custom = window.VI3_RTC_ICE_SERVERS;
+  if (Array.isArray(custom) && custom.length) return custom;
+  return [{ urls: 'stun:stun.sipnet.ru:3478' }, { urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }];
+};
+const getCandidateType = candidate => {
+  const text = String(candidate?.candidate || candidate || '');
+  return (text.match(/ typ ([a-z0-9]+)/i) || [])[1] || '';
+};
+export class NetworkBridge {
+  constructor(myIdOrOptions = {}) {
+    const opts = typeof myIdOrOptions === 'object' ? myIdOrOptions : { playerId: myIdOrOptions };
+    this.gameId = safe(opts.gameId || 'generic');
+    this.playerId = safe(opts.playerId || opts.myId || '');
+    this.displayName = safe(opts.displayName || 'Игрок');
+    this.roomId = '';
+    this.roomSecret = '';
+    this.joinToken = '';
+    this.peerId = '';
+    this.remotePeerId = '';
+    this.role = '';
+    this.peer = null;
+    this.dataChannel = null;
+    this.pollTimer = 0;
+    this.heartbeatTimer = 0;
+    this.audioStream = null;
+    this.audioSender = null;
+    this.remoteAudio = null;
+    this.pendingIce = [];
+    this.connected = false;
+    this.closed = false;
+    this.disconnectTimer = 0;
+    this.iceRestartAttempts = 0;
+    this.iceServers = getIceServers();
+    this.iceDiagnostics = { host: false, srflx: false, relay: false, selected: '', usesTurn: false, updatedAt: 0 };
+    this.onConnect = () => {};
+    this.onDisconnect = () => {};
+    this.onData = () => {};
+    this.onChat = () => {};
+    this.onStatus = () => {};
+    this.onRoom = () => {};
+    this.onError = () => {};
+    this.onIceDiagnostics = () => {};
+  }
+  async _req(action, data = {}) {
+    let lastError = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        await prepareRankedMatch({ state, session });
+        return await requestHost(action, { displayName: this.displayName, gameId: this.gameId, ...data });
       } catch (error) {
-        setNetworkStatus(`Не удалось подготовить Ranked V2: ${error.message}`, 'error');
-        addSystemMessage('Сервер не выдал matchId. Рейтинговый бой не начат.');
-        return false;
+        lastError = error;
+        if (attempt > 0 || !/timeout|network|unreachable/i.test(String(error?.message || ''))) {
+          break;
+        }
+        await wait(350);
       }
     }
-    const myReveal = packBoardReveal(state.myBoard);
-    const layoutCheck = validateRevealLayout(myReveal);
-    state.fairPlay.matchId = state.matchStats.matchId;
-    state.fairPlay.myLayoutOk = layoutCheck.ok;
-    if (!layoutCheck.ok) {
-      toast?.('Расстановка нарушает правила');
-      setNetworkStatus('Расстановка кораблей некорректна. Исправьте поле.', 'error');
-      addSystemMessage(`Проверка расстановки: ${layoutCheck.reason}.`);
-      render();
-      return false;
+    throw lastError || new Error('game_rpc_failed');
+  }
+  _emitStatus(label, online = false, extra = {}) {
+    this.onStatus({ label, online, ice: this.iceDiagnostics, ...extra });
+  }
+  _markIceCandidate(candidate) {
+    const type = getCandidateType(candidate);
+    if (type === 'host') this.iceDiagnostics.host = true;
+    if (type === 'srflx') this.iceDiagnostics.srflx = true;
+    if (type === 'relay') {
+      this.iceDiagnostics.relay = true;
+      this.iceDiagnostics.usesTurn = true;
     }
-    state.fairPlay.mySalt = state.fairPlay.mySalt || createSalt();
-    const commit = await createBoardCommit(state.myBoard, state.fairPlay.mySalt);
-    state.fairPlay.myCommitHash = commit.hash;
-    state.fairPlay.myReveal = myReveal;
-    const commitSent = session.sendBoardCommit({ matchId: state.matchStats.matchId, commitHash: commit.hash, algorithm: commit.algorithm });
-    const readySent = session.sendReady({ matchId: state.matchStats.matchId, ready: true });
-    if (!commitSent || !readySent) {
-      setNetworkStatus('Не удалось отправить готовность. Проверьте соединение.', 'error');
-      addSystemMessage('READY/BOARD_COMMIT не отправлены: нет связи с соперником.');
-      render();
-      scheduleSaveMatchDraft();
-      return false;
-    }
-    state.network.myReady = true;
-    state.network.myCommitSent = true;
-    addSystemMessage('Вы готовы к сетевому бою. Commit доски отправлен.');
-    setNetworkStatus('Вы готовы. Ожидаем готовность соперника...', 'waiting');
-    maybeStartRps();
-    scheduleSaveMatchDraft();
-    return true;
-  };
-  const maybeStartRps = () => {
-    if (state.network.rpsStarted || state.networkRps.active || state.phase === 'rps') return;
-    if (!state.network.myReady || !state.network.peerReady) return;
-    if (!state.network.myCommitSent || !state.network.peerCommitReceived) return;
-    state.network.rpsStarted = true;
-    state.phase = 'rps';
-    setScreen('battle');
-    setNetworkStatus(state.network.ranked ? 'Оба игрока готовы. Рейтинговый бой зафиксирован. Розыгрыш первого хода.' : 'Оба игрока готовы. Гостевой бой зафиксирован. Розыгрыш первого хода.', 'ready');
-    addSystemMessage(state.network.ranked ? 'Оба игрока готовы. Рейтинговый статус боя зафиксирован для этого сражения.' : 'Оба игрока готовы. Гостевой статус боя зафиксирован для этого сражения.');
-    if (state.network.ranked) {
-      openNetworkRpsModal();
-    } else {
-      resolveCasualCommitLottery();
-    }
-    scheduleSaveMatchDraft();
-  };
-  const applyFirstTurn = firstPlayerId => {
-    if (state.network.ranked === true) {
-      setRankedFirstPlayer(state, firstPlayerId);
-    }
-    const mine = firstPlayerId === state.ranked?.playerId || (state.network.ranked !== true && firstPlayerId === 'mine');
-    state.networkRps.active = false;
-    clearModal('.wh-rps-modal-overlay');
-    if (mine) {
-      state.phase = 'player';
-      addSystemMessage('Розыгрыш завершён. Первый ход ваш.');
-      setNetworkStatus('Ваш ход. Выберите клетку для выстрела.', 'your-turn');
-    } else {
-      state.phase = 'computer';
-      addSystemMessage('Розыгрыш завершён. Первым ходит соперник.');
-      setNetworkStatus('Ход соперника. Ожидаем выстрел...', 'peer-turn');
-    }
-    render();
-    scheduleSaveMatchDraft();
-  };
-  const resolveCasualCommitLottery = () => {
-    const mine = String(state.fairPlay?.myCommitHash || '');
-    const peer = String(state.fairPlay?.enemyCommitHash || '');
-    if (!mine || !peer) {
-      setNetworkStatus('Не удалось провести жеребьёвку по commit.', 'error');
-      return;
-    }
-    const mineFirst = mine.localeCompare(peer) < 0;
-    addSystemMessage('Гостевой первый ход определён по двум скрытым board commits.');
-    applyFirstTurn(mineFirst ? 'mine' : 'peer');
-  };
-  const openNetworkRpsModal = () => {
-    clearModal('.wh-rps-modal-overlay');
-    state.networkRps.active = true;
-    state.networkRps.myChoice = '';
-    state.networkRps.peerChoice = '';
-    state.networkRps.round = Math.max(1, Number(state.ranked?.rps?.round || 1));
-    const overlay = document.createElement('div');
-    overlay.className = 'wh-rps-modal-overlay';
-    overlay.innerHTML = `
-      <div class="wh-rps-modal-box">
-        <div class="wh-rps-kicker">
-          Серверный розыгрыш первого хода
-        </div>
-        <h2 class="wh-rps-title">
-          Камень · Ножницы · Бумага
-        </h2>
-        <p class="wh-rps-text" id="wh-net-rps-text">
-          Выбор будет скрыт commit до выбора соперника.
-        </p>
-        <div class="wh-rps-choices">
-          ${RPS_CHOICES.map(
-            choice => `
-            <button
-              class="wh-rps-choice"
-              type="button"
-              data-choice="${choice.id}"
-            >
-              <span>${choice.icon}</span>
-              <b>${choice.label}</b>
-            </button>
-          `
-          ).join('')}
-        </div>
-      </div>
-    `;
-    document.body.appendChild(overlay);
-    overlay.querySelectorAll('[data-choice]').forEach(button => {
-      button.addEventListener('click', async () => {
-        const choice = button.dataset.choice;
-        const text = overlay.querySelector('#wh-net-rps-text');
-        state.networkRps.myChoice = choice;
-        overlay.querySelectorAll('[data-choice]').forEach(item => {
-          item.disabled = true;
-        });
-        if (text) {
-          text.textContent = `Вы выбрали: ${getChoiceLabel(choice)}. ` + 'Commit отправляется серверу...';
-        }
-        setNetworkStatus('Отправляем скрытый RPS commit серверу...', 'waiting');
-        try {
-          const ranked = await playRankedRps({ state, session, choice });
-          if (ranked.firstPlayerId) {
-            if (text) {
-              text.textContent = 'Сервер проверил оба reveal.';
-            }
-            applyFirstTurn(ranked.firstPlayerId);
-            return;
-          }
-          if (ranked.rps?.roundStatus === 'draw' || Number(ranked.rps?.round || 1) > Number(state.networkRps?.round || 1)) {
-            if (text) {
-              text.textContent = 'Ничья. Сервер открыл следующий раунд.';
-            }
-            setNetworkStatus('Ничья в серверном RPS. Повторяем.', 'waiting');
-            setTimeout(openNetworkRpsModal, 900);
-            return;
-          }
-          throw new Error('ranked_rps_result_timeout');
-        } catch (error) {
-          if (text) {
-            text.textContent = `Ошибка серверного RPS: ${error.message}`;
-          }
-          setNetworkStatus('Серверный розыгрыш не завершён.', 'error');
-          overlay.querySelectorAll('[data-choice]').forEach(item => {
-            item.disabled = false;
-          });
-        }
-        scheduleSaveMatchDraft();
-      });
-    });
-  };
-  const shoot = (x, y) => {
-    if (state.opponent?.type !== 'network') return false;
-    const guard = canSendNetworkShot({ state, x, y });
-    if (!guard.ok) {
-      setNetworkStatus(`Выстрел отклонён: ${guard.reason}.`, 'error');
-      addSystemMessage(`Turn guard: выстрел ${formatCellName(x, y)} отклонён (${guard.reason}).`);
-      render();
-      scheduleSaveMatchDraft();
-      return true;
-    }
-    const shooterId = String(state.ranked?.playerId || state.player?.id || 'player').replace(/[^A-Za-z0-9._:-]/g, '');
-    const randomPart = crypto.randomUUID().replace(/-/g, '').slice(0, 12);
-    const shotId = [state.matchStats.matchId, shooterId, ++shotSeq, randomPart].join('_');
-    state.selectedTarget = { x, y };
-    state.network.awaitingShotResult = true;
-    const sent = session.sendShot({ matchId: state.matchStats.matchId, shotId, x, y, seq: shotSeq });
-    if (!sent) {
-      state.network.awaitingShotResult = false;
-      clearOutgoingShotExpectation(state);
-      setNetworkStatus('Не удалось отправить выстрел. Проверьте соединение.', 'error');
-      addSystemMessage(`Выстрел ${formatCellName(x, y)} не отправлен: нет связи.`);
-      render();
-      scheduleSaveMatchDraft();
-      return true;
-    }
-    recordOutgoingShot({ state, shotId, x, y, seq: shotSeq });
-    state.networkShots.mine.push({ shotId, x, y, seq: shotSeq, result: '', sunkCells: [], at: Date.now() });
-    addSystemMessage(`Выстрел ${formatCellName(x, y)} отправлен сопернику.`);
-    setNetworkStatus(`Выстрел ${formatCellName(x, y)} отправлен. Ожидаем результат...`, 'waiting');
-    render();
-    scheduleSaveMatchDraft();
-    return true;
-  };
-  const receiveShot = msg => {
-    const payload = msg.payload || {};
-    const x = Number(payload.x);
-    const y = Number(payload.y);
-    const shotId = String(payload.shotId || '');
-    if (state.phase === 'finished') return;
-    const guard = verifyIncomingShot({ state, shotId, x, y });
-    if (!guard.ok) {
-      setNetworkStatus(`SHOT соперника отклонён: ${guard.reason}.`, 'error');
-      addSystemMessage(`Turn guard: SHOT соперника отклонён (${guard.reason}).`);
-      render();
-      scheduleSaveMatchDraft();
-      return;
-    }
-    recordIncomingShot({ state, shotId });
-    const cell = state.myBoard[y]?.[x];
-    const coord = formatCellName(x, y);
-    const hit = !!cell.ship;
-    cell.status = hit ? 'hit' : 'miss';
-    const shipCells = hit ? getShipCellsAt(state.myBoard, x, y) : [];
-    const sunk = hit && isShipSunk(state.myBoard, shipCells);
-    if (sunk) markSunkPerimeter(state.myBoard, shipCells);
-    const result = sunk ? 'sunk' : hit ? 'hit' : 'miss';
-    state.networkShots.peer.push({ shotId: payload.shotId || '', x, y, result, sunkCells: sunk ? shipCells.map(p => ({ x: p.x, y: p.y })) : [], at: Date.now() });
-    registerShotStats('opponent', result);
-    showBattleFx('mine', result);
-    if (state.network.ranked === true) {
-      recordRankedShot(state, { shotId, shooterId: state.ranked?.peerPlayerId, x, y, result, sunkCells: sunk ? shipCells.map(point => ({ x: point.x, y: point.y })) : [] });
-    }
-    session.sendShotResult({ matchId: state.matchStats.matchId, shotId: payload.shotId, x, y, result, sunkCells: sunk ? shipCells.map(p => ({ x: p.x, y: p.y })) : [] });
-    addSystemMessage(`Соперник стреляет ${coord}: ${result === 'sunk' ? 'убил корабль' : result === 'hit' ? 'ранил корабль' : 'промахнулся'}.`);
-    if (isBoardDefeated(state.myBoard)) {
-      finishMatch('loss', 'Матч завершён: поражение.');
-      return;
-    }
-    if (!hit) {
-      state.phase = 'player';
-      setNetworkStatus('Соперник промахнулся. Ваш ход.', 'your-turn');
-    } else {
-      state.phase = 'computer';
-      setNetworkStatus('Соперник попал и продолжает ход.', 'peer-turn');
-    }
-    render();
-    scheduleSaveMatchDraft();
-  };
-  const receiveShotResult = msg => {
-    const payload = msg.payload || {};
-    const x = Number(payload.x);
-    const y = Number(payload.y);
-    const result = payload.result || 'miss';
-    const shotId = String(payload.shotId || '');
-    const guard = verifyIncomingShotResult({ state, shotId });
-    if (!guard.ok) {
-      setNetworkStatus(`SHOT_RESULT отклонён: ${guard.reason}.`, 'error');
-      addSystemMessage(`Turn guard: SHOT_RESULT отклонён (${guard.reason}).`);
-      render();
-      scheduleSaveMatchDraft();
-      return;
-    }
-    const cell = state.enemyBoard[y]?.[x];
-    if (!cell) {
-      recordTurnViolation(state, 'shot_result_outside_enemy_board', { shotId, x, y });
-      setNetworkStatus('SHOT_RESULT указывает на клетку вне поля.', 'error');
-      render();
-      scheduleSaveMatchDraft();
-      return;
-    }
-    cell.status = result === 'miss' ? 'miss' : 'hit';
-    if (result === 'sunk') {
-      cell.status = 'hit';
-      if (Array.isArray(payload.sunkCells)) {
-        payload.sunkCells.forEach(point => {
-          const target = state.enemyBoard[point.y]?.[point.x];
-          if (target) target.status = 'hit';
-        });
-      }
-    }
-    const shipCells = result === 'sunk' && Array.isArray(payload.sunkCells) ? payload.sunkCells.map(point => ({ x: Number(point.x), y: Number(point.y), cell: state.enemyBoard[point.y]?.[point.x] })).filter(point => point.cell) : [];
-    if (shipCells.length) markSunkPerimeter(state.enemyBoard, shipCells);
-    state.network.awaitingShotResult = false;
-    state.selectedTarget = null;
-    const shotLog = state.networkShots.mine.find(shot => shot.shotId === payload.shotId) || state.networkShots.mine.find(shot => shot.x === x && shot.y === y && !shot.result);
-    if (shotLog) {
-      shotLog.result = result;
-      shotLog.sunkCells = Array.isArray(payload.sunkCells) ? payload.sunkCells.map(point => ({ x: Number(point.x), y: Number(point.y) })) : [];
-      shotLog.resultAt = Date.now();
-    } else {
-      state.networkShots.mine.push({ shotId: payload.shotId || '', x, y, result, sunkCells: Array.isArray(payload.sunkCells) ? payload.sunkCells.map(point => ({ x: Number(point.x), y: Number(point.y) })) : [], at: Date.now() });
-    }
-    recordIncomingShotResult({ state, shotId });
-    if (state.network.ranked === true) {
-      recordRankedShot(state, { shotId, shooterId: state.ranked?.playerId, x, y, result, sunkCells: Array.isArray(payload.sunkCells) ? payload.sunkCells : [] });
-    }
-    registerShotStats('player', result);
-    showBattleFx('enemy', result);
-    addSystemMessage(`Ответ соперника: ${formatCellName(x, y)} — ${result === 'sunk' ? 'корабль уничтожен' : result === 'hit' ? 'попадание' : 'мимо'}.`);
-    if (result === 'miss') {
-      state.phase = 'computer';
-      setNetworkStatus('Вы промахнулись. Ход соперника.', 'peer-turn');
-    } else {
-      state.phase = 'player';
-      setNetworkStatus(result === 'sunk' ? 'Корабль уничтожен. Ваш ход продолжается.' : 'Попадание. Ваш ход продолжается.', 'your-turn');
-    }
-    render();
-    scheduleSaveMatchDraft();
-  };
-  const abortRanked = async (reason = 'disconnect') => {
-    if (state.network?.ranked !== true || !state.ranked?.matchId) {
-      return null;
-    }
+    this.iceDiagnostics.updatedAt = Date.now();
+    this.onIceDiagnostics({ ...this.iceDiagnostics });
+  }
+  async _refreshSelectedCandidatePair() {
+    if (!this.peer?.getStats) return this.iceDiagnostics;
     try {
-      const ranked = await abortRankedMatch({ state, session, reason });
-      setNetworkStatus(ranked.serverStatus === 'forfeited' ? 'Сервер зафиксировал техническое поражение.' : 'Запрос завершения рейтингового матча отправлен.', ranked.serverStatus === 'forfeited' ? 'error' : 'waiting');
-      scheduleSaveMatchDraft();
-      return ranked;
-    } catch (error) {
-      addSystemMessage(`Не удалось зафиксировать выход: ${error.message}`);
-      setNetworkStatus('Сервер не подтвердил завершение матча.', 'error');
-      return null;
-    }
-  };
-  const sendBoardReveal = () => {
-    if (state.network.myRevealSent) return false;
-    const reveal = packBoardReveal(state.myBoard);
-    const layoutCheck = validateRevealLayout(reveal);
-    state.fairPlay.myReveal = reveal;
-    state.fairPlay.myLayoutOk = layoutCheck.ok;
-    const sent = session.sendBoardReveal({ matchId: state.matchStats.matchId, salt: state.fairPlay.mySalt, reveal });
-    if (!sent) {
-      setNetworkStatus('Не удалось отправить BOARD_REVEAL. Проверьте соединение.', 'error');
-      addSystemMessage('BOARD_REVEAL не отправлен: нет связи с соперником.');
-      render();
-      scheduleSaveMatchDraft();
-      return false;
-    }
-    state.network.myRevealSent = true;
-    state.network.awaitingReveal = true;
-    setNetworkStatus('Финал. Ваша доска раскрыта. Ожидаем reveal соперника...', 'waiting');
-    scheduleSaveMatchDraft();
-    return true;
-  };
-  const receiveBoardReveal = async msg => {
-    const payload = msg.payload || {};
-    const reveal = payload.reveal;
-    state.fairPlay.enemyReveal = reveal;
-    const layoutCheck = validateRevealLayout(reveal);
-    state.fairPlay.enemyLayoutOk = layoutCheck.ok;
-    const commitCheck = await verifyBoardCommit({ reveal, salt: payload.salt, commitHash: state.fairPlay.enemyCommitHash });
-    state.fairPlay.enemyCommitOk = commitCheck.ok;
-    const transcriptCheck = verifyShotResultsAgainstReveal({ shots: state.networkShots?.mine || [], reveal });
-    state.networkShots.enemyTranscriptOk = transcriptCheck.ok;
-    state.networkShots.note = transcriptCheck.ok ? `Проверено выстрелов: ${transcriptCheck.checked}.` : `Расхождения выстрелов: ${transcriptCheck.mismatches.length}.`;
-    state.fairPlay.enemyTranscriptOk = transcriptCheck.ok;
-    if (layoutCheck.ok && commitCheck.ok && transcriptCheck.ok) {
-      applyRevealToBoard(state.enemyBoard, reveal);
-      state.fairPlay.note = 'BOARD_REVEAL соперника проверен: commit совпал, расстановка корректна, ответы на выстрелы подтверждены.';
-      addSystemMessage('Проверка соперника: честность OK, история выстрелов совпала.');
-      setNetworkStatus('Reveal соперника проверен. Commit, поле и выстрелы OK.', 'ready');
-      if (state.network?.ranked === true) {
-        addSystemMessage('Рейтинговый результат локально подтверждён, но начисление временно заморожено до запуска серверной проверки V2.');
-      }
-    } else {
-      state.fairPlay.note = `Проблема проверки: ${layoutCheck.reason || commitCheck.reason || transcriptCheck.reason}.`;
-      addSystemMessage(`Проверка соперника не пройдена: ${state.fairPlay.note}`);
-      setNetworkStatus('Reveal соперника не прошёл fair-play проверку.', 'error');
-    }
-    state.fairPlay.revealed = true;
-    state.network.awaitingReveal = false;
-    if (state.network.ranked === true) {
-      try {
-        const ranked = await submitRankedMatch({ state, session });
-        if (ranked?.serverStatus === 'settled') {
-          addSystemMessage(`Ranked V2 подтверждён сервером. Изменение рейтинга: ${ranked.settlement?.winnerDelta || 0}.`);
-          setNetworkStatus('Результат подтверждён сервером и записан в рейтинг.', 'ready');
-        } else if (ranked?.serverStatus === 'disputed') {
-          addSystemMessage('Ranked V2 отклонён сервером: transcript или board validation не пройдены.');
-          setNetworkStatus('Сервер отклонил рейтинговый результат.', 'error');
-        } else {
-          addSystemMessage('Ваш результат отправлен. Ожидаем submit соперника.');
-          setNetworkStatus('Результат отправлен. Ожидаем соперника.', 'waiting');
+      const stats = await this.peer.getStats();
+      let selectedPair = null;
+      stats.forEach(report => {
+        if (report.type === 'transport' && report.selectedCandidatePairId) {
+          selectedPair = stats.get(report.selectedCandidatePairId);
         }
-      } catch (error) {
-        addSystemMessage(`Не удалось отправить Ranked V2: ${error.message}`);
-        setNetworkStatus('Ошибка отправки рейтингового результата.', 'error');
+        if (report.type === 'candidate-pair' && report.selected) {
+          selectedPair = report;
+        }
+      });
+      if (!selectedPair) return this.iceDiagnostics;
+      const local = stats.get(selectedPair.localCandidateId);
+      const remote = stats.get(selectedPair.remoteCandidateId);
+      const localType = local?.candidateType || '';
+      const remoteType = remote?.candidateType || '';
+      this.iceDiagnostics.selected = [localType, remoteType].filter(Boolean).join('↔');
+      this.iceDiagnostics.usesTurn = localType === 'relay' || remoteType === 'relay' || this.iceDiagnostics.relay;
+      this.iceDiagnostics.updatedAt = Date.now();
+      this.onIceDiagnostics({ ...this.iceDiagnostics });
+    } catch {}
+    return this.iceDiagnostics;
+  }
+  async init() {
+    await this._loadRtcConfig();
+    await this._req('player_register', { displayName: this.displayName });
+    await this.heartbeat();
+    this._startHeartbeat();
+    this._emitStatus('ready', false);
+    return true;
+  }
+  async _loadRtcConfig() {
+    try {
+      const res = await this._req('rtc_config', {});
+      if (Array.isArray(res.iceServers) && res.iceServers.length) {
+        this.iceServers = res.iceServers;
       }
+    } catch {
+      this.iceServers = getIceServers();
     }
-    render();
-    saveMatchDraftNow();
-  };
-  const sendMatchFinished = result => {
-    const sent = session.sendMatchFinished({ matchId: state.matchStats.matchId, result, stats: state.matchStats });
-    if (!sent) {
-      addSystemMessage('MATCH_FINISHED не отправлен: нет связи с соперником.');
-      setNetworkStatus('Не удалось отправить финал матча. Проверьте соединение.', 'error');
-      return false;
+    return this.iceServers;
+  }
+  async heartbeat() {
+    return this._req('presence_heartbeat', { deviceId: 'web', gameId: this.gameId, roomId: this.roomId || '' });
+  }
+  async getLeaderboard() {
+    return this._req('leaderboard_v2_get', {});
+  }
+  async prepareRankedMatch() {
+    if (!this.roomId || !this.roomSecret) {
+      throw new Error('room_required');
     }
-    return true;
-  };
-  const receiveMatchFinished = msg => {
-    const payload = msg.payload || {};
-    const peerResult = payload.result || 'unknown';
-    addSystemMessage(`Соперник сообщил финал матча: ${peerResult}.`);
-    if (state.phase !== 'finished') {
-      state.result = peerResult === 'loss' ? 'win' : 'loss';
-      state.phase = 'finished';
-      state.autoBattle.player = false;
-      state.matchStats.finishedAt = Date.now();
-      const myReveal = packBoardReveal(state.myBoard);
-      const myCheck = validateRevealLayout(myReveal);
-      state.fairPlay = { ...state.fairPlay, myReveal, myLayoutOk: myCheck.ok, revealed: !!state.fairPlay.enemyReveal, note: state.fairPlay.enemyReveal ? state.fairPlay.note : 'матч завершён, ожидается BOARD_REVEAL соперника' };
-      sendBoardReveal();
-      render();
-      saveMatchDraftNow();
+    return this._req('ranked_match_prepare', { roomId: this.roomId, roomSecret: this.roomSecret });
+  }
+  async prepareRankedStake(matchId) {
+    return this._req('ranked_stake_prepare', { matchId: safe(matchId) });
+  }
+  async commitRankedRps({ matchId, round, commit } = {}) {
+    return this._req('ranked_rps_commit', { matchId: safe(matchId), round: Number(round || 1), commit: safe(commit) });
+  }
+  async revealRankedRps({ matchId, round, choice, salt } = {}) {
+    return this._req('ranked_rps_reveal', { matchId: safe(matchId), round: Number(round || 1), choice: safe(choice), salt: safe(salt) });
+  }
+  async submitRankedMatch({ matchId, submission } = {}) {
+    return this._req('ranked_match_submit', { matchId: safe(matchId), submission });
+  }
+  async getRankedMatchStatus(matchId) {
+    return this._req('ranked_match_status', { matchId: safe(matchId) });
+  }
+  async abortRankedMatch({ matchId, reason = 'disconnect' } = {}) {
+    return this._req('ranked_match_abort', { matchId: safe(matchId), reason: safe(reason) });
+  }
+  async getProfile(friendId) {
+    const result = await this._req('profile_get', { friendId: safe(friendId) });
+    return result.profile || null;
+  }
+  async sendGameInvite({ toFriendId, gameId = this.gameId, roomId, roomSecret } = {}) {
+    if (roomId && roomSecret && (this.roomId !== roomId || this.roomSecret !== roomSecret)) {
+      this.roomId = safe(roomId);
+      this.roomSecret = safe(roomSecret);
     }
-  };
-  const sendRematchRequest = ranked => {
-    if (state.opponent?.type !== 'network') return false;
-    if (state.network.rematchPending) {
-      setNetworkStatus('Предложение реванша уже отправлено. Ждём ответ соперника...', 'waiting');
-      toast?.('Уже ждём ответ на реванш');
-      return true;
+    const join = await this.createJoinToken({ invitedPlayerId: toFriendId });
+    return this._req('push_send', { toFriendId: safe(toFriendId), kind: 'GAME_INVITE', gameId: safe(gameId), joinToken: join.token });
+  }
+  async setRoomMode({ ranked = false, localOnly = true } = {}) {
+    if (!this.roomId || !this.roomSecret) throw new Error('room_required');
+    const res = await this._req('room_set_mode', { roomId: this.roomId, roomSecret: this.roomSecret, ranked: !!ranked, localOnly: !!localOnly });
+    this.ranked = !!res.ranked;
+    this.forceLocalOnly = !!res.localOnly;
+    return res;
+  }
+  async createNearbyGameCode() {
+    if (!this.roomId) await this.connectAsHost();
+    const res = await this._req('nearby_game_create', { gameId: this.gameId, roomId: this.roomId, roomSecret: this.roomSecret, peerId: this.peerId });
+    return { ...res, roomId: this.roomId, roomSecret: this.roomSecret, joinUrl: this.buildJoinUrl() };
+  }
+  async getNearbyGame(code) {
+    return this._req('nearby_game_join', { code: safe(code).replace(/\D/g, '').slice(0, 6), gameId: this.gameId });
+  }
+  async createRoom() {
+    const hostPeerId = makeId('host');
+    const res = await this._req('room_create', { gameId: this.gameId, peerId: hostPeerId });
+    this.role = 'host';
+    this.roomId = res.roomId;
+    this.roomSecret = res.roomSecret;
+    this.peerId = res.hostPeerId;
+    this.remotePeerId = res.guestPeerId;
+    const join = await this.createJoinToken();
+    this.joinToken = join.token;
+    this.onRoom({ role: this.role, roomId: this.roomId, roomSecret: this.roomSecret, joinUrl: this.buildJoinUrl() });
+    return { ...res, joinUrl: this.buildJoinUrl() };
+  }
+  async createJoinToken({ invitedPlayerId = '' } = {}) {
+    if (!this.roomId || !this.roomSecret) {
+      throw new Error('room_required');
     }
-    const sent = session.sendGame(MessageType.REMATCH_REQUEST, { matchId: state.matchStats.matchId, ranked: !!ranked, at: Date.now() });
-    if (!sent) {
-      setNetworkStatus('Не удалось отправить предложение реванша. Проверьте соединение.', 'error');
-      toast?.('Реванш не отправлен');
-      return false;
+    return this._req('room_join_token_create', { roomId: this.roomId, roomSecret: this.roomSecret, invitedPlayerId: safe(invitedPlayerId) });
+  }
+  async joinRoom({ roomId, roomSecret }) {
+    const res = await this._req('room_join', { roomId, roomSecret });
+    this.role = 'guest';
+    this.roomId = res.roomId;
+    this.roomSecret = roomSecret;
+    this.peerId = res.guestPeerId;
+    this.remotePeerId = res.hostPeerId;
+    this.onRoom({ role: this.role, roomId: this.roomId, roomSecret: this.roomSecret });
+    return res;
+  }
+  buildJoinUrl(joinToken = this.joinToken) {
+    const u = new URL('/Games/', window.location.href);
+    u.searchParams.set('gcGame', this.gameId);
+    if (joinToken) {
+      u.searchParams.set('join', joinToken);
     }
-    state.network.rematchPending = true;
-    state.network.ranked = !!ranked;
-    state.network.matchMode = ranked ? 'ranked' : 'casual';
-    setNetworkStatus(ranked ? 'Предложение рейтингового реванша отправлено. Ждём ответ соперника...' : 'Предложение гостевого реванша отправлено. Ждём ответ соперника...', 'waiting');
-    addSystemMessage(ranked ? 'Вы предложили сопернику рейтинговый реванш.' : 'Вы предложили сопернику гостевой реванш.');
-    toast?.('Предложение реванша отправлено');
-    scheduleSaveMatchDraft();
-    return true;
-  };
-  const requestRematch = () => {
-    if (state.opponent?.type !== 'network') return false;
-    const isAuthed = !!state.snapshot?.user?.yandexLinked;
-    if (state.network?.ranked) {
-      return sendRematchRequest(true);
+    return u.toString();
+  }
+  _initPeer() {
+    try {
+      this.dataChannel?.close?.();
+    } catch {}
+    try {
+      this.peer?.close?.();
+    } catch {}
+    this.peer = null;
+    this.dataChannel = null;
+    this.connected = false;
+    this.pendingIce = [];
+    this.iceDiagnostics = { host: false, srflx: false, relay: false, selected: '', usesTurn: false, updatedAt: 0 };
+    // ВАЖНО: STUN всегда включён. Браузеры маскируют host-кандидаты через mDNS (.local),
+    // и без STUN два устройства в одной Wi-Fi часто не находят друг друга.
+    // srflx-кандидаты с одинаковым внешним IP всё равно дают прямое локальное соединение.
+    const peerConfig = { iceServers: this.iceServers || getIceServers(), iceCandidatePoolSize: 8, iceTransportPolicy: 'all', bundlePolicy: 'max-bundle', rtcpMuxPolicy: 'require' };
+    this.peer = new RTCPeerConnection(peerConfig);
+    try {
+      const transceiver = this.peer.addTransceiver('audio', { direction: 'sendrecv' });
+      this.audioSender = transceiver.sender;
+    } catch {
+      this.audioSender = null;
     }
-    const overlay = document.createElement('div');
-    overlay.className = 'wh-modal-overlay';
-    overlay.innerHTML = `
-<div class="wh-modal-box">
-<h3 class="wh-modal-title">Реванш?</h3>
-<p class="wh-modal-text">
-Можно сыграть снова гостевой бой или предложить рейтинговый реванш.
-${isAuthed ? 'Рейтинговый реванш потребует авторизацию соперника.' : 'Для рейтингового реванша нужно войти через Яндекс.'}
-</p>
-<div class="wh-modal-actions" style="flex-direction:column;gap:10px">
-<button class="wh-btn" type="button" id="wh-rematch-ranked" style="background:linear-gradient(135deg,#ff9800,#f57c00)">🏆 ${isAuthed ? 'Предложить рейтинговый реванш' : 'Войти и предложить рейтинговый реванш'}</button>
-<button class="wh-btn secondary" type="button" id="wh-rematch-casual">👤 Сыграть гостевой реванш</button>
-<button class="wh-btn secondary" type="button" id="wh-rematch-cancel" style="background:transparent;border:1px solid rgba(255,255,255,.2)">Отмена</button>
-</div>
-</div>
-`;
-    document.body.appendChild(overlay);
-    overlay.querySelector('#wh-rematch-cancel')?.addEventListener('click', () => overlay.remove());
-    overlay.querySelector('#wh-rematch-casual')?.addEventListener('click', () => {
-      overlay.remove();
-      sendRematchRequest(false);
-    });
-    overlay.querySelector('#wh-rematch-ranked')?.addEventListener('click', () => {
-      overlay.remove();
-      if (!isAuthed) {
-        window.parent?.postMessage?.({ kind: 'vitrina:game', type: 'GC_AUTH_LOGIN', gameId: 'war_hearts', payload: { reason: 'ranked_rematch' } }, '*');
-        toast?.('Войдите через Яндекс и нажмите реванш ещё раз');
+    this.peer.onicecandidate = e => {
+      if (!e.candidate) return;
+      // Никогда не фильтруем кандидаты: симметричный полный набор у host и guest
+      // даёт максимальный шанс прямого соединения в одной Wi-Fi.
+      this._markIceCandidate(e.candidate);
+      if (!this.roomId || !this.remotePeerId) return;
+      this._sendSignal('ice', e.candidate).catch(error => {
+        this._emitStatus('ice retry', false, { transient: true, signalType: 'ice', error: error?.message || String(error || '') });
+      });
+    };
+    this.peer.onconnectionstatechange = () => {
+      const st = this.peer?.connectionState || 'unknown';
+      if (st === 'connected') {
+        clearTimeout(this.disconnectTimer);
+        this.disconnectTimer = 0;
+        this.iceRestartAttempts = 0;
+        this.connected = true;
+        this._refreshSelectedCandidatePair().finally(() => this._emitStatus('online', true));
         return;
       }
-      sendRematchRequest(true);
-    });
+      if (st === 'disconnected') {
+        this._emitStatus('reconnecting', false, { transient: true });
+        clearTimeout(this.disconnectTimer);
+        this.disconnectTimer = setTimeout(() => {
+          if (!this.closed && this.peer?.connectionState === 'disconnected') {
+            this.connected = false;
+            this.onDisconnect({ state: 'disconnected_timeout' });
+          }
+        }, 10000);
+        return;
+      }
+      if (st === 'failed') {
+        this.connected = false;
+        this._emitStatus('ice failed', false);
+        if (this.role === 'guest' && this.iceRestartAttempts < 1) {
+          this.iceRestartAttempts++;
+          this._makeAndSendOffer('ice-restart', { iceRestart: true }).catch(error => {
+            this.onError(error);
+          });
+          return;
+        }
+        this.onDisconnect({ state: st });
+        return;
+      }
+      if (st === 'closed') {
+        this.connected = false;
+        this._emitStatus('closed', false);
+        this.onDisconnect({ state: st });
+      }
+    };
+    this.peer.ondatachannel = e => {
+      this._bindDataChannel(e.channel);
+    };
+    this.peer.ontrack = e => {
+      this._attachRemoteAudio(e.streams?.[0]);
+    };
+    this.peer.onnegotiationneeded = async () => {
+      if (this.closed || !this.peer || !this.remotePeerId || this.role !== 'host') return;
+      if (!this.connected) return; // Предотвращаем WebRTC glare: Хост не отправляет оффер до установки P2P соединения
+      try {
+        await this._makeAndSendOffer('renegotiate');
+      } catch (err) {
+        this.onError(err);
+      }
+    };
+  }
+  _bindDataChannel(channel) {
+    this.dataChannel = channel;
+    this.dataChannel.onopen = () => {
+      this.connected = true;
+      this._emitStatus('online', true);
+      this.onConnect({ roomId: this.roomId, role: this.role });
+    };
+    this.dataChannel.onclose = () => {
+      this.connected = false;
+      if (!this.closed) {
+        this.onDisconnect({ state: 'datachannel_closed' });
+      }
+    };
+    this.dataChannel.onmessage = e => {
+      const data = jsonParse(e.data);
+      if (!data) return;
+      if (data.type === 'CHAT_MESSAGE') this.onChat(data);
+      this.onData(data);
+    };
+  }
+  _attachRemoteAudio(stream) {
+    if (!stream) return;
+    let audio = document.getElementById('remote-voice');
+    if (!audio) {
+      audio = document.createElement('audio');
+      audio.id = 'remote-voice';
+      audio.autoplay = true;
+      audio.playsInline = true;
+      audio.style.display = 'none';
+      document.body.appendChild(audio);
+    }
+    audio.srcObject = stream;
+    this.remoteAudio = audio;
+  }
+  async _sendSignal(type, data) {
+    this._emitStatus(`send ${type}`, false, { signalType: type });
+    const res = await this._req('signal_send', { roomId: this.roomId, roomSecret: this.roomSecret, fromPeerId: this.peerId, toPeerId: this.remotePeerId, type, payload: { type, data } });
+    this._emitStatus(`${type} sent`, false, { signalType: type });
+    return res;
+  }
+  async _makeAndSendOffer(reason = 'offer', options = {}) {
+    if (!this.peer || this.closed) {
+      throw new Error('peer_unavailable');
+    }
+    const offer = await this.peer.createOffer({ iceRestart: options.iceRestart === true });
+    await this.peer.setLocalDescription(offer);
+    await this._sendSignal('offer', { sdp: this.peer.localDescription, reason, iceRestart: options.iceRestart === true });
+  }
+  async _handleSignal(msg) {
+    const rawPayload = msg?.payload;
+    const payload = typeof rawPayload === 'string' ? jsonParse(rawPayload) : rawPayload;
+    const type = safe(msg?.type || payload?.type);
+    const data = msg?.data ?? payload?.data ?? null;
+    if (!this.peer || !type || !data) return;
+    if (type === 'offer') {
+      this._emitStatus('offer received', false, { signalType: 'offer' });
+      const desc = data?.sdp || data;
+      await this.peer.setRemoteDescription(new RTCSessionDescription(desc));
+      for (const c of this.pendingIce.splice(0)) {
+        await this.peer.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+      }
+      const answer = await this.peer.createAnswer();
+      await this.peer.setLocalDescription(answer);
+      await this._sendSignal('answer', this.peer.localDescription);
+      return;
+    }
+    if (type === 'answer') {
+      this._emitStatus('answer received', false, { signalType: 'answer' });
+      const desc = data?.sdp || data;
+      if (!this.peer.remoteDescription || this.peer.remoteDescription.type !== 'answer') {
+        await this.peer.setRemoteDescription(new RTCSessionDescription(desc));
+      }
+      for (const c of this.pendingIce.splice(0)) {
+        await this.peer.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+      }
+      return;
+    }
+    if (type === 'ice') {
+      this._emitStatus('ice received', false, { signalType: 'ice' });
+      this._markIceCandidate(data);
+      if (!this.peer.remoteDescription) {
+        this.pendingIce.push(data);
+        return;
+      }
+      await this.peer.addIceCandidate(new RTCIceCandidate(data)).catch(() => {});
+    }
+  }
+  _startPolling(intervalMs = 800) {
+    this.stopPolling();
+    let busy = false;
+    let fails = 0;
+    const tick = async () => {
+      if (this.closed || !this.roomId || !this.peerId) {
+        this.pollTimer = 0;
+        return;
+      }
+      if (document.hidden) {
+        this.pollTimer = setTimeout(tick, Math.max(1600, intervalMs * 2));
+        return;
+      }
+      if (busy) {
+        this.pollTimer = setTimeout(tick, intervalMs);
+        return;
+      }
+      busy = true;
+      try {
+        const res = await this._req('signal_poll', { roomId: this.roomId, roomSecret: this.roomSecret, peerId: this.peerId });
+        fails = 0;
+        for (const msg of res.messages || []) {
+          await this._handleSignal(msg);
+        }
+      } catch (err) {
+        fails++;
+        this._emitStatus(fails > 2 ? 'signal retry' : 'signal wait', false, { transient: true, error: err?.message || String(err || '') });
+        // Важно: signal_poll может кратко падать на мобильной сети.
+        // Не вызываем onError до открытия DataChannel, иначе игра сама помечает P2P как разорванный.
+        if (this.connected && (fails === 3 || fails % 8 === 0)) this.onError(err);
+      } finally {
+        busy = false;
+        const backoff = Math.min(5000, intervalMs + fails * 450);
+        this.pollTimer = setTimeout(tick, fails ? backoff : intervalMs);
+      }
+    };
+    this.pollTimer = setTimeout(tick, 20);
+  }
+  stopPolling() {
+    clearTimeout(this.pollTimer);
+    this.pollTimer = 0;
+  }
+  _startHeartbeat() {
+    if (this.heartbeatTimer) return;
+    this.heartbeatTimer = setInterval(() => {
+      if (!document.hidden) {
+        this.heartbeat().catch(err => {
+          if (err && err.status >= 500) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = 0;
+            this.onError(err);
+          }
+        });
+      }
+    }, 25000);
+  }
+  async connectAsHost(opts = {}) {
+    this.closed = false;
+    this.forceLocalOnly = !!opts.forceLocalOnly;
+    this.ranked = !!opts.ranked;
+    if (!this.roomId) await this.createRoom();
+    this.role = 'host';
+    if (Object.prototype.hasOwnProperty.call(opts, 'ranked') || Object.prototype.hasOwnProperty.call(opts, 'forceLocalOnly')) {
+      const mode = await this.setRoomMode({ ranked: this.ranked, localOnly: this.forceLocalOnly });
+      this.ranked = !!mode.ranked;
+      this.forceLocalOnly = !!mode.localOnly;
+    }
+    this._initPeer();
+    // Даже в LAN-режиме signaling остаётся нужен для обмена SDP/ICE.
+    // Интервал не должен создавать сотни serverless-вызовов в минуту.
+    this._startPolling(this.forceLocalOnly ? 650 : 900);
+    this._emitStatus(this.forceLocalOnly ? 'lan waiting' : 'waiting', false, { localOnly: this.forceLocalOnly, ranked: this.ranked });
+    return { roomId: this.roomId, roomSecret: this.roomSecret, joinUrl: this.buildJoinUrl(), localOnly: this.forceLocalOnly, ranked: this.ranked };
+  }
+  async connectAsGuest({ roomId, roomSecret, forceLocalOnly = false, ranked = false, rankedOverride = null }) {
+    this.closed = false;
+    this.forceLocalOnly = !!forceLocalOnly;
+    this.ranked = !!ranked;
+    const joined = await this.joinRoom({ roomId, roomSecret });
+    this.ranked = !!(joined?.ranked ?? this.ranked);
+    this.forceLocalOnly = !!(joined?.localOnly ?? this.forceLocalOnly);
+    if (rankedOverride !== null && !!rankedOverride !== this.ranked) {
+      const mode = await this.setRoomMode({ ranked: !!rankedOverride, localOnly: this.forceLocalOnly });
+      this.ranked = !!mode.ranked;
+      this.forceLocalOnly = !!mode.localOnly;
+    }
+    this.role = 'guest';
+    this._initPeer();
+    // Guest первым создаёт DataChannel и отправляет initial offer.
+    const ch = this.peer.createDataChannel('game', { ordered: true, maxRetransmits: 5 });
+    this._bindDataChannel(ch);
+    await this._makeAndSendOffer('initial');
+    this._startPolling(this.forceLocalOnly ? 650 : 900);
+    this._emitStatus(this.forceLocalOnly ? 'lan connecting' : 'connecting', false, { localOnly: this.forceLocalOnly, ranked: this.ranked });
     return true;
-  };
-  const receiveRematchRequest = msg => {
-    state.network.rematchPending = false;
-    state.rematchOffer = { active: true, from: msg.payload?.from?.name || state.opponent?.name || 'Соперник', matchId: msg.payload?.matchId || '', ranked: msg.payload?.ranked ?? state.network?.ranked ?? false };
-    openRematchModal();
-    setNetworkStatus('Соперник предлагает реванш.', 'waiting');
-    scheduleSaveMatchDraft();
-  };
-  const openRematchModal = () => {
-    clearModal('.wh-rematch-offer-overlay');
-    const isRanked = !!state.rematchOffer?.ranked;
-    const isAuthed = !!state.snapshot?.user?.yandexLinked;
-    const rankBadge = isRanked
-      ? '<div style="padding:4px 12px;border-radius:999px;background:rgba(255,152,0,.2);border:1px solid rgba(255,152,0,.4);color:#ffb74d;font-size:11px;font-weight:900;display:inline-block;margin-bottom:10px">🏆 Рейтинговый</div>'
-      : '<div style="padding:4px 12px;border-radius:999px;background:rgba(124,77,255,.2);border:1px solid rgba(124,77,255,.4);color:#b388ff;font-size:11px;font-weight:900;display:inline-block;margin-bottom:10px">👤 Гостевой</div>';
-    const authWarning =
-      !isAuthed && isRanked
-        ? '<div style="padding:10px;border-radius:10px;background:rgba(255,152,0,.1);border:1px solid rgba(255,152,0,.3);margin-bottom:10px;font-size:11px;color:#ffb74d">🏆 Соперник зовёт в рейтинговый реванш. Войдите через Яндекс, чтобы принять его рейтингово, или предложите гостевой реванш.</div>'
-        : '';
-    const overlay = document.createElement('div');
-    overlay.className = 'wh-modal-overlay wh-rematch-offer-overlay';
-    overlay.innerHTML = `
-<div class="wh-modal-box">
-<h3 class="wh-modal-title">Реванш?</h3>
-${rankBadge}
-${authWarning}
-<p class="wh-modal-text">
-${state.rematchOffer.from || 'Соперник'} предлагает сыграть ещё раз.
-Если принять, вы перейдёте к новой расстановке кораблей.
-</p>
-<div class="wh-modal-actions" style="flex-direction:${isRanked && !isAuthed ? 'column' : 'row'};gap:10px">
-<button class="wh-btn secondary" type="button" id="wh-rematch-reject">Отклонить</button>
-${isRanked && !isAuthed ? '<button class="wh-btn" type="button" id="wh-rematch-login" style="background:linear-gradient(135deg,#ff9800,#f57c00)">🏆 Войти и принять рейтингово</button><button class="wh-btn secondary" type="button" id="wh-rematch-casual">👤 Предложить гостевой реванш</button>' : '<button class="wh-btn" type="button" id="wh-rematch-accept">Принять</button>'}
-</div>
-</div>
-`;
-    document.body.appendChild(overlay);
-    overlay.querySelector('#wh-rematch-reject')?.addEventListener('click', () => {
-      overlay.remove();
-      session.sendGame(MessageType.REMATCH_REJECT, { matchId: state.rematchOffer.matchId, at: Date.now() });
-      state.rematchOffer.active = false;
-      state.network.rematchPending = false;
-      setNetworkStatus('Вы отклонили реванш.', 'ready');
-      addSystemMessage('Реванш отклонён.');
-      scheduleSaveMatchDraft();
-    });
-    overlay.querySelector('#wh-rematch-login')?.addEventListener('click', () => {
-      window.parent?.postMessage?.({ kind: 'vitrina:game', type: 'GC_AUTH_LOGIN', gameId: 'war_hearts', payload: { reason: 'ranked_rematch_accept' } }, '*');
-      toast?.('Войдите через Яндекс и примите реванш снова');
-    });
-    overlay.querySelector('#wh-rematch-casual')?.addEventListener('click', () => {
-      overlay.remove();
-      state.rematchOffer.ranked = false;
-      session.sendGame(MessageType.REMATCH_ACCEPT, { matchId: state.rematchOffer.matchId, ranked: false, at: Date.now() });
-      session.sendGame(MessageType.MATCH_MODE, { matchId: state.rematchOffer.matchId, ranked: false, matchMode: 'casual', at: Date.now() });
-      state.rematchOffer.active = false;
-      state.network.rematchPending = false;
-      state.network.ranked = false;
-      state.network.matchMode = 'casual';
-      addSystemMessage('Вы предложили продолжить реванш как гостевой.');
-      startNetworkPreparation({ initiator: false, ranked: false });
-    });
-    overlay.querySelector('#wh-rematch-accept')?.addEventListener('click', () => {
-      overlay.remove();
-      const ranked = !!state.rematchOffer.ranked;
-      session.sendGame(MessageType.REMATCH_ACCEPT, { matchId: state.rematchOffer.matchId, ranked, at: Date.now() });
-      session.sendGame(MessageType.MATCH_MODE, { matchId: state.rematchOffer.matchId, ranked, matchMode: ranked ? 'ranked' : 'casual', at: Date.now() });
-      state.rematchOffer.active = false;
-      state.network.rematchPending = false;
-      state.network.ranked = ranked;
-      state.network.matchMode = ranked ? 'ranked' : 'casual';
-      addSystemMessage(ranked ? 'Рейтинговый реванш принят. Переходим к расстановке.' : 'Гостевой реванш принят. Переходим к расстановке.');
-      startNetworkPreparation({ initiator: false, ranked });
-    });
-  };
-  const receiveRematchAccept = msg => {
-    const ranked = msg?.payload?.ranked === true;
-    state.network.rematchPending = false;
-    state.network.ranked = ranked;
-    state.network.matchMode = ranked ? 'ranked' : 'casual';
-    addSystemMessage(ranked ? 'Соперник принял рейтинговый реванш. Переходим к расстановке.' : 'Соперник принял гостевой реванш. Переходим к расстановке.');
-    setNetworkStatus(ranked ? 'Рейтинговый реванш принят. Расставьте корабли.' : 'Гостевой реванш принят. Расставьте корабли.', 'setup');
-    startNetworkPreparation({ initiator: true, ranked });
-  };
-  const receiveRematchReject = () => {
-    state.network.rematchPending = false;
-    addSystemMessage('Соперник отклонил реванш.');
-    setNetworkStatus('Соперник отклонил реванш.', 'ready');
-    toast?.('Реванш отклонён');
-    scheduleSaveMatchDraft();
-  };
-  const handleGameData = msg => {
-    if (!msg?.type) return;
-    if (!state.network.connected) {
-      state.network.connected = true;
+  }
+  async connectFromUrl() {
+    const url = new URL(window.location.href);
+    const joinToken = safe(url.searchParams.get('join'));
+    if (!joinToken) return false;
+    const redeemed = await this._req('room_join_token_redeem', { joinToken });
+    if (!redeemed?.roomId || !redeemed?.roomSecret) {
+      throw new Error(redeemed?.reason || 'room_join_token_invalid');
     }
-    ensureNetworkOpponent();
-    switch (msg.type) {
-      case MessageType.BOARD_COMMIT:
-        state.fairPlay.enemyCommitHash = msg.payload?.commitHash || '';
-        state.network.peerCommitReceived = !!state.fairPlay.enemyCommitHash;
-        addSystemMessage('Получен commit доски соперника.');
-        setNetworkStatus('Commit соперника получен. Ожидаем готовность...', 'waiting');
-        maybeStartRps();
-        scheduleSaveMatchDraft();
-        break;
-      case MessageType.READY:
-        state.network.peerReady = true;
-        addSystemMessage('Соперник готов к бою.');
-        setNetworkStatus('Соперник готов. Синхронизация боя...', 'waiting');
-        maybeStartRps();
-        scheduleSaveMatchDraft();
-        break;
-      case MessageType.SHOT:
-        receiveShot(msg);
-        break;
-      case MessageType.SHOT_RESULT:
-        receiveShotResult(msg);
-        break;
-      case MessageType.MATCH_FINISHED:
-        receiveMatchFinished(msg);
-        break;
-      case MessageType.BOARD_REVEAL:
-        receiveBoardReveal(msg);
-        break;
-      case MessageType.REMATCH_REQUEST:
-        receiveRematchRequest(msg);
-        break;
-      case MessageType.REMATCH_ACCEPT:
-        receiveRematchAccept(msg);
-        break;
-      case MessageType.REMATCH_REJECT:
-        receiveRematchReject(msg);
-        break;
-      case MessageType.PING:
-        state.networkWatchdog.lastPeerAt = Date.now();
-        session.sendGame(MessageType.PONG, { matchId: state.matchStats.matchId, phase: state.phase, hidden: !!document.hidden });
-        break;
-      case MessageType.PONG:
-        state.networkWatchdog.lastPongAt = Date.now();
-        state.networkWatchdog.lastPeerAt = Date.now();
-        state.networkWatchdog.warning = false;
-        state.networkWatchdog.note = '';
-        break;
-      case MessageType.MATCH_ABORTED:
-        addSystemMessage('Соперник прервал матч.');
-        setNetworkStatus('Соперник прервал матч или отключился.', 'error');
-        break;
-      case MessageType.MATCH_MODE:
-        state.network.ranked = msg.payload?.ranked === true;
-        state.network.matchMode = state.network.ranked ? 'ranked' : 'casual';
-        addSystemMessage(state.network.ranked ? 'Режим боя обновлён: рейтинговый.' : 'Режим боя обновлён: гостевой без статистики.');
-        setNetworkStatus(state.network.ranked ? 'Режим боя: рейтинговый.' : 'Режим боя: гостевой без статистики.', 'setup');
-        scheduleSaveMatchDraft();
-        break;
-      default:
-        addSystemMessage(`Сетевое событие: ${msg.type}`);
-        break;
+    await this.connectAsGuest({ roomId: redeemed.roomId, roomSecret: redeemed.roomSecret });
+    url.searchParams.delete('join');
+    window.history.replaceState(null, '', url.toString());
+    return true;
+  }
+  send(data) {
+    if (this.dataChannel?.readyState !== 'open') return false;
+    this.dataChannel.send(JSON.stringify(data));
+    return true;
+  }
+  sendChat(text, from = this.displayName) {
+    return this.send({ type: 'CHAT_MESSAGE', payload: { from, text: safe(text).slice(0, 300) }, at: Date.now() });
+  }
+  async toggleVoice(enable) {
+    if (!this.peer) return false;
+    if (!enable && !this.audioStream) {
+      return true;
     }
-    render();
-  };
-  const onConnected = peerName => {
-    ensureNetworkOpponent();
-    state.network.connected = true;
-    state.network.peerName = peerName || state.opponent?.name || 'Соперник';
-    setNetworkStatus('Соединение установлено. Можно готовиться к бою.', 'ready');
-  };
-  const onDisconnected = () => {
-    state.network.connected = false;
-    setNetworkStatus('Связь с соперником потеряна. Проверьте интернет.', 'error');
-  };
-  return { setNetworkStatus, startNetworkPreparation, markReady, shoot, requestRematch, abortRanked, sendBoardReveal, sendMatchFinished, handleGameData, onConnected, onDisconnected };
-};
+    if (!this.audioStream) {
+      this.audioStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      const track = this.audioStream.getAudioTracks()[0];
+      if (track) {
+        track.enabled = false;
+        if (this.audioSender?.replaceTrack) {
+          await this.audioSender.replaceTrack(track);
+        } else {
+          this.peer.addTrack(track, this.audioStream);
+        }
+      }
+    }
+    const track = this.audioStream.getAudioTracks()[0];
+    if (track) track.enabled = !!enable;
+    try {
+      await this.remoteAudio?.play?.();
+    } catch {}
+    this.send({ type: 'VOICE_STATE', payload: { active: !!enable }, at: Date.now() });
+    return true;
+  }
+  // ─── LAN Wi-Fi: генерация и регистрация кодов ──────────────────────────────
+  generateLanCode() {
+    // Только цифры: легко продиктовать другу голосом.
+    let code = '';
+    for (let i = 0; i < 6; i++) code += String(Math.floor(Math.random() * 10));
+    return code;
+  }
+  async registerLanCode(code, roomId, roomSecret, ranked, localOnly = true) {
+    return this._req('lan_code_register', { code: String(code).replace(/\D/g, '').slice(0, 6), roomId, roomSecret, ranked: !!ranked, localOnly: !!localOnly, matchMode: ranked ? 'ranked' : 'casual', ttlMs: 300000 });
+  }
+  async getLanRoomByCode(code) {
+    const cleanCode = String(code || '')
+      .replace(/\D/g, '')
+      .slice(0, 6);
+    if (!cleanCode) throw new Error('lan_code_required');
+    const res = await this._req('lan_code_resolve', { code: cleanCode });
+    if (!res?.roomId || !res?.roomSecret) throw new Error('lan_room_not_found');
+    return { roomId: res.roomId, roomSecret: res.roomSecret, ranked: !!res.ranked, localOnly: !!res.localOnly, matchMode: res.matchMode || (res.ranked ? 'ranked' : 'casual'), expiresAt: res.expiresAt || 0 };
+  }
+  async close() {
+    this.closed = true;
+    this.stopPolling();
+    clearTimeout(this.disconnectTimer);
+    this.disconnectTimer = 0;
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = 0;
+    if (this.roomId && this.roomSecret) {
+      try {
+        await this._req('room_close', { roomId: this.roomId, roomSecret: this.roomSecret });
+      } catch {}
+    }
+    try {
+      this.dataChannel?.close?.();
+    } catch {}
+    try {
+      this.peer?.close?.();
+    } catch {}
+    this.audioStream?.getTracks?.().forEach(t => {
+      try {
+        t.stop();
+      } catch {}
+    });
+    this.peer = null;
+    this.dataChannel = null;
+    this.audioStream = null;
+    this.connected = false;
+    this.roomId = '';
+    this.roomSecret = '';
+    this.joinToken = '';
+    this.peerId = '';
+    this.remotePeerId = '';
+    this.role = '';
+    this.pendingIce = [];
+  }
+}
+export default NetworkBridge;

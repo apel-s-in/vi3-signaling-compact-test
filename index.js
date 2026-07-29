@@ -634,16 +634,7 @@ function isValidIanaTimezone(zone) {
 function timezoneOffsetAt(zone, timestamp = now()) {
   if (!isValidIanaTimezone(zone)) throw new Error('timezone_invalid');
   const at = Math.max(0, num(timestamp)) || now();
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: zone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hourCycle: 'h23'
-  }).formatToParts(new Date(at));
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).formatToParts(new Date(at));
   const values = Object.fromEntries(parts.filter(part => part.type !== 'literal').map(part => [part.type, Number(part.value)]));
   const localAsUtc = Date.UTC(values.year, values.month - 1, values.day, values.hour, values.minute, values.second);
   return Math.round((at - localAsUtc) / 60000);
@@ -664,16 +655,7 @@ function normalizeTimezonePolicy(raw = {}, playerId = '') {
 }
 function publicTimezonePolicy(raw = {}) {
   const policy = normalizeTimezonePolicy(raw, raw.playerId);
-  return {
-    available: !!policy.zone,
-    version: policy.version,
-    zone: policy.zone,
-    revision: policy.revision,
-    source: policy.source,
-    boundAt: policy.boundAt,
-    effectiveFrom: policy.effectiveFrom,
-    updatedAt: policy.updatedAt
-  };
+  return { available: !!policy.zone, version: policy.version, zone: policy.zone, revision: policy.revision, source: policy.source, boundAt: policy.boundAt, effectiveFrom: policy.effectiveFrom, updatedAt: policy.updatedAt };
 }
 async function getTimezonePolicy(playerId) {
   return normalizeTimezonePolicy(payload(await kvGet(timezonePolicyKey(playerId))), playerId);
@@ -722,21 +704,24 @@ async function upsertAccountDevice(playerId, body = {}) {
   const key = accountDeviceKey(playerId, deviceId);
   const old = normalizeAccountDevice(payload(await kvGet(key)), playerId);
   const at = now();
-  const device = normalizeAccountDevice({
-    ...old,
-    playerId,
-    deviceId,
-    label: body.deviceLabel || old.label || 'Устройство',
-    deviceClass: body.deviceClass || old.deviceClass || 'Desktop',
-    platform: body.platform || old.platform || 'web',
-    pwa: body.pwa === true,
-    timezone: body.timezone || old.timezone,
-    timezoneOffsetMin: body.timezoneOffsetMin,
-    revokedAt: old.revokedAt,
-    firstSeenAt: old.firstSeenAt || at,
-    lastSeenAt: at,
-    updatedAt: at
-  }, playerId);
+  const device = normalizeAccountDevice(
+    {
+      ...old,
+      playerId,
+      deviceId,
+      label: body.deviceLabel || old.label || 'Устройство',
+      deviceClass: body.deviceClass || old.deviceClass || 'Desktop',
+      platform: body.platform || old.platform || 'web',
+      pwa: body.pwa === true,
+      timezone: body.timezone || old.timezone,
+      timezoneOffsetMin: body.timezoneOffsetMin,
+      revokedAt: old.revokedAt,
+      firstSeenAt: old.firstSeenAt || at,
+      lastSeenAt: at,
+      updatedAt: at
+    },
+    playerId
+  );
   await kvPut({ pk: key, type: 'accountDevice', owner: playerId, data: device });
   return device;
 }
@@ -802,23 +787,19 @@ async function actionTimezonePolicySet(event, body) {
   }
   const old = await getTimezonePolicy(playerId);
   const at = now();
-  const next = normalizeTimezonePolicy({
-    playerId,
-    zone,
-    revision: old.revision + 1,
-    source: 'browser_confirmed',
-    offsetAtBindingMin: expectedOffset,
-    boundAt: at,
-    effectiveFrom: at,
-    updatedAt: at
-  }, playerId);
+  const next = normalizeTimezonePolicy({ playerId, zone, revision: old.revision + 1, source: 'browser_confirmed', offsetAtBindingMin: expectedOffset, boundAt: at, effectiveFrom: at, updatedAt: at }, playerId);
   await kvPut({ pk: timezonePolicyKey(playerId), type: 'timezonePolicy', owner: playerId, data: next });
   return { ok: true, timezonePolicy: publicTimezonePolicy(next) };
 }
 async function actionAccountDeviceList(event, body) {
   const { playerId } = await requirePlayer(event, body);
   const rows = await kvPrefix(`accountDevice:${playerId}:`, 100);
-  const items = rows.map(payload).map(item => normalizeAccountDevice(item, playerId)).filter(item => item.deviceId).sort((left, right) => right.lastSeenAt - left.lastSeenAt).map(publicAccountDevice);
+  const items = rows
+    .map(payload)
+    .map(item => normalizeAccountDevice(item, playerId))
+    .filter(item => item.deviceId)
+    .sort((left, right) => right.lastSeenAt - left.lastSeenAt)
+    .map(publicAccountDevice);
   return { ok: true, items };
 }
 async function actionAccountDeviceUpdate(event, body) {
@@ -829,15 +810,18 @@ async function actionAccountDeviceUpdate(event, body) {
   const row = await kvGet(key);
   if (!row) throw new Error('account_device_not_found');
   const old = normalizeAccountDevice(payload(row), playerId);
-  const next = normalizeAccountDevice({
-    ...old,
-    label: hasOwn(body, 'label') ? safe(body.label).slice(0, 80) || old.label : old.label,
-    takeoverEnabled: hasOwn(body, 'takeoverEnabled') ? body.takeoverEnabled === true : old.takeoverEnabled,
-    remotePauseEnabled: hasOwn(body, 'remotePauseEnabled') ? body.remotePauseEnabled === true : old.remotePauseEnabled,
-    alwaysConfirm: true,
-    revokedAt: hasOwn(body, 'revoked') && body.revoked === true ? now() : old.revokedAt,
-    updatedAt: now()
-  }, playerId);
+  const next = normalizeAccountDevice(
+    {
+      ...old,
+      label: hasOwn(body, 'label') ? safe(body.label).slice(0, 80) || old.label : old.label,
+      takeoverEnabled: hasOwn(body, 'takeoverEnabled') ? body.takeoverEnabled === true : old.takeoverEnabled,
+      remotePauseEnabled: hasOwn(body, 'remotePauseEnabled') ? body.remotePauseEnabled === true : old.remotePauseEnabled,
+      alwaysConfirm: true,
+      revokedAt: hasOwn(body, 'revoked') && body.revoked === true ? now() : old.revokedAt,
+      updatedAt: now()
+    },
+    playerId
+  );
   await kvPut({ pk: key, type: 'accountDevice', owner: playerId, data: next });
   return { ok: true, device: publicAccountDevice(next) };
 }
@@ -850,16 +834,7 @@ function playbackIsActive(state, at = now()) {
   return !!state.logicalSessionId && state.status === 'playing' && state.leaseExpiresAt > at;
 }
 function playbackGrant(state, fencingToken) {
-  return {
-    logicalSessionId: state.logicalSessionId,
-    ownerEpoch: state.ownerEpoch,
-    fencingToken,
-    trackUid: state.trackUid,
-    trackVersion: state.trackVersion,
-    position: state.confirmedPosition,
-    leaseExpiresAt: state.leaseExpiresAt,
-    revision: state.revision
-  };
+  return { logicalSessionId: state.logicalSessionId, ownerEpoch: state.ownerEpoch, fencingToken, trackUid: state.trackUid, trackVersion: state.trackVersion, position: state.confirmedPosition, leaseExpiresAt: state.leaseExpiresAt, revision: state.revision };
 }
 async function requirePlaybackDevice(event, body) {
   const auth = await requirePlayer(event, body);
@@ -874,6 +849,79 @@ async function requirePlaybackDevice(event, body) {
   if (!row || !device.deviceId) throw new Error('account_device_not_found');
   if (device.revokedAt > 0) throw new Error('account_device_revoked');
   return { ...auth, deviceId, device };
+}
+function playbackFenceFields(body = {}) {
+  return {
+    logicalSessionId: sanitizeId(body.logicalSessionId, 120),
+    ownerEpoch: Math.max(0, Math.floor(num(body.ownerEpoch))),
+    fencingToken: safe(body.fencingToken),
+    trackVersion: safe(body.trackVersion).slice(0, 96)
+  };
+}
+function assertPlaybackFenceState(stateRaw, auth, body = {}, { requireTrack = false, trackUid = '', trackVersion = '' } = {}) {
+  const state = normalizePlaybackState(stateRaw, auth.playerId);
+  const fence = playbackFenceFields(body);
+  if (!playbackIsActive(state)) throw new Error('playback_owner_not_active');
+  if (state.ownerDeviceId !== auth.deviceId) throw new Error('playback_owner_changed');
+  if (!fence.ownerEpoch || state.ownerEpoch !== fence.ownerEpoch) throw new Error('playback_fence_epoch_mismatch');
+  if (!fence.fencingToken || state.fencingTokenHash !== hash(fence.fencingToken)) throw new Error('playback_fence_token_mismatch');
+  if (requireTrack) {
+    const uid = sanitizeId(trackUid, 160);
+    const version = safe(trackVersion).slice(0, 96);
+    if (state.trackUid !== uid || state.trackVersion !== version) throw new Error('playback_fence_track_mismatch');
+  }
+  return { state, fence };
+}
+async function requirePlaybackFence(event, body, options = {}) {
+  const auth = await requirePlaybackDevice(event, body);
+  const row = await kvGet(playbackStateKey(auth.playerId));
+  if (!row) throw new Error('playback_grant_required');
+  return { ...assertPlaybackFenceState(payload(row), auth, body, options), auth, row };
+}
+async function renewPlaybackFence(auth, body, position) {
+  const key = playbackStateKey(auth.playerId);
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const row = await kvGet(key);
+    if (!row) throw new Error('playback_grant_required');
+    const checked = assertPlaybackFenceState(payload(row), auth, body);
+    const at = now();
+    const track = LISTEN_TRACK_CATALOG.get(checked.state.trackUid);
+    const next = normalizePlaybackState({
+      ...checked.state,
+      confirmedPosition: Math.max(0, Math.min(track?.duration || 7200, num(position))),
+      confirmedAt: at,
+      leaseExpiresAt: at + PLAYBACK_LEASE_MS,
+      revision: checked.state.revision + 1,
+      updatedAt: at
+    }, auth.playerId);
+    if (!(await kvCompareAndPut({ row, type: 'playbackState', owner: auth.playerId, expiresAt: next.leaseExpiresAt + PLAYBACK_LEASE_MS, data: next }))) continue;
+    return next;
+  }
+  throw new Error('playback_lease_conflict');
+}
+async function closeTransferredListenSegment(playerId, deviceId, confirmedPosition) {
+  const key = listenActiveKey(playerId, deviceId);
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const row = await kvGet(key);
+    const current = normalizeListenSession(payload(row));
+    if (!row || current.status !== 'active') return null;
+    const at = now();
+    const completed = normalizeListenSession({
+      ...current,
+      status: 'completed',
+      completedAt: at,
+      completionReason: 'ownership_transfer',
+      lastPosition: Math.max(current.lastPosition, Math.min(current.duration, num(confirmedPosition))),
+      receiptId: `lr_${hash([playerId, current.sessionId, 'ownership_transfer'].join(':')).slice(0, 28)}`,
+      updatedAt: at
+    });
+    if (!(await kvCompareAndPut({ row, type: 'listenActive', owner: playerId, data: completed }))) continue;
+    await persistListenSession(completed);
+    const finalized = await finalizeListenSession(completed);
+    await kvDelete(key).catch(() => null);
+    return finalized;
+  }
+  throw new Error('playback_transfer_listen_close_conflict');
 }
 async function actionPlaybackStateGet(event, body) {
   const auth = await requirePlayer(event, body);
@@ -898,26 +946,31 @@ async function actionPlaybackClaim(event, body) {
     if (playbackIsActive(current, at) && current.ownerDeviceId !== auth.deviceId) {
       return { ok: true, claimed: false, requiresConfirmation: true, playback: publicPlaybackState(current, auth.deviceId) };
     }
-    const fencingToken = base64url(crypto.randomBytes(32));
+    const suppliedFencingToken = safe(body.fencingToken);
+    const sameOwnerGrant = playbackIsActive(current, at) && current.ownerDeviceId === auth.deviceId && suppliedFencingToken && current.fencingTokenHash === hash(suppliedFencingToken);
+    const fencingToken = sameOwnerGrant ? suppliedFencingToken : base64url(crypto.randomBytes(32));
     const sameLogicalTrack = current.logicalSessionId && current.trackUid === track.uid && current.trackVersion === track.trackVersion;
-    const next = normalizePlaybackState({
-      ...current,
-      playerId: auth.playerId,
-      logicalSessionId: sameLogicalTrack ? current.logicalSessionId : rid('playback'),
-      trackUid: track.uid,
-      trackVersion: track.trackVersion,
-      status: 'playing',
-      ownerDeviceId: auth.deviceId,
-      ownerLabel: auth.device.label,
-      ownerSessionId: auth.sessionId,
-      ownerEpoch: current.ownerEpoch + 1,
-      fencingTokenHash: hash(fencingToken),
-      confirmedPosition: sameLogicalTrack ? Math.min(track.duration, Math.max(current.confirmedPosition, num(body.position))) : Math.min(track.duration, Math.max(0, num(body.position))),
-      confirmedAt: at,
-      leaseExpiresAt: at + PLAYBACK_LEASE_MS,
-      revision: current.revision + 1,
-      updatedAt: at
-    }, auth.playerId);
+    const next = normalizePlaybackState(
+      {
+        ...current,
+        playerId: auth.playerId,
+        logicalSessionId: sameLogicalTrack ? current.logicalSessionId : rid('playback'),
+        trackUid: track.uid,
+        trackVersion: track.trackVersion,
+        status: 'playing',
+        ownerDeviceId: auth.deviceId,
+        ownerLabel: auth.device.label,
+        ownerSessionId: auth.sessionId,
+        ownerEpoch: sameOwnerGrant ? current.ownerEpoch : current.ownerEpoch + 1,
+        fencingTokenHash: hash(fencingToken),
+        confirmedPosition: sameLogicalTrack ? Math.min(track.duration, Math.max(current.confirmedPosition, num(body.position))) : Math.min(track.duration, Math.max(0, num(body.position))),
+        confirmedAt: at,
+        leaseExpiresAt: at + PLAYBACK_LEASE_MS,
+        revision: current.revision + 1,
+        updatedAt: at
+      },
+      auth.playerId
+    );
     let changed = false;
     if (!row) {
       try {
@@ -963,7 +1016,6 @@ async function actionPlaybackTransferPrepare(event, body) {
     fromDeviceId: state.ownerDeviceId,
     toDeviceId: auth.deviceId,
     expectedOwnerEpoch: state.ownerEpoch,
-    expectedRevision: state.revision,
     expectedLogicalSessionId: state.logicalSessionId,
     targetTrackUid: targetTrack.uid,
     targetTrackVersion: targetTrack.trackVersion,
@@ -996,7 +1048,7 @@ async function actionPlaybackTransferCommit(event, body) {
   for (let attempt = 0; attempt < 10; attempt++) {
     const row = await kvGet(key);
     const current = normalizePlaybackState(payload(row), auth.playerId);
-    if (!row || current.ownerDeviceId !== transfer.fromDeviceId || current.ownerEpoch !== num(transfer.expectedOwnerEpoch) || current.revision !== num(transfer.expectedRevision) || current.logicalSessionId !== transfer.expectedLogicalSessionId) {
+    if (!row || current.ownerDeviceId !== transfer.fromDeviceId || current.ownerEpoch !== num(transfer.expectedOwnerEpoch) || current.logicalSessionId !== transfer.expectedLogicalSessionId) {
       const error = new Error('playback_transfer_state_changed');
       error.httpStatus = 409;
       throw error;
@@ -1010,26 +1062,57 @@ async function actionPlaybackTransferCommit(event, body) {
     const sameTrack = current.trackUid === track.uid && current.trackVersion === track.trackVersion;
     const fencingToken = base64url(crypto.randomBytes(32));
     const at = now();
-    const next = normalizePlaybackState({
-      ...current,
-      trackUid: track.uid,
-      trackVersion: track.trackVersion,
-      status: 'playing',
-      ownerDeviceId: auth.deviceId,
-      ownerLabel: auth.device.label,
-      ownerSessionId: auth.sessionId,
-      ownerEpoch: current.ownerEpoch + 1,
-      fencingTokenHash: hash(fencingToken),
-      confirmedPosition: sameTrack ? Math.min(track.duration, current.confirmedPosition) : Math.min(track.duration, Math.max(0, num(transfer.requestedPosition))),
-      confirmedAt: at,
-      leaseExpiresAt: at + PLAYBACK_LEASE_MS,
-      transferCount: current.transferCount + 1,
-      revision: current.revision + 1,
-      updatedAt: at
-    }, auth.playerId);
+    const next = normalizePlaybackState(
+      {
+        ...current,
+        logicalSessionId: sameTrack ? current.logicalSessionId : rid('playback'),
+        trackUid: track.uid,
+        trackVersion: track.trackVersion,
+        status: 'playing',
+        ownerDeviceId: auth.deviceId,
+        ownerLabel: auth.device.label,
+        ownerSessionId: auth.sessionId,
+        ownerEpoch: current.ownerEpoch + 1,
+        fencingTokenHash: hash(fencingToken),
+        confirmedPosition: sameTrack ? Math.min(track.duration, current.confirmedPosition) : Math.min(track.duration, Math.max(0, num(transfer.requestedPosition))),
+        confirmedAt: at,
+        leaseExpiresAt: at + PLAYBACK_LEASE_MS,
+        transferCount: current.transferCount + 1,
+        revision: current.revision + 1,
+        updatedAt: at
+      },
+      auth.playerId
+    );
     if (!(await kvCompareAndPut({ row, type: 'playbackState', owner: auth.playerId, expiresAt: next.leaseExpiresAt + PLAYBACK_LEASE_MS, data: next }))) continue;
     await kvDelete(transferKey).catch(() => null);
-    return { ok: true, transferred: true, fromDeviceId: transfer.fromDeviceId, playback: publicPlaybackState(next, auth.deviceId), grant: playbackGrant(next, fencingToken) };
+    const closedListenSegment = await closeTransferredListenSegment(auth.playerId, transfer.fromDeviceId, current.confirmedPosition).catch(error => ({ error: safe(error?.message) }));
+    const webPush = await sendSystemWebPush({
+      toPlayerId: auth.playerId,
+      targetDeviceId: transfer.fromDeviceId,
+      title: 'Воспроизведение передано',
+      body: `Музыка продолжена на «${next.ownerLabel || 'другом устройстве'}».`,
+      url: './',
+      tag: `playback-${next.logicalSessionId}`,
+      requireInteraction: false,
+      kind: 'PLAYBACK_TRANSFERRED',
+      logicalSessionId: next.logicalSessionId,
+      ownerDeviceId: next.ownerDeviceId,
+      ownerLabel: next.ownerLabel,
+      ownerEpoch: next.ownerEpoch
+    }).catch(error => ({ ok: false, error: safe(error?.message) }));
+    return {
+      ok: true,
+      transferred: true,
+      fromDeviceId: transfer.fromDeviceId,
+      playback: publicPlaybackState(next, auth.deviceId),
+      grant: playbackGrant(next, fencingToken),
+      closedListenSegment: closedListenSegment?.segmentReceipt ? {
+        receiptId: closedListenSegment.segmentReceipt.receiptId,
+        observedSec: closedListenSegment.segmentReceipt.observedSec
+      } : null,
+      logical: closedListenSegment?.logical || null,
+      webPush
+    };
   }
   throw new Error('playback_transfer_conflict');
 }
@@ -1040,65 +1123,16 @@ async function actionSocialSessionIssue(event, body) {
   const expiresAt = issuedAt + CFG.socialSessionTtlMs;
   const oldPlayer = payload(await kvGet(`player:${identity.friendId}`));
   const oldProfile = payload(await kvGet(`profile:${identity.friendId}`));
-  const yandexIdHash = hash(
-    `ya:${identity.yandexId}`
-  );
-  const playerChanged =
-    oldPlayer.playerId !== identity.friendId ||
-    num(oldPlayer.authVersion) < 2 ||
-    oldPlayer.yandexIdHash !== yandexIdHash ||
-    safe(oldPlayer.displayName) !==
-      identity.displayName ||
-    safe(oldPlayer.avatarUrl) !==
-      identity.avatarUrl;
-
+  const yandexIdHash = hash(`ya:${identity.yandexId}`);
+  const playerChanged = oldPlayer.playerId !== identity.friendId || num(oldPlayer.authVersion) < 2 || oldPlayer.yandexIdHash !== yandexIdHash || safe(oldPlayer.displayName) !== identity.displayName || safe(oldPlayer.avatarUrl) !== identity.avatarUrl;
   if (playerChanged) {
-    await kvPut({
-      pk: `player:${identity.friendId}`,
-      type: 'player',
-      owner: identity.friendId,
-      data: {
-        ...oldPlayer,
-        playerId: identity.friendId,
-        authVersion: 2,
-        yandexIdHash,
-        displayName: identity.displayName,
-        avatarUrl: identity.avatarUrl,
-        createdAt:
-          oldPlayer.createdAt || issuedAt,
-        updatedAt: issuedAt
-      }
-    });
+    await kvPut({ pk: `player:${identity.friendId}`, type: 'player', owner: identity.friendId, data: { ...oldPlayer, playerId: identity.friendId, authVersion: 2, yandexIdHash, displayName: identity.displayName, avatarUrl: identity.avatarUrl, createdAt: oldPlayer.createdAt || issuedAt, updatedAt: issuedAt } });
   }
-
-  const profileDisplayName =
-    identity.displayName ||
-    oldProfile.displayName ||
-    'Слушатель';
-  const profileAvatar =
-    identity.avatarUrl ||
-    oldProfile.avatarUrl ||
-    '';
-  const profileChanged =
-    oldProfile.friendId !== identity.friendId ||
-    safe(oldProfile.displayName) !==
-      profileDisplayName ||
-    safe(oldProfile.avatarUrl) !==
-      profileAvatar;
-
+  const profileDisplayName = identity.displayName || oldProfile.displayName || 'Слушатель';
+  const profileAvatar = identity.avatarUrl || oldProfile.avatarUrl || '';
+  const profileChanged = oldProfile.friendId !== identity.friendId || safe(oldProfile.displayName) !== profileDisplayName || safe(oldProfile.avatarUrl) !== profileAvatar;
   if (profileChanged) {
-    await kvPut({
-      pk: `profile:${identity.friendId}`,
-      type: 'profile',
-      owner: identity.friendId,
-      data: {
-        ...oldProfile,
-        friendId: identity.friendId,
-        displayName: profileDisplayName,
-        avatarUrl: profileAvatar,
-        updatedAt: issuedAt
-      }
-    });
+    await kvPut({ pk: `profile:${identity.friendId}`, type: 'profile', owner: identity.friendId, data: { ...oldProfile, friendId: identity.friendId, displayName: profileDisplayName, avatarUrl: profileAvatar, updatedAt: issuedAt } });
   }
   const [registrationGrant, accountDevice, timezonePolicy] = await Promise.all([
     ensureRegistrationShardGrant(identity.friendId).catch(error => ({ ok: false, duplicate: false, amount: 0, operationId: '', error: safe(error?.message) })),
@@ -1489,20 +1523,13 @@ async function actionSignalAck(event, body) {
     return { ok: false, reason: 'peer_identity_mismatch' };
   }
   let acked = 0;
-
   for (const seq of seqs) {
     try {
-      await kvDelete(
-        `signal:${roomId}:${peerId}:${seq}`
-      );
+      await kvDelete(`signal:${roomId}:${peerId}:${seq}`);
       acked++;
     } catch {}
   }
-
-  return {
-    ok: true,
-    acked
-  };
+  return { ok: true, acked };
 }
 // ===== FRIENDS / E2EE V2 =====
 async function actionProfileSet(event, body) {
@@ -1557,10 +1584,10 @@ async function actionPresenceBatch(event, body) {
   }
   return { ok: true, presence };
 }
-async function sendSystemWebPush({ toPlayerId, title, body, url = './', tag = 'vi3-notification', requireInteraction = false, kind = '', fromFriendId = '', gameId = '', msgId = '', callId = '' } = {}) {
+async function sendSystemWebPush({ toPlayerId, targetDeviceId = '', title, body, url = './', tag = 'vi3-notification', requireInteraction = false, kind = '', fromFriendId = '', gameId = '', msgId = '', callId = '', logicalSessionId = '', ownerDeviceId = '', ownerLabel = '', ownerEpoch = 0 } = {}) {
   if (!CFG.webPushFunctionUrl || !CFG.webPushSecret || !toPlayerId) return { ok: false, skipped: true };
   try {
-    const res = await fetch(CFG.webPushFunctionUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Vi3-Admin': CFG.webPushSecret }, body: JSON.stringify({ action: 'send_to_player', playerId: toPlayerId, title, body, url, tag, requireInteraction, kind, fromFriendId, gameId, msgId, callId }) });
+    const res = await fetch(CFG.webPushFunctionUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Vi3-Admin': CFG.webPushSecret }, body: JSON.stringify({ action: 'send_to_player', playerId: toPlayerId, targetDeviceId, title, body, url, tag, requireInteraction, kind, fromFriendId, gameId, msgId, callId, logicalSessionId, ownerDeviceId, ownerLabel, ownerEpoch }) });
     const json = await res.json().catch(() => ({}));
     return json;
   } catch (err) {
@@ -2267,22 +2294,9 @@ function favoriteRewardCount(raw) {
   return Object.values(state.items).filter(item => item.status === 'active' && item.rewardEligible).length;
 }
 async function actionFavoriteStateGet(event, body) {
-  const { playerId } = await requirePlayer(
-    event,
-    body
-  );
-  const { state } =
-    await getOrCreateFavoriteState(playerId);
-
-  return {
-    ok: true,
-    shadow: CFG.favoriteRewardsShadow,
-    rewardsEnabled:
-      !CFG.favoriteRewardsShadow,
-    state: publicFavoriteState(state),
-    rewards: [],
-    wallet: null
-  };
+  const { playerId } = await requirePlayer(event, body);
+  const { state } = await getOrCreateFavoriteState(playerId);
+  return { ok: true, shadow: CFG.favoriteRewardsShadow, rewardsEnabled: !CFG.favoriteRewardsShadow, state: publicFavoriteState(state), rewards: [], wallet: null };
 }
 async function actionFavoriteStateMutate(event, body) {
   const { playerId } = await requirePlayer(event, body);
@@ -2907,9 +2921,11 @@ function normalizeListenCreditSegments(raw) {
       toAt: Math.max(0, Math.floor(num(segment?.toAt))),
       creditMs: Math.max(0, Math.floor(num(segment?.creditMs))),
       fromObservedMs: Math.max(0, Math.floor(num(segment?.fromObservedMs))),
-      toObservedMs: Math.max(0, Math.floor(num(segment?.toObservedMs)))
+      toObservedMs: Math.max(0, Math.floor(num(segment?.toObservedMs))),
+      fromPositionMs: Math.max(0, Math.floor(num(segment?.fromPositionMs))),
+      toPositionMs: Math.max(0, Math.floor(num(segment?.toPositionMs)))
     }))
-    .filter(segment => segment.fromAt > 0 && segment.toAt > segment.fromAt && segment.creditMs > 0 && segment.toObservedMs > segment.fromObservedMs)
+    .filter(segment => segment.fromAt > 0 && segment.toAt > segment.fromAt && segment.creditMs > 0 && segment.toObservedMs > segment.fromObservedMs && segment.toPositionMs > segment.fromPositionMs)
     .sort((left, right) => left.fromObservedMs - right.fromObservedMs)
     .slice(-LISTEN_CREDIT_SEGMENT_LIMIT);
 }
@@ -2919,7 +2935,11 @@ function normalizeListenSession(raw = {}) {
     playerId: sanitizeId(raw.playerId, 96),
     sessionId: sanitizeId(raw.sessionId, 120),
     deviceId: sanitizeId(raw.deviceId, 120),
+    logicalSessionId: sanitizeId(raw.logicalSessionId, 120),
+    ownerEpoch: Math.max(0, Math.floor(num(raw.ownerEpoch))),
+    fencingTokenHash: safe(raw.fencingTokenHash).slice(0, 64),
     trackUid: sanitizeId(raw.trackUid, 160),
+    trackVersion: safe(raw.trackVersion).slice(0, 96),
     album: sanitizeId(raw.album, 120),
     duration: Math.max(0, Math.min(7200, num(raw.duration))),
     variant: sanitizeId(raw.variant || 'audio', 40),
@@ -2951,6 +2971,291 @@ function normalizeListenSession(raw = {}) {
     platform: sanitizeId(raw.platform, 30),
     updatedAt: num(raw.updatedAt)
   };
+}
+const LOGICAL_LISTEN_VERSION = 1;
+const LOGICAL_COVERAGE_LIMIT = 512;
+const LOGICAL_SEGMENT_LIMIT = 128;
+const LOGICAL_COVERAGE_REQUIRED_RATIO = 0.95;
+const LOGICAL_COVERAGE_MAX_GAP_MS = 3000;
+
+function logicalListenKey(playerId, logicalSessionId) {
+  return ['logicalListen', sanitizeId(playerId, 96), sanitizeId(logicalSessionId, 120)].join(':');
+}
+function normalizeLogicalCoverageIntervals(raw) {
+  return (Array.isArray(raw) ? raw : [])
+    .map(interval => ({
+      intervalId: sanitizeId(interval?.intervalId, 120),
+      sessionId: sanitizeId(interval?.sessionId, 120),
+      deviceId: sanitizeId(interval?.deviceId, 120),
+      ownerEpoch: Math.max(0, Math.floor(num(interval?.ownerEpoch))),
+      fromPositionMs: Math.max(0, Math.floor(num(interval?.fromPositionMs))),
+      toPositionMs: Math.max(0, Math.floor(num(interval?.toPositionMs))),
+      creditMs: Math.max(0, Math.floor(num(interval?.creditMs))),
+      fromAt: Math.max(0, Math.floor(num(interval?.fromAt))),
+      toAt: Math.max(0, Math.floor(num(interval?.toAt)))
+    }))
+    .filter(interval => interval.intervalId && interval.sessionId && interval.deviceId && interval.ownerEpoch > 0 && interval.toPositionMs > interval.fromPositionMs && interval.creditMs > 0)
+    .sort((left, right) => left.fromPositionMs - right.fromPositionMs || left.toPositionMs - right.toPositionMs)
+    .slice(-LOGICAL_COVERAGE_LIMIT);
+}
+function mergeLogicalCoverageIntervals(intervals = []) {
+  const rows = normalizeLogicalCoverageIntervals(intervals);
+  const merged = [];
+  rows.forEach(interval => {
+    const last = merged[merged.length - 1];
+    if (!last || interval.fromPositionMs > last.toPositionMs) {
+      merged.push({ fromPositionMs: interval.fromPositionMs, toPositionMs: interval.toPositionMs });
+      return;
+    }
+    last.toPositionMs = Math.max(last.toPositionMs, interval.toPositionMs);
+  });
+  return merged;
+}
+function logicalCoverageMetrics(intervals = [], durationMs = 0) {
+  const merged = mergeLogicalCoverageIntervals(intervals);
+  const coveredMs = merged.reduce((sum, interval) => sum + Math.max(0, interval.toPositionMs - interval.fromPositionMs), 0);
+  let maxGapMs = 0;
+  for (let index = 1; index < merged.length; index++) {
+    maxGapMs = Math.max(maxGapMs, merged[index].fromPositionMs - merged[index - 1].toPositionMs);
+  }
+  const duration = Math.max(0, Math.floor(num(durationMs)));
+  return {
+    merged,
+    coveredMs: Math.min(duration || coveredMs, coveredMs),
+    coverageRatio: duration > 0 ? Math.min(1, coveredMs / duration) : 0,
+    maxGapMs
+  };
+}
+function normalizeLogicalListen(raw = {}, playerId = '') {
+  const durationMs = Math.max(0, Math.floor(num(raw.durationMs)));
+  const coverageIntervals = normalizeLogicalCoverageIntervals(raw.coverageIntervals);
+  const coverage = logicalCoverageMetrics(coverageIntervals, durationMs);
+  return {
+    version: LOGICAL_LISTEN_VERSION,
+    playerId: sanitizeId(playerId || raw.playerId, 96),
+    logicalSessionId: sanitizeId(raw.logicalSessionId, 120),
+    trackUid: sanitizeId(raw.trackUid, 160),
+    trackVersion: safe(raw.trackVersion).slice(0, 96),
+    album: sanitizeId(raw.album, 120),
+    durationMs,
+    status: sanitizeId(raw.status || 'active', 30),
+    initialStartedPositionMs: Math.max(0, Math.floor(num(raw.initialStartedPositionMs))),
+    finalPositionMs: Math.max(0, Math.floor(num(raw.finalPositionMs))),
+    acceptedCreditMs: Math.max(0, Math.floor(num(raw.acceptedCreditMs))),
+    coverageIntervals,
+    coveredMs: coverage.coveredMs,
+    coverageRatio: coverage.coverageRatio,
+    maxGapMs: coverage.maxGapMs,
+    intervalIds: [...new Set((Array.isArray(raw.intervalIds) ? raw.intervalIds : []).map(value => sanitizeId(value, 120)).filter(Boolean))].slice(-LOGICAL_COVERAGE_LIMIT),
+    segmentIds: [...new Set((Array.isArray(raw.segmentIds) ? raw.segmentIds : []).map(value => sanitizeId(value, 120)).filter(Boolean))].slice(-LOGICAL_SEGMENT_LIMIT),
+    deviceIds: [...new Set((Array.isArray(raw.deviceIds) ? raw.deviceIds : []).map(value => sanitizeId(value, 120)).filter(Boolean))].slice(-30),
+    transferCount: Math.max(0, Math.floor(num(raw.transferCount))),
+    invalidated: raw.invalidated === true,
+    invalidReason: sanitizeId(raw.invalidReason, 80),
+    reachedEndNaturally: raw.reachedEndNaturally === true,
+    completionReason: sanitizeId(raw.completionReason, 40),
+    contextVersion: Math.max(0, Math.min(1, Math.floor(num(raw.contextVersion)))),
+    quality: normalizeListenQuality(raw.quality),
+    timezoneOffsetMin: normalizeTimezoneOffsetMin(raw.timezoneOffsetMin),
+    shuffle: raw.shuffle === true,
+    favoritesOnly: raw.favoritesOnly === true,
+    favoriteAtStart: raw.favoriteAtStart === true,
+    favoriteRevisionAtStart: Math.max(0, Math.floor(num(raw.favoriteRevisionAtStart))),
+    favoriteOrderIndexAtStart: Math.max(-1, Math.floor(num(raw.favoriteOrderIndexAtStart, -1))),
+    favoriteOrderSizeAtStart: Math.max(0, Math.floor(num(raw.favoriteOrderSizeAtStart))),
+    startedAt: Math.max(0, num(raw.startedAt)),
+    completedAt: Math.max(0, num(raw.completedAt)),
+    fullReceiptId: sanitizeId(raw.fullReceiptId, 120),
+    createdAt: Math.max(0, num(raw.createdAt)),
+    updatedAt: Math.max(0, num(raw.updatedAt))
+  };
+}
+function publicLogicalListen(raw = {}) {
+  const logical = normalizeLogicalListen(raw, raw?.playerId);
+  return {
+    version: logical.version,
+    logicalSessionId: logical.logicalSessionId,
+    trackUid: logical.trackUid,
+    trackVersion: logical.trackVersion,
+    status: logical.status,
+    durationMs: logical.durationMs,
+    initialStartedPositionMs: logical.initialStartedPositionMs,
+    finalPositionMs: logical.finalPositionMs,
+    acceptedCreditMs: logical.acceptedCreditMs,
+    coveredMs: logical.coveredMs,
+    coverageRatio: logical.coverageRatio,
+    maxGapMs: logical.maxGapMs,
+    segments: logical.segmentIds.length,
+    devices: logical.deviceIds.length,
+    transferCount: logical.transferCount,
+    invalidated: logical.invalidated,
+    invalidReason: logical.invalidReason,
+    reachedEndNaturally: logical.reachedEndNaturally,
+    fullReceiptId: logical.fullReceiptId,
+    completedAt: logical.completedAt,
+    updatedAt: logical.updatedAt
+  };
+}
+async function syncLogicalListenSession(sessionRaw) {
+  const session = normalizeListenSession(sessionRaw);
+  if (!session.playerId || !session.logicalSessionId || !session.trackUid || !session.trackVersion) return null;
+  const track = listenTrackFromCatalog(session.trackUid);
+  if (track.trackVersion !== session.trackVersion) throw new Error('logical_listen_track_version_mismatch');
+  const key = logicalListenKey(session.playerId, session.logicalSessionId);
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const row = await kvGet(key);
+    const current = normalizeLogicalListen(payload(row), session.playerId);
+    if (row && (current.trackUid !== session.trackUid || current.trackVersion !== session.trackVersion)) {
+      throw new Error('logical_listen_track_mismatch');
+    }
+    if (row && current.status === 'completed') return current;
+    const knownIntervals = new Set(current.intervalIds);
+    const additions = session.creditSegments
+      .map(segment => {
+        const intervalId = `cov_${hash([session.playerId, session.logicalSessionId, session.sessionId, segment.fromObservedMs, segment.toObservedMs].join(':')).slice(0, 36)}`;
+        return {
+          intervalId,
+          sessionId: session.sessionId,
+          deviceId: session.deviceId,
+          ownerEpoch: session.ownerEpoch,
+          fromPositionMs: segment.fromPositionMs,
+          toPositionMs: segment.toPositionMs,
+          creditMs: segment.creditMs,
+          fromAt: segment.fromAt,
+          toAt: segment.toAt
+        };
+      })
+      .filter(interval => !knownIntervals.has(interval.intervalId));
+    const at = now();
+    const ended = session.status === 'completed' && session.completionReason === 'ended';
+    const first = !row || !current.logicalSessionId;
+    const invalidated = current.invalidated || session.rejectedHeartbeats > 0 || session.continuityBroken === true;
+    const next = normalizeLogicalListen({
+      ...current,
+      playerId: session.playerId,
+      logicalSessionId: session.logicalSessionId,
+      trackUid: session.trackUid,
+      trackVersion: session.trackVersion,
+      album: session.album,
+      durationMs: Math.floor(track.duration * 1000),
+      status: ended ? 'completed' : 'active',
+      initialStartedPositionMs: first ? Math.floor(session.startedPosition * 1000) : current.initialStartedPositionMs,
+      finalPositionMs: ended ? Math.floor(session.lastPosition * 1000) : Math.max(current.finalPositionMs, Math.floor(session.lastPosition * 1000)),
+      acceptedCreditMs: current.acceptedCreditMs + additions.reduce((sum, interval) => sum + interval.creditMs, 0),
+      coverageIntervals: [...current.coverageIntervals, ...additions],
+      intervalIds: [...current.intervalIds, ...additions.map(interval => interval.intervalId)],
+      segmentIds: [...current.segmentIds, session.sessionId],
+      deviceIds: [...current.deviceIds, session.deviceId],
+      transferCount: Math.max(current.transferCount, Math.max(0, current.deviceIds.includes(session.deviceId) ? current.transferCount : current.deviceIds.length)),
+      invalidated,
+      invalidReason: invalidated ? (current.invalidReason || session.lastRejectReason || 'segment_continuity') : '',
+      reachedEndNaturally: current.reachedEndNaturally || ended,
+      completionReason: ended ? 'ended' : current.completionReason,
+      contextVersion: first ? session.contextVersion : current.contextVersion,
+      quality: first ? session.quality : current.quality,
+      timezoneOffsetMin: first ? session.timezoneOffsetMin : current.timezoneOffsetMin,
+      shuffle: first ? session.shuffle : current.shuffle,
+      favoritesOnly: first ? session.favoritesOnly : current.favoritesOnly,
+      favoriteAtStart: first ? session.favoriteAtStart : current.favoriteAtStart,
+      favoriteRevisionAtStart: first ? session.favoriteRevisionAtStart : current.favoriteRevisionAtStart,
+      favoriteOrderIndexAtStart: first ? session.favoriteOrderIndexAtStart : current.favoriteOrderIndexAtStart,
+      favoriteOrderSizeAtStart: first ? session.favoriteOrderSizeAtStart : current.favoriteOrderSizeAtStart,
+      startedAt: first ? session.startedAt : current.startedAt,
+      completedAt: ended ? session.completedAt : current.completedAt,
+      createdAt: current.createdAt || session.startedAt || at,
+      updatedAt: at
+    }, session.playerId);
+    let changed = false;
+    if (!row) {
+      try {
+        await kvInsert({ pk: key, type: 'logicalListen', owner: session.playerId, expiresAt: now() + LISTEN_SESSION_RETENTION_MS, data: next });
+        changed = true;
+      } catch {}
+    } else {
+      changed = await kvCompareAndPut({ row, type: 'logicalListen', owner: session.playerId, expiresAt: now() + LISTEN_SESSION_RETENTION_MS, data: next });
+    }
+    if (changed) return next;
+  }
+  throw new Error('logical_listen_sync_conflict');
+}
+async function finalizeLogicalListen(logicalRaw) {
+  const logical = normalizeLogicalListen(logicalRaw, logicalRaw?.playerId);
+  if (!logical.playerId || !logical.logicalSessionId || logical.status !== 'completed' || !logical.reachedEndNaturally) return null;
+  const receiptId = logical.fullReceiptId || `llr_${hash([logical.playerId, logical.logicalSessionId, logical.trackUid, logical.trackVersion].join(':')).slice(0, 36)}`;
+  const receiptPk = listenReceiptKey(logical.playerId, receiptId);
+  const oldRow = await kvGet(receiptPk);
+  const oldReceipt = payload(oldRow);
+  if (oldReceipt.progressApplied === true) {
+    const progress = normalizeAchievementProgress(payload(await kvGet(achievementProgressKey(logical.playerId))), logical.playerId);
+    return { receipt: oldReceipt, progress, rewards: { enabled: true, grants: [], wallet: null }, duplicate: true };
+  }
+  const requiredCoverageMs = Math.floor(logical.durationMs * LOGICAL_COVERAGE_REQUIRED_RATIO);
+  const full = !logical.invalidated &&
+    logical.initialStartedPositionMs <= 2000 &&
+    logical.finalPositionMs >= Math.max(0, logical.durationMs - 3000) &&
+    logical.coveredMs >= requiredCoverageMs &&
+    logical.acceptedCreditMs >= requiredCoverageMs &&
+    logical.maxGapMs <= LOGICAL_COVERAGE_MAX_GAP_MS;
+  const receipt = {
+    version: LISTEN_RECEIPT_VERSION,
+    receiptId,
+    receiptKind: 'logical_full',
+    playerId: logical.playerId,
+    logicalSessionId: logical.logicalSessionId,
+    sessionId: logical.logicalSessionId,
+    deviceId: logical.deviceIds[logical.deviceIds.length - 1] || '',
+    trackUid: logical.trackUid,
+    trackVersion: logical.trackVersion,
+    album: logical.album,
+    duration: logical.durationMs / 1000,
+    startedPosition: logical.initialStartedPositionMs / 1000,
+    finalPosition: logical.finalPositionMs / 1000,
+    observedSec: Math.floor(logical.acceptedCreditMs / 1000),
+    coveredMs: logical.coveredMs,
+    coverageRatio: logical.coverageRatio,
+    maxGapMs: logical.maxGapMs,
+    valid: false,
+    full,
+    acceptedHeartbeats: logical.coverageIntervals.length,
+    rejectedHeartbeats: logical.invalidated ? 1 : 0,
+    completionReason: 'ended',
+    contextVersion: logical.contextVersion,
+    quality: logical.quality,
+    timezoneOffsetMin: logical.timezoneOffsetMin,
+    shuffle: logical.shuffle,
+    favoritesOnly: logical.favoritesOnly,
+    favoriteAtStart: logical.favoriteAtStart,
+    favoriteRevisionAtStart: logical.favoriteRevisionAtStart,
+    favoriteOrderIndexAtStart: logical.favoriteOrderIndexAtStart,
+    favoriteOrderSizeAtStart: logical.favoriteOrderSizeAtStart,
+    continuousObservedMs: logical.invalidated ? 0 : logical.acceptedCreditMs,
+    continuityBroken: logical.invalidated,
+    startedAt: logical.startedAt,
+    completedAt: logical.completedAt,
+    segments: logical.segmentIds.length,
+    devices: logical.deviceIds.length,
+    transferCount: logical.transferCount,
+    shadow: true,
+    rewardGranted: false
+  };
+  if (!oldRow) {
+    try {
+      await kvInsert({ pk: receiptPk, type: 'listenReceipt', owner: logical.playerId, expiresAt: 0, data: { ...receipt, progressApplied: false } });
+    } catch {}
+  }
+  const applied = await applyListenReceiptProgress(receipt);
+  const rewards = await reconcileAchievementRewards(logical.playerId, applied.progress);
+  const completedReceipt = { ...receipt, progressApplied: true, rewardGranted: rewards.grants.length > 0, rewardAmount: rewards.grants.reduce((sum, grant) => sum + grant.amount, 0), rewardIds: rewards.grants.map(grant => grant.achievementId) };
+  await kvPut({ pk: receiptPk, type: 'listenReceipt', owner: logical.playerId, expiresAt: 0, data: completedReceipt });
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const row = await kvGet(logicalListenKey(logical.playerId, logical.logicalSessionId));
+    if (!row) break;
+    const current = normalizeLogicalListen(payload(row), logical.playerId);
+    if (current.fullReceiptId === receiptId) break;
+    const next = normalizeLogicalListen({ ...current, fullReceiptId: receiptId, updatedAt: now() }, logical.playerId);
+    if (await kvCompareAndPut({ row, type: 'logicalListen', owner: logical.playerId, expiresAt: now() + LISTEN_SESSION_RETENTION_MS, data: next })) break;
+  }
+  return { receipt: completedReceipt, progress: applied.progress, rewards, duplicate: applied.duplicate };
 }
 function normalizeFavoriteOrderedByDevice(raw = {}) {
   const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
@@ -3181,7 +3486,10 @@ function publicListenSession(session) {
     version: data.version,
     sessionId: data.sessionId,
     deviceId: data.deviceId,
+    logicalSessionId: data.logicalSessionId,
+    ownerEpoch: data.ownerEpoch,
     trackUid: data.trackUid,
+    trackVersion: data.trackVersion,
     status: data.status,
     contextVersion: data.contextVersion,
     quality: data.quality,
@@ -3329,7 +3637,9 @@ function applyListenObservation(session, body, { completed = false, at = now() }
   }
   const creditMs = accepted ? Math.max(0, Math.floor(Math.min(gapMs, mediaDeltaMs, maxGapMs))) : 0;
   const nextObservedMs = current.observedMs + creditMs;
-  const creditSegments = creditMs > 0 ? normalizeListenCreditSegments([...current.creditSegments, { fromAt: at - gapMs, toAt: at, creditMs, fromObservedMs: current.observedMs, toObservedMs: nextObservedMs }]) : current.creditSegments;
+  const fromPositionMs = Math.max(0, Math.floor(current.lastPosition * 1000));
+  const toPositionMs = Math.max(fromPositionMs, Math.floor(position * 1000));
+  const creditSegments = creditMs > 0 ? normalizeListenCreditSegments([...current.creditSegments, { fromAt: at - gapMs, toAt: at, creditMs, fromObservedMs: current.observedMs, toObservedMs: nextObservedMs, fromPositionMs, toPositionMs }]) : current.creditSegments;
   return {
     changed: true,
     throttled: false,
@@ -3598,28 +3908,35 @@ async function applyVerifiedFeatureProgress(playerId, { receiptId, field, increm
 }
 async function finalizeListenSession(session) {
   const data = normalizeListenSession(session);
+  const logical = data.logicalSessionId ? await syncLogicalListenSession(data) : null;
   const receiptId = data.receiptId || `lr_${hash([data.playerId, data.sessionId, data.completedAt].join(':')).slice(0, 28)}`;
   const receiptPk = listenReceiptKey(data.playerId, receiptId);
   const oldReceiptRow = await kvGet(receiptPk);
   const oldReceipt = payload(oldReceiptRow);
   if (oldReceipt.progressApplied === true) {
-    const progress = normalizeAchievementProgress(payload(await kvGet(achievementProgressKey(data.playerId))), data.playerId);
-    return { receipt: oldReceipt, progress, rewards: { enabled: true, grants: [], wallet: null }, duplicate: true };
+    const logicalFinalized = logical?.status === 'completed' ? await finalizeLogicalListen(logical) : null;
+    const progress = logicalFinalized?.progress || normalizeAchievementProgress(payload(await kvGet(achievementProgressKey(data.playerId))), data.playerId);
+    return { receipt: logicalFinalized?.receipt || oldReceipt, segmentReceipt: oldReceipt, logical: logical ? publicLogicalListen(logical) : null, progress, rewards: logicalFinalized?.rewards || { enabled: true, grants: [], wallet: null }, duplicate: true };
   }
   await applyVerifiedListenTimeProgress(data);
   const observedSec = Math.max(0, Math.floor(data.observedMs / 1000));
   const progressRatio = data.duration > 0 ? data.lastPosition / data.duration : 0;
-  const valid = observedSec >= LISTEN_VALID_MIN_SEC;
+  const transferred = data.completionReason === 'ownership_transfer';
+  const valid = !transferred && observedSec >= LISTEN_VALID_MIN_SEC;
   const fullPositionToleranceSec = 3;
   const fullObservedMinSec = Math.max(LISTEN_VALID_MIN_SEC, Math.floor(data.duration * 0.95));
-  const full = data.completionReason === 'ended' && data.startedPosition <= 2 && data.lastPosition >= Math.max(0, data.duration - fullPositionToleranceSec) && observedSec >= fullObservedMinSec && data.acceptedHeartbeats > 0 && data.rejectedHeartbeats === 0 && data.continuityBroken !== true;
+  const segmentFull = !data.logicalSessionId && data.completionReason === 'ended' && data.startedPosition <= 2 && data.lastPosition >= Math.max(0, data.duration - fullPositionToleranceSec) && observedSec >= fullObservedMinSec && data.acceptedHeartbeats > 0 && data.rejectedHeartbeats === 0 && data.continuityBroken !== true;
   const receipt = {
     version: LISTEN_RECEIPT_VERSION,
     receiptId,
+    receiptKind: data.logicalSessionId ? 'device_segment' : 'legacy_session',
     playerId: data.playerId,
+    logicalSessionId: data.logicalSessionId,
     sessionId: data.sessionId,
     deviceId: data.deviceId,
+    ownerEpoch: data.ownerEpoch,
     trackUid: data.trackUid,
+    trackVersion: data.trackVersion,
     album: data.album,
     duration: data.duration,
     startedPosition: data.startedPosition,
@@ -3629,7 +3946,7 @@ async function finalizeListenSession(session) {
     finalPosition: data.lastPosition,
     progressRatio: Math.max(0, Math.min(1, progressRatio)),
     valid,
-    full,
+    full: segmentFull,
     acceptedHeartbeats: data.acceptedHeartbeats,
     rejectedHeartbeats: data.rejectedHeartbeats,
     completionReason: data.completionReason,
@@ -3654,17 +3971,26 @@ async function finalizeListenSession(session) {
       await kvInsert({ pk: receiptPk, type: 'listenReceipt', owner: data.playerId, expiresAt: 0, data: { ...receipt, progressApplied: false } });
     } catch {}
   }
-  const applied = await applyListenReceiptProgress(receipt);
-  const rewards = await reconcileAchievementRewards(data.playerId, applied.progress);
-  const completedReceipt = { ...receipt, progressApplied: true, rewardGranted: rewards.grants.length > 0, rewardAmount: rewards.grants.reduce((sum, grant) => sum + grant.amount, 0), rewardIds: rewards.grants.map(grant => grant.achievementId) };
+  const segmentApplied = await applyListenReceiptProgress(receipt);
+  const logicalFinalized = logical?.status === 'completed' ? await finalizeLogicalListen(logical) : null;
+  const progress = logicalFinalized?.progress || segmentApplied.progress;
+  const rewards = logicalFinalized?.rewards || await reconcileAchievementRewards(data.playerId, progress);
+  const completedReceipt = { ...receipt, progressApplied: true, rewardGranted: !logicalFinalized && rewards.grants.length > 0, rewardAmount: !logicalFinalized ? rewards.grants.reduce((sum, grant) => sum + grant.amount, 0) : 0, rewardIds: !logicalFinalized ? rewards.grants.map(grant => grant.achievementId) : [] };
   await kvPut({ pk: receiptPk, type: 'listenReceipt', owner: data.playerId, expiresAt: 0, data: completedReceipt });
-  return { receipt: completedReceipt, progress: applied.progress, rewards, duplicate: applied.duplicate };
+  return {
+    receipt: logicalFinalized?.receipt || completedReceipt,
+    segmentReceipt: completedReceipt,
+    logical: logical ? publicLogicalListen(logical) : null,
+    progress,
+    rewards,
+    duplicate: logicalFinalized ? logicalFinalized.duplicate : segmentApplied.duplicate
+  };
 }
 async function actionListenSessionStart(event, body) {
-  const { playerId } = await requirePlayer(event, body);
-  await enforceRateLimit({ scope: 'listen_start', actor: playerId, limit: 40, windowMs: 60 * 1000 });
   const track = listenTrackFromCatalog(body.trackUid);
-  const deviceId = sanitizeId(body.deviceId, 120) || 'web';
+  const fenced = await requirePlaybackFence(event, body, { requireTrack: true, trackUid: track.uid, trackVersion: track.trackVersion });
+  const { playerId, deviceId } = fenced.auth;
+  await enforceRateLimit({ scope: 'listen_start', actor: playerId, limit: 40, windowMs: 60 * 1000 });
   const favoriteState = normalizeFavoriteState(payload(await kvGet(favoriteStateKey(playerId))), playerId);
   const favoriteOrder = Object.values(favoriteState.items || {})
     .filter(item => item.status === 'active')
@@ -3676,7 +4002,8 @@ async function actionListenSessionStart(event, body) {
     let row = await kvGet(key);
     const current = normalizeListenSession(payload(row));
     if (row && current.status === 'active' && current.trackUid === track.uid && current.deviceId === deviceId && now() - current.lastHeartbeatAt < CFG.listenHeartbeatMaxGapMs) {
-      return { ok: true, duplicate: true, shadow: CFG.listeningReceiptsShadow, session: publicListenSession(current) };
+      const logical = await syncLogicalListenSession(current);
+      return { ok: true, duplicate: true, shadow: CFG.listeningReceiptsShadow, playback: publicPlaybackState(fenced.state, deviceId), logical: publicLogicalListen(logical), session: publicListenSession(current) };
     }
     const at = now();
     const session = normalizeListenSession({
@@ -3684,7 +4011,11 @@ async function actionListenSessionStart(event, body) {
       playerId,
       sessionId: rid('listen'),
       deviceId,
+      logicalSessionId: fenced.state.logicalSessionId,
+      ownerEpoch: fenced.state.ownerEpoch,
+      fencingTokenHash: fenced.state.fencingTokenHash,
       trackUid: track.uid,
+      trackVersion: track.trackVersion,
       album: track.album,
       duration: track.duration,
       variant: body.variant || 'audio',
@@ -3715,7 +4046,8 @@ async function actionListenSessionStart(event, body) {
       try {
         await kvInsert({ pk: key, type: 'listenActive', owner: playerId, data: session });
         await persistListenSession(session);
-        return { ok: true, duplicate: false, shadow: CFG.listeningReceiptsShadow, session: publicListenSession(session) };
+        const logical = await syncLogicalListenSession(session);
+        return { ok: true, duplicate: false, shadow: CFG.listeningReceiptsShadow, playback: publicPlaybackState(fenced.state, deviceId), logical: publicLogicalListen(logical), session: publicListenSession(session) };
       } catch {
         continue;
       }
@@ -3727,12 +4059,14 @@ async function actionListenSessionStart(event, body) {
       continue;
     }
     await persistListenSession(session);
-    return { ok: true, duplicate: false, shadow: CFG.listeningReceiptsShadow, session: publicListenSession(session) };
+    const logical = await syncLogicalListenSession(session);
+    return { ok: true, duplicate: false, shadow: CFG.listeningReceiptsShadow, playback: publicPlaybackState(fenced.state, deviceId), logical: publicLogicalListen(logical), session: publicListenSession(session) };
   }
   throw new Error('listen_session_start_conflict');
 }
 async function actionListenSessionHeartbeat(event, body) {
-  const { playerId } = await requirePlayer(event, body);
+  const fenced = await requirePlaybackFence(event, body);
+  const { playerId } = fenced.auth;
   const sessionId = sanitizeId(body.sessionId, 120);
   if (!sessionId) {
     throw new Error('listen_session_required');
@@ -3742,6 +4076,9 @@ async function actionListenSessionHeartbeat(event, body) {
     const { row, session } = resolved;
     if (!resolved.active || !row || session.sessionId !== sessionId || session.status !== 'active') {
       throw new Error('listen_session_not_active');
+    }
+    if (session.ownerEpoch !== fenced.state.ownerEpoch || session.fencingTokenHash !== fenced.state.fencingTokenHash || session.deviceId !== fenced.auth.deviceId) {
+      throw new Error('playback_owner_changed');
     }
     if (now() - session.startedAt > CFG.listenSessionMaxMs) {
       throw new Error('listen_session_expired');
@@ -3753,6 +4090,9 @@ async function actionListenSessionHeartbeat(event, body) {
     if (!(await kvCompareAndPut({ row, type: 'listenActive', owner: playerId, data: observation.session }))) {
       continue;
     }
+    await requirePlaybackFence(event, body);
+    const playback = await renewPlaybackFence(fenced.auth, body, observation.session.lastPosition);
+    const logical = await syncLogicalListenSession(observation.session);
     const appliedTime = await applyVerifiedListenTimeProgress(observation.session);
     const previousTotalSec = Math.floor(appliedTime.previousTotalListenMs / 1000);
     const currentTotalSec = appliedTime.progress.totalSec;
@@ -3771,13 +4111,16 @@ async function actionListenSessionHeartbeat(event, body) {
       loyalty: loyalty?.loyalty || null,
       wallet: loyalty?.wallet ? publicShardWallet(loyalty.wallet) : rewards.wallet ? publicShardWallet(rewards.wallet) : null,
       progress: publicAchievementProgress(appliedTime.progress),
+      playback: publicPlaybackState(playback, fenced.auth.deviceId),
+      logical: publicLogicalListen(logical),
       session: publicListenSession(observation.session)
     };
   }
   throw new Error('listen_heartbeat_conflict');
 }
 async function actionListenSessionComplete(event, body) {
-  const { playerId } = await requirePlayer(event, body);
+  const fenced = await requirePlaybackFence(event, body);
+  const { playerId } = fenced.auth;
   const sessionId = sanitizeId(body.sessionId, 120);
   if (!sessionId) {
     throw new Error('listen_session_required');
@@ -3800,6 +4143,8 @@ async function actionListenSessionComplete(event, body) {
         rewardsEnabled: !CFG.listeningReceiptsShadow,
         rewardChannels: publicRewardChannels(),
         receipt: finalized.receipt,
+        segmentReceipt: finalized.segmentReceipt || null,
+        logical: finalized.logical || null,
         rewards: finalized.rewards?.grants || [],
         loyaltyRewards: loyalty?.loyaltyRewards || [],
         loyalty: loyalty?.loyalty || null,
@@ -3809,6 +4154,9 @@ async function actionListenSessionComplete(event, body) {
     }
     if (!['active', 'replaced'].includes(current.status)) {
       throw new Error('listen_session_not_completable');
+    }
+    if (current.ownerEpoch !== fenced.state.ownerEpoch || current.fencingTokenHash !== fenced.state.fencingTokenHash || current.deviceId !== fenced.auth.deviceId) {
+      throw new Error('playback_owner_changed');
     }
     const at = now();
     const observation = applyListenObservation(current, body, { completed: true, at });
@@ -3829,6 +4177,8 @@ async function actionListenSessionComplete(event, body) {
       rewardsEnabled: !CFG.listeningReceiptsShadow,
       rewardChannels: publicRewardChannels(),
       receipt: finalized.receipt,
+      segmentReceipt: finalized.segmentReceipt || null,
+      logical: finalized.logical || null,
       rewards: finalized.rewards?.grants || [],
       loyaltyRewards: loyalty?.loyaltyRewards || [],
       loyalty: loyalty?.loyalty || null,
@@ -5649,55 +5999,27 @@ async function actionRankedMatchPrepare(event, body) {
     }
     const currentRoom = payload(currentRoomRow);
     const currentMatchId = sanitizeId(currentRoom.rankedMatchId, 120);
-    const currentMatchRow = currentMatchId
-      ? await kvGet(rankedMatchKey(currentMatchId))
-      : null;
+    const currentMatchRow = currentMatchId ? await kvGet(rankedMatchKey(currentMatchId)) : null;
     const currentMatch = payload(currentMatchRow);
-
     if (currentMatchId && !currentMatchRow) {
-      const reservationAge =
-        now() - num(currentRoom.rankedPreparedAt);
-
+      const reservationAge = now() - num(currentRoom.rankedPreparedAt);
       if (reservationAge < 3000) {
-        await new Promise(resolve =>
-          setTimeout(resolve, 100)
-        );
+        await new Promise(resolve => setTimeout(resolve, 100));
         continue;
       }
-
-      const cleared = await kvCompareAndPut({
-        row: currentRoomRow,
-        type: 'room',
-        owner: currentRoom.hostPlayerId,
-        expiresAt: num(currentRoomRow.expires_at),
-        data: {
-          ...currentRoom,
-          rankedMatchId: '',
-          rankedPreparedAt: 0,
-          updatedAt: now()
-        }
-      });
-
+      const cleared = await kvCompareAndPut({ row: currentRoomRow, type: 'room', owner: currentRoom.hostPlayerId, expiresAt: num(currentRoomRow.expires_at), data: { ...currentRoom, rankedMatchId: '', rankedPreparedAt: 0, updatedAt: now() } });
       if (!cleared) continue;
       continue;
     }
-
-    const terminal = isRankedTerminal(
-      currentMatch.status
-    );
-
+    const terminal = isRankedTerminal(currentMatch.status);
     if (currentMatchRow && !terminal) {
       matchId = currentMatchId;
       break;
     }
-
     const candidate = rid('ranked');
     const preparedAt = now();
     const candidateKey = rankedMatchKey(candidate);
-    const candidateExpiresAt =
-      num(currentRoom.reconnectUntil) ||
-      preparedAt + CFG.roomTtlMs;
-
+    const candidateExpiresAt = num(currentRoom.reconnectUntil) || preparedAt + CFG.roomTtlMs;
     try {
       await kvInsert({
         pk: candidateKey,
@@ -5711,27 +6033,9 @@ async function actionRankedMatchPrepare(event, body) {
           gameId: RANKED_GAME_ID,
           participants,
           status: 'pending',
-          rps: {
-            version: 1,
-            status: 'waiting',
-            currentRound: 1,
-            firstPlayerId: '',
-            rounds: {},
-            updatedAt: preparedAt
-          },
+          rps: { version: 1, status: 'waiting', currentRound: 1, firstPlayerId: '', rounds: {}, updatedAt: preparedAt },
           submissions: {},
-          economy: {
-            required: true,
-            status: 'locking',
-            stakeEach: RANKED_STAKE_AMOUNT,
-            escrow: RANKED_STAKE_AMOUNT * 2,
-            lockedPlayers: 0,
-            participants: 2,
-            fundedAt: 0,
-            paidAt: 0,
-            refundedAt: 0,
-            updatedAt: preparedAt
-          },
+          economy: { required: true, status: 'locking', stakeEach: RANKED_STAKE_AMOUNT, escrow: RANKED_STAKE_AMOUNT * 2, lockedPlayers: 0, participants: 2, fundedAt: 0, paidAt: 0, refundedAt: 0, updatedAt: preparedAt },
           createdAt: preparedAt,
           updatedAt: preparedAt
         }
@@ -5739,25 +6043,11 @@ async function actionRankedMatchPrepare(event, body) {
     } catch {
       continue;
     }
-
-    const changed = await kvCompareAndPut({
-      row: currentRoomRow,
-      type: 'room',
-      owner: currentRoom.hostPlayerId,
-      expiresAt: num(currentRoomRow.expires_at),
-      data: {
-        ...currentRoom,
-        rankedMatchId: candidate,
-        rankedPreparedAt: preparedAt,
-        updatedAt: preparedAt
-      }
-    });
-
+    const changed = await kvCompareAndPut({ row: currentRoomRow, type: 'room', owner: currentRoom.hostPlayerId, expiresAt: num(currentRoomRow.expires_at), data: { ...currentRoom, rankedMatchId: candidate, rankedPreparedAt: preparedAt, updatedAt: preparedAt } });
     if (!changed) {
       await kvDelete(candidateKey).catch(() => null);
       continue;
     }
-
     matchId = candidate;
     break;
   }
@@ -5844,39 +6134,17 @@ async function actionRankedMatchAbort(event, body) {
   throw new Error('ranked_abort_conflict');
 }
 async function actionRankedMatchCleanup(event, body) {
-  const admin =
-    headerValue(event, 'x-vi3-admin') ||
-    safe(body.adminSecret);
-  const scheduler =
-    headerValue(event, 'x-vi3-scheduler') ||
-    safe(body.schedulerSecret);
-
-  const adminAllowed =
-    !!CFG.adminSecret &&
-    timingSafeEqualText(admin, CFG.adminSecret);
-  const schedulerAllowed =
-    !!CFG.schedulerSecret &&
-    timingSafeEqualText(
-      scheduler,
-      CFG.schedulerSecret
-    );
-
+  const admin = headerValue(event, 'x-vi3-admin') || safe(body.adminSecret);
+  const scheduler = headerValue(event, 'x-vi3-scheduler') || safe(body.schedulerSecret);
+  const adminAllowed = !!CFG.adminSecret && timingSafeEqualText(admin, CFG.adminSecret);
+  const schedulerAllowed = !!CFG.schedulerSecret && timingSafeEqualText(scheduler, CFG.schedulerSecret);
   if (!adminAllowed && !schedulerAllowed) {
-    const error = new Error(
-      'bad_ranked_cleanup_secret'
-    );
+    const error = new Error('bad_ranked_cleanup_secret');
     error.httpStatus = 403;
     throw error;
   }
-
-  const limit = Math.max(
-    1,
-    Math.min(100, Math.floor(num(body.limit, 50)))
-  );
-  const rows = await kvPrefixOrdered(
-    'rankedMatch:',
-    limit
-  );
+  const limit = Math.max(1, Math.min(100, Math.floor(num(body.limit, 50))));
+  const rows = await kvPrefixOrdered('rankedMatch:', limit);
   const results = [];
   for (const row of rows) {
     const match = payload(row);
@@ -5943,13 +6211,20 @@ async function actionWebPushConfig(event, body) {
   return { ok: true, vapidPublicKey: CFG.vapidPublicKey, enabled: !!CFG.vapidPublicKey };
 }
 async function actionWebPushSubscribe(event, body) {
-  const { playerId } = await requirePlayer(event, body);
+  const auth = await requirePlayer(event, body);
   const sub = body.subscription || {};
   const endpoint = safe(sub.endpoint || '');
   if (!endpoint) throw new Error('push_endpoint_required');
+  const requestedDeviceId = sanitizeId(body.deviceId, 120);
+  const deviceId = auth.deviceId || requestedDeviceId;
+  if (!deviceId) throw new Error('push_device_required');
+  if (requestedDeviceId && requestedDeviceId !== deviceId) throw new Error('push_device_identity_mismatch');
   const endpointHash = hash(endpoint).slice(0, 32);
-  await kvPut({ pk: `webPushSub:${playerId}:${endpointHash}`, type: 'webPushSub', owner: playerId, expiresAt: 0, data: { playerId, endpointHash, subscription: sub, userAgent: safe(body.userAgent || '').slice(0, 220), createdAt: now(), updatedAt: now() } });
-  return { ok: true, endpointHash };
+  const key = `webPushSub:${auth.playerId}:${endpointHash}`;
+  const old = payload(await kvGet(key));
+  const at = now();
+  await kvPut({ pk: key, type: 'webPushSub', owner: auth.playerId, expiresAt: 0, data: { ...old, playerId: auth.playerId, deviceId, endpointHash, subscription: sub, userAgent: safe(body.userAgent || '').slice(0, 220), createdAt: old.createdAt || at, updatedAt: at } });
+  return { ok: true, endpointHash, deviceId };
 }
 async function actionWebPushUnsubscribe(event, body) {
   const { playerId } = await requirePlayer(event, body);
@@ -6035,48 +6310,17 @@ async function actionLanCodeRegister(event, body) {
   const ttlMs = Math.min(600000, Math.max(60000, num(body.ttlMs, 300000)));
   const createdAt = now();
   const expiresAt = createdAt + ttlMs;
-  const matchMode = ranked
-    ? 'ranked'
-    : 'casual';
-  const modeChanged =
-    room.ranked !== ranked ||
-    room.localOnly !== localOnly ||
-    room.matchMode !== matchMode;
-
+  const matchMode = ranked ? 'ranked' : 'casual';
+  const modeChanged = room.ranked !== ranked || room.localOnly !== localOnly || room.matchMode !== matchMode;
   if (modeChanged) {
     room.ranked = ranked;
     room.localOnly = localOnly;
     room.matchMode = matchMode;
     room.updatedAt = createdAt;
-
-    await kvPut({
-      pk: `room:${roomId}`,
-      type: 'room',
-      owner: room.hostPlayerId || playerId,
-      expiresAt:
-        room.reconnectUntil || expiresAt,
-      data: room
-    });
+    await kvPut({ pk: `room:${roomId}`, type: 'room', owner: room.hostPlayerId || playerId, expiresAt: room.reconnectUntil || expiresAt, data: room });
   }
   try {
-await kvInsert({
-  pk: codeKey,
-  type: 'lanCode',
-  owner: playerId,
-  expiresAt,
-  data: {
-    code,
-    roomId,
-    roomSecret,
-    gameId: room.gameId,
-    ranked,
-    localOnly,
-    matchMode,
-    hostPlayerId: playerId,
-    createdAt,
-    expiresAt
-  }
-});
+    await kvInsert({ pk: codeKey, type: 'lanCode', owner: playerId, expiresAt, data: { code, roomId, roomSecret, gameId: room.gameId, ranked, localOnly, matchMode, hostPlayerId: playerId, createdAt, expiresAt } });
   } catch {
     return { ok: false, reason: 'lan_code_taken' };
   }
@@ -6347,7 +6591,7 @@ exports.handler = async event => {
         status = 410;
       } else if (/listen_session_not_found/i.test(msg)) {
         status = 404;
-      } else if (/listen_session_(not_active|not_completable)|playback_.*(?:conflict|mismatch|state_changed|disabled|not_active)|chat_revision_conflict|ranked_.*conflict|crypto_.*(?:missing|not_ready|conflict)|chat_e2ee_disabled/i.test(msg)) {
+      } else if (/listen_session_(not_active|not_completable)|playback_.*(?:conflict|mismatch|state_changed|disabled|not_active|owner_changed|grant_required)|chat_revision_conflict|ranked_.*conflict|crypto_.*(?:missing|not_ready|conflict)|chat_e2ee_disabled/i.test(msg)) {
         status = 409;
       } else if (/required|bad_|not_found|invalid|timezone_|account_device_/i.test(msg)) {
         status = 400;

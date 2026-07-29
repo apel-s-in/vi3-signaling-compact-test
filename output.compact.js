@@ -1,660 +1,90 @@
-/* GENERATED_FROM=input.js SOURCE_SHA256=7f86b47af14295a9095f301129e3715278774f6ff2431cc3589ade0a0b92909e FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
-/**
- * common/network-bridge.js
- * Общий WebRTC DataChannel + Yandex Cloud Function signaling bridge.
- * Используется из /Games/war_hearts/ и будущих игр.
- */
-const safe = v => String(v == null ? '' : v).trim();
-const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
-const jsonParse = raw => {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
+#!/usr/bin/env node
+/* GENERATED_FROM=input.js SOURCE_SHA256=7df4cc44224ca178c9ff899816f931c790852f84a0e916cb29b1c8b7c57c2378 FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
+import fs from 'node:fs';
+import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+const execFileAsync = promisify(execFile);
+const albums = JSON.parse(fs.readFileSync('albums.json', 'utf8'))?.albums || [];
+const FULL_PATH = 'data/listen-track-catalog.json';
+const ENV_PATH = 'data/listen-track-catalog.env.json';
+const CONCURRENCY = 4;
+const safe = value => String(value == null ? '' : value).trim();
+const probe = async url => {
+  const { stdout } = await execFileAsync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration,size', '-of', 'json', url], { maxBuffer: 1024 * 1024, timeout: 120000 });
+  const format = JSON.parse(stdout || '{}')?.format || {};
+  const duration = Number(format.duration);
+  const bytes = Number(format.size);
+  if (!Number.isFinite(duration) || duration < 10 || !Number.isFinite(bytes) || bytes <= 0) {
+    throw new Error(`invalid_media_metadata:${url}`);
   }
+  return { duration: Math.round(duration * 1000) / 1000, bytes: Math.floor(bytes) };
 };
-const makeId = prefix => `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-const rpcPending = new Map();
-window.addEventListener('message', event => {
-  if (window.parent !== window && event.source !== window.parent) return;
-  const data = event.data || {};
-  if (data.kind !== 'vitrina:game-host' || data.type !== 'GC_SIGNALING_RESPONSE') return;
-  const payload = data.payload || {};
-  const requestId = safe(payload.requestId);
-  const pending = rpcPending.get(requestId);
-  if (!pending) return;
-  rpcPending.delete(requestId);
-  clearTimeout(pending.timer);
-  if (!payload.ok) {
-    const error = new Error(payload.error || 'game_rpc_failed');
-    error.status = Number(payload.status || 500);
-    pending.reject(error);
-    return;
+const mapLimit = async (items, limit, worker) => {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const run = async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await worker(items[index], index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+  return results;
+};
+const readAlbum = async album => {
+  const base = safe(album.yandex_base || album.github_base || album.base);
+  if (!base) {
+    throw new Error(`album_base_missing:${album.key}`);
   }
-  pending.resolve(payload.result || {});
-});
-const requestHost = (action, data = {}) => {
-  const bridgeId = safe(window.__GC_BRIDGE_ID);
-  if (!bridgeId || window.parent === window) {
-    return Promise.reject(new Error('game_parent_bridge_required'));
+  const baseUrl = base.endsWith('/') ? base : `${base}/`;
+  const configUrl = new URL('config.json', baseUrl);
+  const response = await fetch(configUrl);
+  if (!response.ok) {
+    throw new Error(`config_fetch_failed:${album.key}:${response.status}`);
   }
-  const requestId = makeId('rpc');
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      rpcPending.delete(requestId);
-      reject(new Error('game_rpc_timeout'));
-    }, 45000);
-    rpcPending.set(requestId, { resolve, reject, timer });
-    window.parent.postMessage({ kind: 'vitrina:game', bridgeId, capabilityToken: safe(window.__GC_CAPABILITY_TOKEN), type: 'GC_SIGNALING_REQUEST', payload: { requestId, action, data, capabilityToken: safe(window.__GC_CAPABILITY_TOKEN) } }, '*');
+  const config = await response.json();
+  const tracks = Array.isArray(config?.tracks) ? config.tracks : [];
+  return tracks.map(track => ({ uid: safe(track.uid), title: safe(track.title), album: safe(album.key), albumTitle: safe(config.albumName || album.title), hiUrl: new URL(track.audio, baseUrl).toString(), loUrl: new URL(track.audio_low, baseUrl).toString() }));
+};
+const main = async () => {
+  const albumTracks = await Promise.all(albums.map(readAlbum));
+  const tracks = albumTracks.flat();
+  if (!tracks.length) {
+    throw new Error('listen_catalog_empty');
+  }
+  const duplicate = tracks.find((track, index) => tracks.findIndex(item => item.uid === track.uid) !== index);
+  if (duplicate) {
+    throw new Error(`duplicate_track_uid:${duplicate.uid}`);
+  }
+  const rows = await mapLimit(tracks, CONCURRENCY, async track => {
+    if (!track.uid || !track.hiUrl || !track.loUrl) {
+      throw new Error(`track_metadata_missing:${track.album}:${track.title}`);
+    }
+    console.log(`PROBE ${track.uid} · ${track.title}`);
+    const [hi, lo] = await Promise.all([probe(track.hiUrl), probe(track.loUrl)]);
+    const durationDifference = Math.abs(hi.duration - lo.duration);
+    if (durationDifference > 1) {
+      throw new Error(`duration_mismatch:${track.uid}:` + `${hi.duration}:${lo.duration}`);
+    }
+    const duration = Math.max(hi.duration, lo.duration);
+    const trackVersion = crypto
+      .createHash('sha256')
+      .update(JSON.stringify({ uid: track.uid, duration, hiDuration: hi.duration, hiBytes: hi.bytes, loDuration: lo.duration, loBytes: lo.bytes }))
+      .digest('hex')
+      .slice(0, 32);
+    return { uid: track.uid, trackVersion, title: track.title, album: track.album, albumTitle: track.albumTitle, duration, hi: { duration: hi.duration, bytes: hi.bytes, url: track.hiUrl }, lo: { duration: lo.duration, bytes: lo.bytes, url: track.loUrl } };
   });
+  rows.sort((a, b) => a.album.localeCompare(b.album) || a.uid.localeCompare(b.uid));
+  const compact = Object.fromEntries(rows.map(track => [track.uid, [track.duration, track.album, track.trackVersion]]));
+  fs.mkdirSync('data', { recursive: true });
+  fs.writeFileSync(FULL_PATH, `${JSON.stringify({ version: 1, generatedAt: new Date().toISOString(), tracks: rows }, null, 2)}\n`, 'utf8');
+  fs.writeFileSync(ENV_PATH, JSON.stringify(compact), 'utf8');
+  console.log(`Generated ${rows.length} tracks`);
+  console.log(`Full: ${FULL_PATH}`);
+  console.log(`Environment: ${ENV_PATH}`);
 };
-const getIceServers = () => {
-  const custom = window.VI3_RTC_ICE_SERVERS;
-  if (Array.isArray(custom) && custom.length) return custom;
-  return [{ urls: 'stun:stun.sipnet.ru:3478' }, { urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }];
-};
-const MAX_DATA_MESSAGE_BYTES = 64 * 1024;
-const getCandidateType = candidate => {
-  const text = String(candidate?.candidate || candidate || '');
-  return (text.match(/ typ ([a-z0-9]+)/i) || [])[1] || '';
-};
-export class NetworkBridge {
-  constructor(myIdOrOptions = {}) {
-    const opts = typeof myIdOrOptions === 'object' ? myIdOrOptions : { playerId: myIdOrOptions };
-    this.gameId = safe(opts.gameId || 'generic');
-    this.playerId = safe(opts.playerId || opts.myId || '');
-    this.displayName = safe(opts.displayName || 'Игрок');
-    this.roomId = '';
-    this.roomSecret = '';
-    this.joinToken = '';
-    this.peerId = '';
-    this.remotePeerId = '';
-    this.role = '';
-    this.peer = null;
-    this.dataChannel = null;
-    this.pollTimer = 0;
-    this.heartbeatTimer = 0;
-    this.pendingIce = [];
-    this.processedSignalSeqs = new Set();
-    this.connected = false;
-    this.closed = false;
-    this.disconnectTimer = 0;
-    this.iceRestartAttempts = 0;
-    this.iceServers = getIceServers();
-    this.trickleIce = false;
-    this.iceDiagnostics = { host: false, srflx: false, relay: false, selected: '', usesTurn: false, updatedAt: 0 };
-    this.onConnect = () => {};
-    this.onDisconnect = () => {};
-    this.onData = () => {};
-    this.onChat = () => {};
-    this.onStatus = () => {};
-    this.onRoom = () => {};
-    this.onError = () => {};
-    this.onIceDiagnostics = () => {};
-  }
-  async _req(action, data = {}) {
-    let lastError = null;
-    const backoffDelays = [2000, 4000, 8000, 16000];
-    for (let attempt = 0; attempt <= backoffDelays.length; attempt++) {
-      try {
-        return await requestHost(action, { displayName: this.displayName, gameId: this.gameId, ...data });
-      } catch (error) {
-        lastError = error;
-        const message = String(error?.message || '');
-        const localBackoff = message === 'social_server_backoff_active';
-        const transient = localBackoff || error?.status === 429 || /timeout|network|unreachable|resource_exhausted|too many requests/i.test(message);
-        if (!transient || attempt >= backoffDelays.length) break;
-        const delay = localBackoff || error?.status === 429 ? backoffDelays[attempt] : Math.min(4000, 800 * (attempt + 1));
-        this._emitStatus('server backoff', false, { transient: true, action, retryInMs: delay, error: message });
-        await wait(delay);
-      }
-    }
-    throw lastError || new Error('game_rpc_failed');
-  }
-  _emitStatus(label, online = false, extra = {}) {
-    this.onStatus({ label, online, ice: this.iceDiagnostics, ...extra });
-  }
-  _markIceCandidate(candidate) {
-    const type = getCandidateType(candidate);
-    if (type === 'host') this.iceDiagnostics.host = true;
-    if (type === 'srflx') this.iceDiagnostics.srflx = true;
-    if (type === 'relay') {
-      this.iceDiagnostics.relay = true;
-      this.iceDiagnostics.usesTurn = true;
-    }
-    this.iceDiagnostics.updatedAt = Date.now();
-    this.onIceDiagnostics({ ...this.iceDiagnostics });
-  }
-  async _refreshSelectedCandidatePair() {
-    if (!this.peer?.getStats) return this.iceDiagnostics;
-    try {
-      const stats = await this.peer.getStats();
-      let selectedPair = null;
-      stats.forEach(report => {
-        if (report.type === 'transport' && report.selectedCandidatePairId) {
-          selectedPair = stats.get(report.selectedCandidatePairId);
-        }
-        if (report.type === 'candidate-pair' && report.selected) {
-          selectedPair = report;
-        }
-      });
-      if (!selectedPair) return this.iceDiagnostics;
-      const local = stats.get(selectedPair.localCandidateId);
-      const remote = stats.get(selectedPair.remoteCandidateId);
-      const localType = local?.candidateType || '';
-      const remoteType = remote?.candidateType || '';
-      this.iceDiagnostics.selected = [localType, remoteType].filter(Boolean).join('↔');
-      this.iceDiagnostics.usesTurn = localType === 'relay' || remoteType === 'relay' || this.iceDiagnostics.relay;
-      this.iceDiagnostics.updatedAt = Date.now();
-      this.onIceDiagnostics({ ...this.iceDiagnostics });
-    } catch {}
-    return this.iceDiagnostics;
-  }
-  async init() {
-    this.closed = false;
-    this._emitStatus('ready', false);
-    return true;
-  }
-  async _loadRtcConfig() {
-    try {
-      const res = await this._req('rtc_config', {});
-      if (Array.isArray(res.iceServers) && res.iceServers.length) {
-        this.iceServers = res.iceServers;
-      }
-    } catch {
-      this.iceServers = getIceServers();
-    }
-    return this.iceServers;
-  }
-  async heartbeat() {
-    return this._req('presence_heartbeat', { deviceId: 'web', gameId: this.gameId, roomId: this.roomId || '' });
-  }
-  async getLeaderboard() {
-    return this._req('leaderboard_v2_get', {});
-  }
-  async getRankedStats() {
-    return this._req('ranked_stats_get', {});
-  }
-  async prepareRankedMatch() {
-    if (!this.roomId || !this.roomSecret) {
-      throw new Error('room_required');
-    }
-    return this._req('ranked_match_prepare', { roomId: this.roomId, roomSecret: this.roomSecret });
-  }
-  async prepareRankedStake(matchId) {
-    return this._req('ranked_stake_prepare', { matchId: safe(matchId) });
-  }
-  async commitRankedRps({ matchId, round, commit } = {}) {
-    return this._req('ranked_rps_commit', { matchId: safe(matchId), round: Number(round || 1), commit: safe(commit) });
-  }
-  async revealRankedRps({ matchId, round, choice, salt } = {}) {
-    return this._req('ranked_rps_reveal', { matchId: safe(matchId), round: Number(round || 1), choice: safe(choice), salt: safe(salt) });
-  }
-  async submitRankedMatch({ matchId, submission } = {}) {
-    return this._req('ranked_match_submit', { matchId: safe(matchId), submission });
-  }
-  async getRankedMatchStatus(matchId) {
-    return this._req('ranked_match_status', { matchId: safe(matchId) });
-  }
-  async abortRankedMatch({ matchId, reason = 'disconnect' } = {}) {
-    return this._req('ranked_match_abort', { matchId: safe(matchId), reason: safe(reason) });
-  }
-  async getProfile(friendId) {
-    const result = await this._req('profile_get', { friendId: safe(friendId) });
-    return result.profile || null;
-  }
-  async sendGameInvite({ toFriendId, gameId = this.gameId, roomId, roomSecret } = {}) {
-    if (roomId && roomSecret && (this.roomId !== roomId || this.roomSecret !== roomSecret)) {
-      this.roomId = safe(roomId);
-      this.roomSecret = safe(roomSecret);
-    }
-    const join = await this.createJoinToken({ invitedPlayerId: toFriendId });
-    return this._req('push_send', { toFriendId: safe(toFriendId), kind: 'GAME_INVITE', gameId: safe(gameId), joinToken: join.token });
-  }
-  async setRoomMode({ ranked = false, localOnly = true } = {}) {
-    if (!this.roomId || !this.roomSecret) throw new Error('room_required');
-    const res = await this._req('room_set_mode', { roomId: this.roomId, roomSecret: this.roomSecret, ranked: !!ranked, localOnly: !!localOnly });
-    this.ranked = !!res.ranked;
-    this.forceLocalOnly = !!res.localOnly;
-    return res;
-  }
-  async createNearbyGameCode() {
-    if (!this.roomId) await this.connectAsHost();
-    const res = await this._req('nearby_game_create', { gameId: this.gameId, roomId: this.roomId, roomSecret: this.roomSecret, peerId: this.peerId });
-    return { ...res, roomId: this.roomId, roomSecret: this.roomSecret, joinUrl: this.buildJoinUrl() };
-  }
-  async getNearbyGame(code) {
-    return this._req('nearby_game_join', { code: safe(code).replace(/\D/g, '').slice(0, 6), gameId: this.gameId });
-  }
-  async createRoom({ createJoinToken = true } = {}) {
-    const hostPeerId = makeId('host');
-    const res = await this._req('room_create', { gameId: this.gameId, peerId: hostPeerId });
-    this.role = 'host';
-    this.roomId = res.roomId;
-    this.roomSecret = res.roomSecret;
-    this.peerId = res.hostPeerId;
-    this.remotePeerId = res.guestPeerId;
-    this.joinToken = '';
-    if (createJoinToken) {
-      const join = await this.createJoinToken();
-      this.joinToken = join.token;
-    }
-    const joinUrl = this.joinToken ? this.buildJoinUrl() : '';
-    this.onRoom({ role: this.role, roomId: this.roomId, roomSecret: this.roomSecret, joinUrl });
-    return { ...res, joinUrl };
-  }
-  async createJoinToken({ invitedPlayerId = '' } = {}) {
-    if (!this.roomId || !this.roomSecret) {
-      throw new Error('room_required');
-    }
-    return this._req('room_join_token_create', { roomId: this.roomId, roomSecret: this.roomSecret, invitedPlayerId: safe(invitedPlayerId) });
-  }
-  async joinRoom({ roomId, roomSecret }) {
-    const res = await this._req('room_join', { roomId, roomSecret });
-    this.role = 'guest';
-    this.roomId = res.roomId;
-    this.roomSecret = roomSecret;
-    this.peerId = res.guestPeerId;
-    this.remotePeerId = res.hostPeerId;
-    this.onRoom({ role: this.role, roomId: this.roomId, roomSecret: this.roomSecret });
-    return res;
-  }
-  buildJoinUrl(joinToken = this.joinToken) {
-    const u = new URL('/Games/', window.location.href);
-    u.searchParams.set('gcGame', this.gameId);
-    if (joinToken) {
-      u.searchParams.set('join', joinToken);
-    }
-    return u.toString();
-  }
-  _waitForIceGatheringComplete(timeoutMs = 4000) {
-    if (!this.peer || this.peer.iceGatheringState === 'complete') {
-      return Promise.resolve(true);
-    }
-    return new Promise(resolve => {
-      let settled = false;
-      let timer = 0;
-      const finish = complete => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        this.peer?.removeEventListener?.('icegatheringstatechange', onChange);
-        resolve(complete);
-      };
-      const onChange = () => {
-        if (this.peer?.iceGatheringState === 'complete') {
-          finish(true);
-        }
-      };
-      this.peer.addEventListener('icegatheringstatechange', onChange);
-      timer = setTimeout(() => finish(false), timeoutMs);
-    });
-  }
-  _initPeer() {
-    try {
-      this.dataChannel?.close?.();
-    } catch {}
-    try {
-      this.peer?.close?.();
-    } catch {}
-    this.peer = null;
-    this.dataChannel = null;
-    this.connected = false;
-    this.pendingIce = [];
-    this.processedSignalSeqs = new Set();
-    this.iceDiagnostics = { host: false, srflx: false, relay: false, selected: '', usesTurn: false, updatedAt: 0 };
-    // ВАЖНО: STUN всегда включён. Браузеры маскируют host-кандидаты через mDNS (.local),
-    // и без STUN два устройства в одной Wi-Fi часто не находят друг друга.
-    // srflx-кандидаты с одинаковым внешним IP всё равно дают прямое локальное соединение.
-    const peerConfig = { iceServers: this.iceServers || getIceServers(), iceCandidatePoolSize: 0, iceTransportPolicy: 'all', bundlePolicy: 'max-bundle', rtcpMuxPolicy: 'require' };
-    this.peer = new RTCPeerConnection(peerConfig);
-    this.peer.onicecandidate = event => {
-      if (!event.candidate) return;
-      this._markIceCandidate(event.candidate);
-      if (!this.trickleIce || !this.roomId || !this.remotePeerId) return;
-      this._sendSignal('ice', event.candidate).catch(error => {
-        this._emitStatus('ice retry', false, { transient: true, signalType: 'ice', error: error?.message || String(error || '') });
-      });
-    };
-    this.peer.onconnectionstatechange = () => {
-      const st = this.peer?.connectionState || 'unknown';
-      if (st === 'connected') {
-        clearTimeout(this.disconnectTimer);
-        this.disconnectTimer = 0;
-        this.iceRestartAttempts = 0;
-        this.connected = true;
-        this._refreshSelectedCandidatePair().finally(() => this._emitStatus('online', true));
-        return;
-      }
-      if (st === 'disconnected') {
-        this._emitStatus('reconnecting', false, { transient: true });
-        clearTimeout(this.disconnectTimer);
-        this.disconnectTimer = setTimeout(() => {
-          if (!this.closed && this.peer?.connectionState === 'disconnected') {
-            this.connected = false;
-            this.onDisconnect({ state: 'disconnected_timeout' });
-          }
-        }, 25000);
-        return;
-      }
-      if (st === 'failed') {
-        this.connected = false;
-        this._emitStatus('ice failed', false);
-        if (this.role === 'guest' && this.iceRestartAttempts < 1) {
-          this.iceRestartAttempts++;
-          this._restartIceWithServerConfig().catch(error => {
-            this.onError(error);
-          });
-          return;
-        }
-        if (this.role === 'host') {
-          this._emitStatus('reconnecting', false, { transient: true, waitingForRemoteRestart: true });
-          clearTimeout(this.disconnectTimer);
-          this.disconnectTimer = setTimeout(() => {
-            if (!this.closed && this.peer?.connectionState === 'failed') {
-              this.onDisconnect({ state: 'failed_timeout' });
-            }
-          }, 25000);
-          return;
-        }
-        this.onDisconnect({ state: st });
-        return;
-      }
-      if (st === 'closed') {
-        this.connected = false;
-        this._emitStatus('closed', false);
-        this.onDisconnect({ state: st });
-      }
-    };
-    this.peer.ondatachannel = event => {
-      this._bindDataChannel(event.channel);
-    };
-  }
-  _bindDataChannel(channel) {
-    this.dataChannel = channel;
-    this.dataChannel.onopen = () => {
-      this.connected = true;
-      this._startHeartbeat();
-      this.heartbeat().catch(() => null);
-      this._emitStatus('online', true);
-      this.onConnect({ roomId: this.roomId, role: this.role });
-    };
-    this.dataChannel.onclose = () => {
-      this.connected = false;
-      if (!this.closed) {
-        this.onDisconnect({ state: 'datachannel_closed' });
-      }
-    };
-    this.dataChannel.onmessage = event => {
-      if (typeof event.data !== 'string' || event.data.length > MAX_DATA_MESSAGE_BYTES) {
-        this._emitStatus('data rejected', false, { error: 'data_message_too_large' });
-        return;
-      }
-      const data = jsonParse(event.data);
-      if (!data || typeof data !== 'object') return;
-      if (data.type === 'CHAT_MESSAGE') {
-        this.onChat(data);
-      }
-      this.onData(data);
-    };
-  }
-  async _sendSignal(type, data) {
-    this._emitStatus(`send ${type}`, false, { signalType: type });
-    const res = await this._req('signal_send', { roomId: this.roomId, roomSecret: this.roomSecret, fromPeerId: this.peerId, toPeerId: this.remotePeerId, type, payload: { type, data } });
-    this._emitStatus(`${type} sent`, false, { signalType: type });
-    return res;
-  }
-  async _restartIceWithServerConfig() {
-    if (!this.peer || this.closed) {
-      throw new Error('peer_unavailable');
-    }
-    const iceServers = await this._loadRtcConfig();
-    this.peer.setConfiguration({ ...this.peer.getConfiguration(), iceServers, iceTransportPolicy: 'all' });
-    return this._makeAndSendOffer('ice-restart', { iceRestart: true });
-  }
-  async _makeAndSendOffer(reason = 'offer', options = {}) {
-    if (!this.peer || this.closed) {
-      throw new Error('peer_unavailable');
-    }
-    const offer = await this.peer.createOffer({ iceRestart: options.iceRestart === true });
-    await this.peer.setLocalDescription(offer);
-    if (!this.trickleIce) {
-      const complete = await this._waitForIceGatheringComplete();
-      if (!complete) {
-        this.trickleIce = true;
-        this._emitStatus('ice gathering slow', false, { transient: true });
-      }
-    }
-    await this._sendSignal('offer', { sdp: this.peer.localDescription, reason, iceRestart: options.iceRestart === true });
-  }
-  async _handleSignal(msg) {
-    const rawPayload = msg?.payload;
-    const payload = typeof rawPayload === 'string' ? jsonParse(rawPayload) : rawPayload;
-    const type = safe(msg?.type || payload?.type);
-    const data = msg?.data ?? payload?.data ?? null;
-    if (!this.peer || !type || !data) return;
-    if (type === 'offer') {
-      this._emitStatus('offer received', false, { signalType: 'offer' });
-      const desc = data?.sdp && typeof data.sdp === 'object' ? data.sdp : data;
-      await this.peer.setRemoteDescription(new RTCSessionDescription(desc));
-      for (const c of this.pendingIce.splice(0)) {
-        await this.peer.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
-      }
-      const answer = await this.peer.createAnswer();
-      await this.peer.setLocalDescription(answer);
-      if (!this.trickleIce) {
-        const complete = await this._waitForIceGatheringComplete();
-        if (!complete) {
-          this.trickleIce = true;
-          this._emitStatus('ice gathering slow', false, { transient: true });
-        }
-      }
-      await this._sendSignal('answer', { sdp: this.peer.localDescription });
-      return;
-    }
-    if (type === 'answer') {
-      this._emitStatus('answer received', false, { signalType: 'answer' });
-      const desc = data?.sdp && typeof data.sdp === 'object' ? data.sdp : data;
-      if (!this.peer.remoteDescription || this.peer.remoteDescription.type !== 'answer') {
-        await this.peer.setRemoteDescription(new RTCSessionDescription(desc));
-      }
-      for (const c of this.pendingIce.splice(0)) {
-        await this.peer.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
-      }
-      return;
-    }
-    if (type === 'ice') {
-      this._emitStatus('ice received', false, { signalType: 'ice' });
-      this._markIceCandidate(data);
-      if (!this.peer.remoteDescription) {
-        this.pendingIce.push(data);
-        return;
-      }
-      await this.peer.addIceCandidate(new RTCIceCandidate(data)).catch(() => {});
-    }
-  }
-  _startPolling(intervalMs = 800) {
-    this.stopPolling();
-    let busy = false;
-    let fails = 0;
-    const tick = async () => {
-      if (this.closed || !this.roomId || !this.peerId) {
-        this.pollTimer = 0;
-        return;
-      }
-      if (document.hidden) {
-        this.pollTimer = setTimeout(tick, Math.max(1600, intervalMs * 2));
-        return;
-      }
-      if (busy) {
-        this.pollTimer = setTimeout(tick, intervalMs);
-        return;
-      }
-      busy = true;
-      try {
-        const res = await this._req('signal_poll', { roomId: this.roomId, roomSecret: this.roomSecret, peerId: this.peerId });
-        fails = 0;
-        const ackSeqs = [];
-        for (const msg of res.messages || []) {
-          const seq = safe(msg?.seq);
-          if (!seq || !this.processedSignalSeqs.has(seq)) {
-            await this._handleSignal(msg);
-            if (seq) this.processedSignalSeqs.add(seq);
-          }
-          if (seq) ackSeqs.push(seq);
-        }
-        if (ackSeqs.length) {
-          await this._req('signal_ack', { roomId: this.roomId, roomSecret: this.roomSecret, peerId: this.peerId, seqs: ackSeqs });
-          if (this.processedSignalSeqs.size > 400) {
-            this.processedSignalSeqs = new Set([...this.processedSignalSeqs].slice(-200));
-          }
-        }
-      } catch (err) {
-        fails++;
-        this._emitStatus(fails > 2 ? 'signal retry' : 'signal wait', false, { transient: true, error: err?.message || String(err || '') });
-        // После открытия DataChannel signaling является вспомогательным.
-        // Его временная ошибка не означает разрыв прямого P2P-канала.
-        if (this.connected && (fails === 3 || fails % 8 === 0)) {
-          this._emitStatus('signaling degraded', true, { transient: true, error: err?.message || String(err || '') });
-        }
-      } finally {
-        busy = false;
-        const normalDelay = this.connected ? 15000 : intervalMs;
-        const backoff = Math.min(15000, normalDelay + fails * 800);
-        this.pollTimer = setTimeout(tick, fails ? backoff : normalDelay);
-      }
-    };
-    this.pollTimer = setTimeout(tick, 20);
-  }
-  stopPolling() {
-    clearTimeout(this.pollTimer);
-    this.pollTimer = 0;
-  }
-  _startHeartbeat() {
-    if (this.heartbeatTimer) return;
-    this.heartbeatTimer = setInterval(() => {
-      if (document.hidden || !this.connected) return;
-      this.heartbeat().catch(error => {
-        this._emitStatus('presence degraded', true, { transient: true, error: error?.message || String(error || '') });
-      });
-    }, 60000);
-  }
-  async connectAsHost(opts = {}) {
-    this.closed = false;
-    this.forceLocalOnly = !!opts.forceLocalOnly;
-    this.ranked = !!opts.ranked;
-    if (!this.roomId) {
-      await this.createRoom({ createJoinToken: !this.forceLocalOnly });
-    }
-    this.role = 'host';
-    if (Object.prototype.hasOwnProperty.call(opts, 'ranked') || Object.prototype.hasOwnProperty.call(opts, 'forceLocalOnly')) {
-      const mode = await this.setRoomMode({ ranked: this.ranked, localOnly: this.forceLocalOnly });
-      this.ranked = !!mode.ranked;
-      this.forceLocalOnly = !!mode.localOnly;
-    }
-    this._initPeer();
-    // Даже в LAN-режиме signaling остаётся нужен для обмена SDP/ICE.
-    // Интервал не должен создавать сотни serverless-вызовов в минуту.
-    this._startPolling(this.forceLocalOnly ? 3000 : 2000);
-    this._emitStatus(this.forceLocalOnly ? 'lan waiting' : 'waiting', false, { localOnly: this.forceLocalOnly, ranked: this.ranked });
-    return { roomId: this.roomId, roomSecret: this.roomSecret, joinUrl: this.buildJoinUrl(), localOnly: this.forceLocalOnly, ranked: this.ranked };
-  }
-  async connectAsGuest({ roomId, roomSecret, forceLocalOnly = false, ranked = false, rankedOverride = null }) {
-    this.closed = false;
-    this.forceLocalOnly = !!forceLocalOnly;
-    this.ranked = !!ranked;
-    const joined = await this.joinRoom({ roomId, roomSecret });
-    this.ranked = !!(joined?.ranked ?? this.ranked);
-    this.forceLocalOnly = !!(joined?.localOnly ?? this.forceLocalOnly);
-    if (rankedOverride !== null && !!rankedOverride !== this.ranked) {
-      throw new Error('room_mode_mismatch');
-    }
-    if (this.gameId === 'war_hearts' && this.ranked !== true) {
-      throw new Error('ranked_room_required');
-    }
-    this.role = 'guest';
-    this._initPeer();
-    // Guest первым создаёт DataChannel и отправляет initial offer.
-    const ch = this.peer.createDataChannel('game', { ordered: true });
-    this._bindDataChannel(ch);
-    await this._makeAndSendOffer('initial');
-    this._startPolling(this.forceLocalOnly ? 1200 : 1500);
-    this._emitStatus(this.forceLocalOnly ? 'lan connecting' : 'connecting', false, { localOnly: this.forceLocalOnly, ranked: this.ranked });
-    return true;
-  }
-  async connectFromUrl() {
-    const url = new URL(window.location.href);
-    const joinToken = safe(url.searchParams.get('join'));
-    if (!joinToken) return false;
-    const redeemed = await this._req('room_join_token_redeem', { joinToken });
-    if (!redeemed?.roomId || !redeemed?.roomSecret) {
-      throw new Error(redeemed?.reason || 'room_join_token_invalid');
-    }
-    await this.connectAsGuest({ roomId: redeemed.roomId, roomSecret: redeemed.roomSecret });
-    url.searchParams.delete('join');
-    window.history.replaceState(null, '', url.toString());
-    return true;
-  }
-  send(data) {
-    if (this.dataChannel?.readyState !== 'open') return false;
-    const text = JSON.stringify(data);
-    if (!text || text.length > MAX_DATA_MESSAGE_BYTES) {
-      this._emitStatus('data rejected', false, { error: 'data_message_too_large' });
-      return false;
-    }
-    this.dataChannel.send(text);
-    return true;
-  }
-  sendChat(text, from = this.displayName) {
-    return this.send({ type: 'CHAT_MESSAGE', payload: { from, text: safe(text).slice(0, 300) }, at: Date.now() });
-  }
-  // ─── LAN Wi-Fi: генерация и регистрация кодов ──────────────────────────────
-  generateLanCode() {
-    // Только цифры: легко продиктовать другу голосом.
-    let code = '';
-    for (let i = 0; i < 6; i++) code += String(Math.floor(Math.random() * 10));
-    return code;
-  }
-  async registerLanCode(code, roomId, roomSecret, ranked, localOnly = true) {
-    return this._req('lan_code_register', { code: String(code).replace(/\D/g, '').slice(0, 6), roomId, roomSecret, ranked: !!ranked, localOnly: !!localOnly, matchMode: ranked ? 'ranked' : 'casual', ttlMs: 300000 });
-  }
-  async getLanRoomByCode(code) {
-    const cleanCode = String(code || '')
-      .replace(/\D/g, '')
-      .slice(0, 6);
-    if (!cleanCode) throw new Error('lan_code_required');
-    const res = await this._req('lan_code_resolve', { code: cleanCode });
-    if (!res?.roomId || !res?.roomSecret) throw new Error('lan_room_not_found');
-    return { roomId: res.roomId, roomSecret: res.roomSecret, ranked: !!res.ranked, localOnly: !!res.localOnly, matchMode: res.matchMode || (res.ranked ? 'ranked' : 'casual'), expiresAt: res.expiresAt || 0 };
-  }
-  async close() {
-    this.closed = true;
-    this.stopPolling();
-    clearTimeout(this.disconnectTimer);
-    this.disconnectTimer = 0;
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-    this.heartbeatTimer = 0;
-    if (this.roomId && this.roomSecret) {
-      try {
-        await this._req('room_close', { roomId: this.roomId, roomSecret: this.roomSecret });
-      } catch {}
-    }
-    try {
-      this.dataChannel?.close?.();
-    } catch {}
-    try {
-      this.peer?.close?.();
-    } catch {}
-    this.peer = null;
-    this.dataChannel = null;
-    this.connected = false;
-    this.roomId = '';
-    this.roomSecret = '';
-    this.joinToken = '';
-    this.peerId = '';
-    this.remotePeerId = '';
-    this.role = '';
-    this.pendingIce = [];
-  }
-}
-export default NetworkBridge;
+main().catch(error => {
+  console.error(error);
+  process.exit(2);
+});

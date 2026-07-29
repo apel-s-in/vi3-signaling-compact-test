@@ -1,90 +1,139 @@
 #!/usr/bin/env node
-/* GENERATED_FROM=input.js SOURCE_SHA256=7df4cc44224ca178c9ff899816f931c790852f84a0e916cb29b1c8b7c57c2378 FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
+/* GENERATED_FROM=input.js SOURCE_SHA256=f04f75106ef318f1cc99c4d97f0fe468a6a99b14fcb9e2588168e9d6a74bb12d FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
 import fs from 'node:fs';
-import crypto from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-const execFileAsync = promisify(execFile);
-const albums = JSON.parse(fs.readFileSync('albums.json', 'utf8'))?.albums || [];
-const FULL_PATH = 'data/listen-track-catalog.json';
-const ENV_PATH = 'data/listen-track-catalog.env.json';
-const CONCURRENCY = 4;
-const safe = value => String(value == null ? '' : value).trim();
-const probe = async url => {
-  const { stdout } = await execFileAsync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration,size', '-of', 'json', url], { maxBuffer: 1024 * 1024, timeout: 120000 });
-  const format = JSON.parse(stdout || '{}')?.format || {};
-  const duration = Number(format.duration);
-  const bytes = Number(format.size);
-  if (!Number.isFinite(duration) || duration < 10 || !Number.isFinite(bytes) || bytes <= 0) {
-    throw new Error(`invalid_media_metadata:${url}`);
-  }
-  return { duration: Math.round(duration * 1000) / 1000, bytes: Math.floor(bytes) };
-};
-const mapLimit = async (items, limit, worker) => {
-  const results = new Array(items.length);
-  let cursor = 0;
-  const run = async () => {
-    while (cursor < items.length) {
-      const index = cursor++;
-      results[index] = await worker(items[index], index);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
-  return results;
-};
-const readAlbum = async album => {
-  const base = safe(album.yandex_base || album.github_base || album.base);
-  if (!base) {
-    throw new Error(`album_base_missing:${album.key}`);
-  }
-  const baseUrl = base.endsWith('/') ? base : `${base}/`;
-  const configUrl = new URL('config.json', baseUrl);
-  const response = await fetch(configUrl);
-  if (!response.ok) {
-    throw new Error(`config_fetch_failed:${album.key}:${response.status}`);
-  }
-  const config = await response.json();
-  const tracks = Array.isArray(config?.tracks) ? config.tracks : [];
-  return tracks.map(track => ({ uid: safe(track.uid), title: safe(track.title), album: safe(album.key), albumTitle: safe(config.albumName || album.title), hiUrl: new URL(track.audio, baseUrl).toString(), loUrl: new URL(track.audio_low, baseUrl).toString() }));
-};
-const main = async () => {
-  const albumTracks = await Promise.all(albums.map(readAlbum));
-  const tracks = albumTracks.flat();
-  if (!tracks.length) {
-    throw new Error('listen_catalog_empty');
-  }
-  const duplicate = tracks.find((track, index) => tracks.findIndex(item => item.uid === track.uid) !== index);
-  if (duplicate) {
-    throw new Error(`duplicate_track_uid:${duplicate.uid}`);
-  }
-  const rows = await mapLimit(tracks, CONCURRENCY, async track => {
-    if (!track.uid || !track.hiUrl || !track.loUrl) {
-      throw new Error(`track_metadata_missing:${track.album}:${track.title}`);
-    }
-    console.log(`PROBE ${track.uid} · ${track.title}`);
-    const [hi, lo] = await Promise.all([probe(track.hiUrl), probe(track.loUrl)]);
-    const durationDifference = Math.abs(hi.duration - lo.duration);
-    if (durationDifference > 1) {
-      throw new Error(`duration_mismatch:${track.uid}:` + `${hi.duration}:${lo.duration}`);
-    }
-    const duration = Math.max(hi.duration, lo.duration);
-    const trackVersion = crypto
-      .createHash('sha256')
-      .update(JSON.stringify({ uid: track.uid, duration, hiDuration: hi.duration, hiBytes: hi.bytes, loDuration: lo.duration, loBytes: lo.bytes }))
-      .digest('hex')
-      .slice(0, 32);
-    return { uid: track.uid, trackVersion, title: track.title, album: track.album, albumTitle: track.albumTitle, duration, hi: { duration: hi.duration, bytes: hi.bytes, url: track.hiUrl }, lo: { duration: lo.duration, bytes: lo.bytes, url: track.loUrl } };
-  });
-  rows.sort((a, b) => a.album.localeCompare(b.album) || a.uid.localeCompare(b.uid));
-  const compact = Object.fromEntries(rows.map(track => [track.uid, [track.duration, track.album, track.trackVersion]]));
-  fs.mkdirSync('data', { recursive: true });
-  fs.writeFileSync(FULL_PATH, `${JSON.stringify({ version: 1, generatedAt: new Date().toISOString(), tracks: rows }, null, 2)}\n`, 'utf8');
-  fs.writeFileSync(ENV_PATH, JSON.stringify(compact), 'utf8');
-  console.log(`Generated ${rows.length} tracks`);
-  console.log(`Full: ${FULL_PATH}`);
-  console.log(`Environment: ${ENV_PATH}`);
-};
-main().catch(error => {
-  console.error(error);
+import path from 'node:path';
+const args = Object.fromEntries(
+  process.argv.slice(2).map(arg => {
+    const [key, ...rest] = arg.replace(/^--/, '').split('=');
+    return [key, rest.length ? rest.join('=') : true];
+  })
+);
+const musicRoot = path.resolve(args['music-root'] || process.cwd());
+const friendsRoot = args['friends-root'] ? path.resolve(args['friends-root']) : null;
+const gamesRoot = args['games-root'] ? path.resolve(args['games-root']) : null;
+const warHeartsRoot = args['war-hearts-root'] ? path.resolve(args['war-hearts-root']) : null;
+const manifestPath = path.join(musicRoot, '.release/version.json');
+const checkOnly = args.check === true || args.check === 'true';
+const fail = message => {
+  console.error(`❌ ${message}`);
   process.exit(2);
+};
+const read = file => {
+  if (!fs.existsSync(file)) fail(`Файл не найден: ${file}`);
+  return fs.readFileSync(file, 'utf8');
+};
+const write = (file, value) => {
+  fs.writeFileSync(file, value, 'utf8');
+  console.log(`✅ ${path.relative(process.cwd(), file)}`);
+};
+const readManifest = () => {
+  try {
+    return JSON.parse(read(manifestPath));
+  } catch (error) {
+    fail(`Некорректный ${manifestPath}: ${error.message}`);
+  }
+};
+const currentManifest = readManifest();
+const version = String(args.version || currentManifest.appVersion || '').trim();
+const buildDate = String(args.date || (checkOnly ? currentManifest.buildDate : new Date().toISOString().slice(0, 10))).trim();
+const friendsBuild = String(args['friends-build'] || version).trim();
+const gamesBuild = String(args['games-build'] || version).trim();
+const warHeartsBuild = String(args['war-hearts-build'] || version).trim();
+if (!/^\d+\.\d+\.\d+$/.test(version)) {
+  fail(`Версия должна иметь формат X.Y.Z, получено: ${version}`);
+}
+if (!/^\d{4}-\d{2}-\d{2}$/.test(buildDate)) {
+  fail(`Дата должна иметь формат YYYY-MM-DD, получено: ${buildDate}`);
+}
+[
+  ['Friends', friendsBuild],
+  ['Games', gamesBuild],
+  ['War Hearts', warHeartsBuild]
+].forEach(([label, value]) => {
+  if (!/^\d+\.\d+\.\d+$/.test(value)) {
+    fail(`${label} build должен иметь формат X.Y.Z, получено: ${value}`);
+  }
 });
+const replaceOne = (file, pattern, replacement, label) => {
+  const source = read(file);
+  const matches = [...source.matchAll(pattern)];
+  if (matches.length !== 1) {
+    fail(`${label}: ожидалось 1 совпадение, найдено ${matches.length} в ${file}`);
+  }
+  const next = source.replace(pattern, replacement);
+  if (checkOnly) {
+    if (source !== next) {
+      fail(`${label}: версия не синхронизирована в ${file}`);
+    }
+    return;
+  }
+  if (source !== next) write(file, next);
+};
+const musicFile = relative => path.join(musicRoot, relative);
+const friendsFile = relative => {
+  if (!friendsRoot) {
+    fail('Для Friends-файла требуется --friends-root');
+  }
+  return path.join(friendsRoot, relative);
+};
+const gamesFile = relative => {
+  if (!gamesRoot) {
+    fail('Для Games-файла требуется --games-root');
+  }
+  return path.join(gamesRoot, relative);
+};
+const warHeartsFile = relative => {
+  if (!warHeartsRoot) {
+    fail('Для War Hearts-файла требуется --war-hearts-root');
+  }
+  return path.join(warHeartsRoot, relative);
+};
+const updateMusic = () => {
+  replaceOne(musicFile('scripts/core/config.js'), /APP_VERSION:\s*'[^']+',/g, `APP_VERSION: '${version}',`, 'APP_CONFIG.APP_VERSION');
+  replaceOne(musicFile('scripts/core/config.js'), /BUILD_DATE:\s*'[^']+',/g, `BUILD_DATE: '${buildDate}',`, 'APP_CONFIG.BUILD_DATE');
+  replaceOne(musicFile('service-worker.js'), /const SW_VERSION = '[^']+';/g, `const SW_VERSION = '${version}';`, 'SW_VERSION');
+  replaceOne(musicFile('index.html'), /Friends\/styles\.css\?v=[^"']+/g, `Friends/styles.css?v=${friendsBuild}`, 'Friends CSS build');
+  replaceOne(
+    musicFile('index.html'),
+    /const VERSION = String\(window\.APP_CONFIG\?\.APP_VERSION \|\| '[^']+'\), BUILD_DATE = String\(window\.APP_CONFIG\?\.BUILD_DATE \|\| '[^']+'\);/g,
+    `const VERSION = String(window.APP_CONFIG?.APP_VERSION || '${version}'), BUILD_DATE = String(window.APP_CONFIG?.BUILD_DATE || '${buildDate}');`,
+    'index.html fallback version'
+  );
+  replaceOne(musicFile('scripts/app/friends/friends-block.js'), /const FRIENDS_BUILD = '[^']+';/g, `const FRIENDS_BUILD = '${friendsBuild}';`, 'FRIENDS_BUILD');
+  replaceOne(musicFile('scripts/app/games/bridge-host.js'), /Friends\/embedded-rpc-contract\.js\?v=[^"']+/g, `Friends/embedded-rpc-contract.js?v=${friendsBuild}`, 'Music embedded Friends RPC contract');
+};
+const updateFriends = () => {
+  replaceOne(friendsFile('friends-core.js'), /\.\/friends-crypto\.js\?v=[^"']+/g, `./friends-crypto.js?v=${friendsBuild}`, 'Friends crypto module');
+  replaceOne(friendsFile('chat-text-ui.js'), /\.\/crypto-devices-ui\.js\?v=[^"']+/g, `./crypto-devices-ui.js?v=${friendsBuild}`, 'Friends crypto devices UI');
+  replaceOne(friendsFile('index.html'), /\.\/styles\.css\?v=[^"']+/g, `./styles.css?v=${friendsBuild}`, 'Friends standalone CSS');
+  replaceOne(friendsFile('index.html'), /\.\/friends-core\.js\?v=[^"']+/g, `./friends-core.js?v=${friendsBuild}`, 'Friends standalone core');
+  replaceOne(friendsFile('index.html'), /\.\/friends-ui\.js\?v=[^"']+/g, `./friends-ui.js?v=${friendsBuild}`, 'Friends standalone UI');
+  replaceOne(friendsFile('friends-ui.js'), /\.\/games-registry\.js\?v=[^"']+/g, `./games-registry.js?v=${friendsBuild}`, 'Friends games registry');
+  replaceOne(friendsFile('friends-ui.js'), /\.\/modal-adapter\.js\?v=[^"']+/g, `./modal-adapter.js?v=${friendsBuild}`, 'Friends modal adapter');
+  replaceOne(friendsFile('friends-ui.js'), /\.\/chat-text-ui\.js\?v=[^"']+/g, `./chat-text-ui.js?v=${friendsBuild}`, 'Friends chat UI');
+  replaceOne(friendsFile('friends-ui.js'), /\.\/voice-call-ui\.js\?v=[^"']+/g, `./voice-call-ui.js?v=${friendsBuild}`, 'Friends voice UI');
+};
+const updateGames = () => {
+  replaceOne(gamesFile('common/friends-embed.js'), /Friends\/embedded-rpc-contract\.js\?v=[^"']+/g, `Friends/embedded-rpc-contract.js?v=${friendsBuild}`, 'Games embedded Friends RPC contract');
+  replaceOne(gamesFile('common/friends-embed.js'), /const DEFAULT_BUILD = '[^']+';/g, `const DEFAULT_BUILD = '${friendsBuild}';`, 'Games default Friends build');
+  replaceOne(gamesFile('src/app.js'), /common\/friends-embed\.js\?v=[^"']+/g, `common/friends-embed.js?v=${gamesBuild}`, 'Games Friends embed module');
+  replaceOne(gamesFile('src/app.js'), /build: '\d+\.\d+\.\d+',/g, `build: '${friendsBuild}',`, 'Games embedded Friends UI build');
+};
+const updateWarHearts = () => {
+  replaceOne(warHeartsFile('src/app.js'), /\/Games\/common\/friends-embed\.js\?v=[^"']+/g, `/Games/common/friends-embed.js?v=${gamesBuild}`, 'War Hearts Friends embed module');
+  replaceOne(warHeartsFile('src/app.js'), /build: '\d+\.\d+\.\d+',/g, `build: '${friendsBuild}',`, 'War Hearts embedded Friends UI build');
+};
+updateMusic();
+if (friendsRoot) {
+  updateFriends();
+}
+if (gamesRoot) {
+  updateGames();
+}
+if (warHeartsRoot) {
+  updateWarHearts();
+}
+if (!checkOnly) {
+  write(manifestPath, `${JSON.stringify({ appVersion: version, buildDate, friendsBuild, gamesBuild, warHeartsBuild }, null, 2)}\n`);
+}
+console.log(checkOnly ? `✅ Версии согласованы: app=${version}, friends=${friendsBuild}, games=${gamesBuild}, warHearts=${warHeartsBuild}, date=${buildDate}` : `✅ Версии обновлены: app=${version}, friends=${friendsBuild}, games=${gamesBuild}, warHearts=${warHeartsBuild}, date=${buildDate}`);

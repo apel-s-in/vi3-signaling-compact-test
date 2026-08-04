@@ -1,161 +1,141 @@
-/* GENERATED_FROM=input.js SOURCE_SHA256=dd7d72d7773b918b63500dc5998a35b67e2c10177c86bf28a8d111367498dd34 FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
-// UID.003_(Event log truth)_(achievement state должен быть merge-safe и rebuildable)_(unlock provenance восстанавливается из ACHIEVEMENT_UNLOCK events)
-// UID.004_(Stats as cache)_(progress projection выводится из stats/event log)_(unlock/RPG/streak snapshot — компактный индекс поверх событий)
-// UID.099_(Multi-device sync model)_(achievements merge без дублей XP и потерь unlock)_(earliest unlock, max XP/level, max streak, device provenance)
-export const ACHIEVEMENT_STATE_VERSION = '1.1';
-const n = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
+/* GENERATED_FROM=input.js SOURCE_SHA256=82d19f7cd5156dd2f524d4dc519f311379662d8bddf86d272accb9460274f788 FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
+// UID.003_(Event log truth)_(event ledger v2 добавляет проверяемую цепочку событий)_(deviceSeq/prevHash/eventHash/checkpoint)
+// UID.104_(Trust and eligibility state)_(ledger health — база будущего trust/prize слоя)_(локальный прогресс не блокируется, но подозрения видны)
+// UID.109_(Yandex Cloud Functions validation layer)_(будущая server validation сможет проверять hash-chain)_(сейчас локальный фундамент без backend-зависимости)
+import { metaDB as defaultMetaDB } from './meta-db.js';
+import { normalizeEventList } from './backup-event-cleanup.js';
+export const LEDGER_CHECKPOINT_KEY = 'event_ledger_checkpoint';
+const CHAIN_ID_KEY = 'eventLedger:chainId:v1';
 const s = v => String(v == null ? '' : v).trim();
-const isObj = v => !!v && typeof v === 'object' && !Array.isArray(v);
-export const normalizeUnlockedAchievements = raw =>
-  Object.fromEntries(
-    Object.entries(isObj(raw) ? raw : {})
-      .map(([k, v]) => {
-        const ts = n(isObj(v) ? v.unlockedAt || v.timestamp || v.ts : v);
-        return [s(k), ts || Date.now()];
-      })
-      .filter(([k]) => k)
-  );
-export const normalizeAchievementProfile = raw => ({ xp: Math.max(0, n(raw?.xp)), level: Math.max(1, n(raw?.level || 1)) });
-export const normalizeAchievementStreaks = raw => ({ ...(isObj(raw) ? raw : {}), current: Math.max(0, n(raw?.current)), longest: Math.max(0, n(raw?.longest)), lastActiveDate: s(raw?.lastActiveDate || '') });
-export const normalizeAchievementUnlockMetaRow = (id, raw = {}, fallbackTs = 0) => ({
-  id: s(raw?.id || id),
-  unlockedAt: n(raw?.unlockedAt || raw?.timestamp || raw?.ts || fallbackTs) || 0,
-  eventId: s(raw?.eventId || ''),
-  sessionId: s(raw?.sessionId || ''),
-  deviceStableId: s(raw?.deviceStableId || ''),
-  deviceHash: s(raw?.deviceHash || ''),
-  deviceLabel: s(raw?.deviceLabel || ''),
-  deviceClass: s(raw?.deviceClass || ''),
-  devicePwa: !!raw?.devicePwa,
-  platform: s(raw?.platform || ''),
-  source: s(raw?.source || 'achievement_unlock')
-});
-export const normalizeAchievementUnlockMeta = (raw = {}, unlocked = {}) => {
-  const out = {};
-  Object.entries(isObj(raw) ? raw : {}).forEach(([id, row]) => {
-    const r = normalizeAchievementUnlockMetaRow(id, row, n(unlocked?.[id]));
-    if (r.id && r.unlockedAt > 0) out[r.id] = r;
-  });
-  Object.entries(unlocked || {}).forEach(([id, ts]) => {
-    const k = s(id);
-    if (k && !out[k]) out[k] = normalizeAchievementUnlockMetaRow(k, { source: 'unlocked_map' }, n(ts));
-  });
-  return out;
-};
-export const deriveAchievementUnlockMetaFromEvents = events => {
-  const out = {};
-  (Array.isArray(events) ? events : []).forEach(ev => {
-    if (s(ev?.type) !== 'ACHIEVEMENT_UNLOCK') return;
-    const id = s(ev?.data?.id);
-    if (!id) return;
-    const row = normalizeAchievementUnlockMetaRow(id, {
-      unlockedAt: n(ev?.timestamp),
-      eventId: ev?.eventId,
-      sessionId: ev?.sessionId,
-      deviceStableId: ev?.deviceStableId,
-      deviceHash: ev?.deviceHash,
-      deviceLabel: ev?.deviceLabel,
-      deviceClass: ev?.deviceClass,
-      devicePwa: ev?.devicePwa,
-      platform: ev?.platform,
-      source: 'event_log'
-    });
-    if (!row.unlockedAt) return;
-    const prev = out[id];
-    if (!prev || row.unlockedAt < prev.unlockedAt) out[id] = row;
-  });
-  return out;
-};
-export const normalizeAchievementState = raw => {
-  const unlocked = normalizeUnlockedAchievements(raw?.unlocked || raw?.achievements || {});
-  const unlockMeta = normalizeAchievementUnlockMeta(raw?.unlockMeta || raw?.unlockedMeta || {}, unlocked);
-  Object.entries(unlockMeta).forEach(([id, row]) => {
-    if (!unlocked[id] || row.unlockedAt < unlocked[id]) unlocked[id] = row.unlockedAt;
-  });
-  return { version: s(raw?.version || ACHIEVEMENT_STATE_VERSION) || ACHIEVEMENT_STATE_VERSION, updatedAt: n(raw?.updatedAt) || Date.now(), unlocked, unlockMeta, profileRpg: normalizeAchievementProfile(raw?.profileRpg || raw?.userProfileRpg || {}), streaks: normalizeAchievementStreaks(raw?.streaks || {}) };
-};
-export const buildAchievementBackupState = ({ unlocked = {}, unlockMeta = {}, profileRpg = {}, streaks = {}, events = [] } = {}) => {
-  const fromEvents = deriveAchievementUnlockMetaFromEvents(events);
-  return normalizeAchievementState({ unlocked, unlockMeta: { ...unlockMeta, ...fromEvents }, profileRpg, streaks, updatedAt: Date.now() });
-};
-const pickEarlierMeta = (a, b, id) => {
-  const aa = normalizeAchievementUnlockMetaRow(id, a),
-    bb = normalizeAchievementUnlockMetaRow(id, b);
-  if (!aa.unlockedAt) return bb;
-  if (!bb.unlockedAt) return aa;
-  if (bb.unlockedAt < aa.unlockedAt) return bb;
-  if (aa.unlockedAt < bb.unlockedAt) return aa;
-  return aa.deviceLabel || aa.eventId ? aa : bb;
-};
-export const mergeAchievementStates = (localRaw = {}, remoteRaw = {}) => {
-  const l = normalizeAchievementState(localRaw),
-    r = normalizeAchievementState(remoteRaw);
-  const unlocked = { ...l.unlocked };
-  Object.entries(r.unlocked).forEach(([id, ts]) => {
-    const a = n(unlocked[id]),
-      b = n(ts);
-    unlocked[id] = a > 0 && b > 0 ? Math.min(a, b) : b || a || Date.now();
-  });
-  const unlockMeta = { ...l.unlockMeta };
-  Object.keys({ ...l.unlockMeta, ...r.unlockMeta, ...unlocked }).forEach(id => {
-    unlockMeta[id] = pickEarlierMeta(l.unlockMeta[id], r.unlockMeta[id], id);
-    if (!unlockMeta[id]?.unlockedAt && unlocked[id]) unlockMeta[id] = normalizeAchievementUnlockMetaRow(id, { source: 'merged_unlocked_map' }, unlocked[id]);
-    if (unlockMeta[id]?.unlockedAt && (!unlocked[id] || unlockMeta[id].unlockedAt < unlocked[id])) unlocked[id] = unlockMeta[id].unlockedAt;
-  });
-  return normalizeAchievementState({
-    updatedAt: Math.max(n(l.updatedAt), n(r.updatedAt), Date.now()),
-    unlocked,
-    unlockMeta,
-    profileRpg: { xp: Math.max(n(l.profileRpg.xp), n(r.profileRpg.xp)), level: Math.max(1, n(l.profileRpg.level), n(r.profileRpg.level)) },
-    streaks: { ...l.streaks, ...r.streaks, current: Math.max(n(l.streaks.current), n(r.streaks.current)), longest: Math.max(n(l.streaks.longest), n(r.streaks.longest)), lastActiveDate: [s(l.streaks.lastActiveDate), s(r.streaks.lastActiveDate)].sort().pop() || '' }
-  });
-};
-export const applyAchievementStateToMetaDB = async (metaDB, stateRaw) => {
-  const st = normalizeAchievementState(stateRaw);
-  await Promise.all([metaDB.setGlobal('unlocked_achievements', st.unlocked), metaDB.setGlobal('achievement_unlock_meta', st.unlockMeta), metaDB.setGlobal('user_profile_rpg', st.profileRpg), metaDB.setGlobal('global_streak', st.streaks)]);
-  return st;
-};
-export const refreshAchievementEngineFromDb = async ({ metaDB, reason = 'achievement_state_refresh', forceCheck = true, silent = true } = {}) => {
-  const eng = window.achievementEngine;
-  if (!eng || !metaDB) return false;
-  const [u, m, r, st, warm] = await Promise.all([
-    metaDB.getGlobal('unlocked_achievements').catch(() => null),
-    metaDB.getGlobal('achievement_unlock_meta').catch(() => null),
-    metaDB.getGlobal('user_profile_rpg').catch(() => null),
-    metaDB.getGlobal('global_streak').catch(() => null),
-    Promise.all([metaDB.getEvents('events_warm').catch(() => []), metaDB.getEvents('events_hot').catch(() => [])]).then(([w, h]) => [...(w || []), ...(h || [])])
-  ]);
-  const fromEvents = deriveAchievementUnlockMetaFromEvents(warm);
-  const merged = mergeAchievementStates({ unlocked: u?.value || {}, unlockMeta: m?.value || {}, profileRpg: r?.value || { xp: 0, level: 1 }, streaks: st?.value || {} }, { unlocked: Object.fromEntries(Object.entries(fromEvents).map(([id, x]) => [id, x.unlockedAt])), unlockMeta: fromEvents });
-  await applyAchievementStateToMetaDB(metaDB, merged);
-  eng.unlocked = merged.unlocked;
-  eng.unlockMeta = merged.unlockMeta;
-  eng.profile = merged.profileRpg;
-  if (forceCheck && typeof eng.check === 'function') {
-    const old = !!eng._silentNotify;
-    eng._silentNotify = !!silent;
-    try {
-      await eng.check({ force: true, reason });
-    } finally {
-      eng._silentNotify = old;
-    }
-  } else {
-    eng.achievements = eng._buildUIArray?.() || eng.achievements || [];
-    eng.broadcast?.(n(st?.value?.current), { reason });
+const n = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
+export const sortObj = v =>
+  Array.isArray(v)
+    ? v.map(sortObj)
+    : !v || typeof v !== 'object'
+      ? v
+      : Object.keys(v)
+          .sort()
+          .reduce((a, k) => ((a[k] = sortObj(v[k])), a), {});
+export const stableStringify = v => JSON.stringify(sortObj(v));
+export const sha256Hex = async v => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(v || ''))))].map(b => b.toString(16).padStart(2, '0')).join('');
+const chainId = () => {
+  try {
+    let id = localStorage.getItem(CHAIN_ID_KEY);
+    if (!id) localStorage.setItem(CHAIN_ID_KEY, (id = `chain_${crypto.randomUUID()}`));
+    return id;
+  } catch {
+    return `chain_${crypto.randomUUID()}`;
   }
-  return true;
 };
-export default {
-  ACHIEVEMENT_STATE_VERSION,
-  normalizeUnlockedAchievements,
-  normalizeAchievementProfile,
-  normalizeAchievementStreaks,
-  normalizeAchievementUnlockMetaRow,
-  normalizeAchievementUnlockMeta,
-  deriveAchievementUnlockMetaFromEvents,
-  normalizeAchievementState,
-  buildAchievementBackupState,
-  mergeAchievementStates,
-  applyAchievementStateToMetaDB,
-  refreshAchievementEngineFromDb
+export const normalizeLedgerCheckpoint = raw => ({
+  version: 'ledger-v2',
+  chainId: s(raw?.chainId) || chainId(),
+  deviceSeq: Math.max(0, n(raw?.deviceSeq)),
+  headHash: s(raw?.headHash || ''),
+  deviceStableId: s(raw?.deviceStableId || localStorage.getItem('deviceStableId') || ''),
+  deviceHash: s(raw?.deviceHash || localStorage.getItem('deviceHash') || ''),
+  updatedAt: n(raw?.updatedAt) || 0,
+  repairedAt: n(raw?.repairedAt) || 0,
+  repairReason: s(raw?.repairReason || ''),
+  repairedEvents: Math.max(0, n(raw?.repairedEvents))
+});
+export const readLedgerCheckpoint = async (db = defaultMetaDB) => normalizeLedgerCheckpoint((await db.getGlobal(LEDGER_CHECKPOINT_KEY).catch(() => null))?.value || {});
+export const publishLedgerCheckpoint = cp => {
+  const row = normalizeLedgerCheckpoint(cp);
+  try {
+    if (row.chainId) localStorage.setItem(CHAIN_ID_KEY, row.chainId);
+  } catch {}
+  try {
+    window.dispatchEvent(new CustomEvent('event-ledger:checkpoint', { detail: row }));
+  } catch {}
+  return row;
 };
+export const writeLedgerCheckpoint = async (db = defaultMetaDB, cp = {}) => {
+  const row = normalizeLedgerCheckpoint(cp);
+  await db.setGlobal(LEDGER_CHECKPOINT_KEY, row);
+  return publishLedgerCheckpoint(row);
+};
+export const adoptLedgerCheckpointFromEvents = async ({ db = defaultMetaDB, deviceStableId = localStorage.getItem('deviceStableId') || '', reason = 'adopt_from_events' } = {}) => {
+  const [warmRaw, hotRaw] = await Promise.all([db.getEvents('events_warm').catch(() => []), db.getEvents('events_hot').catch(() => [])]);
+  const rows = normalizeEventList([...(warmRaw || []), ...(hotRaw || [])], { limit: 10000, sort: true, dedupeAchievementUnlocks: false, dropNoise: false })
+    .filter(e => s(e?.deviceStableId) === s(deviceStableId) && s(e?.chainId) && s(e?.eventHash) && n(e?.deviceSeq))
+    .sort((a, b) => n(a.timestamp) - n(b.timestamp) || n(a.deviceSeq) - n(b.deviceSeq));
+  const last = rows[rows.length - 1];
+  if (!last) return null;
+  return await writeLedgerCheckpoint(db, {
+    chainId: last.chainId,
+    deviceSeq: last.deviceSeq,
+    headHash: last.eventHash,
+    deviceStableId: last.deviceStableId,
+    deviceHash: last.deviceHash || localStorage.getItem('deviceHash') || '',
+    updatedAt: Date.now(),
+    repairedAt: Date.now(),
+    repairReason: reason,
+    repairedEvents: rows.length
+  });
+};
+const makeSourceClock = (ev, ts = Date.now()) => (ev?.sourceClock && typeof ev.sourceClock === 'object' ? ev.sourceClock : { clientTs: n(ev?.timestamp || ts) || ts, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '', offsetMin: new Date(n(ev?.timestamp || ts) || ts).getTimezoneOffset() });
+const ownerHash = async () => {
+  const id = s(window.YandexAuth?.getProfile?.()?.yandexId || '');
+  return id ? await sha256Hex(`ya:${id}`) : '';
+};
+export const hashEvent = async ev => {
+  const { eventHash, ...rest } = ev || {};
+  return await sha256Hex(stableStringify(rest));
+};
+export const buildLedgerEvents = async (events = [], { db = defaultMetaDB, checkpoint = null } = {}) => {
+  let cp = normalizeLedgerCheckpoint(checkpoint || (await readLedgerCheckpoint(db)));
+  const out = [],
+    ownerYandexIdHash = await ownerHash().catch(() => '');
+  for (const raw of Array.isArray(events) ? events : []) {
+    if (!raw?.eventId) continue;
+    const deviceSeq = cp.deviceSeq + 1;
+    const ev = { ...raw, sourceClock: makeSourceClock(raw, raw.timestamp), chainId: cp.chainId, deviceSeq, prevHash: cp.headHash || '', ownerYandexIdHash: raw.ownerYandexIdHash || ownerYandexIdHash };
+    ev.eventHash = await hashEvent(ev);
+    cp = normalizeLedgerCheckpoint({ ...cp, deviceSeq, headHash: ev.eventHash, deviceStableId: ev.deviceStableId || cp.deviceStableId, deviceHash: ev.deviceHash || cp.deviceHash, updatedAt: Date.now() });
+    out.push(ev);
+  }
+  return { events: out, checkpoint: cp };
+};
+export const rebuildLedgerCheckpointFromEvents = async ({ db = defaultMetaDB, reason = 'manual_repair' } = {}) => {
+  const [warmRaw, hotRaw, oldCp] = await Promise.all([db.getEvents('events_warm').catch(() => []), db.getEvents('events_hot').catch(() => []), readLedgerCheckpoint(db).catch(() => normalizeLedgerCheckpoint({}))]);
+  const warmIds = new Set((warmRaw || []).map(e => e?.eventId).filter(Boolean));
+  const hotIds = new Set((hotRaw || []).map(e => e?.eventId).filter(Boolean));
+  const merged = normalizeEventList([...(warmRaw || []), ...(hotRaw || [])], { limit: 10000, sort: true, dedupeAchievementUnlocks: false });
+  const base = normalizeLedgerCheckpoint({ ...oldCp, deviceSeq: 0, headHash: '', updatedAt: 0 });
+  const built = await buildLedgerEvents(merged, { db, checkpoint: base });
+  const byId = new Map(built.events.map(e => [e.eventId, e]));
+  const warm = [...warmIds].map(id => byId.get(id)).filter(Boolean);
+  const hot = [...hotIds]
+    .filter(id => !warmIds.has(id))
+    .map(id => byId.get(id))
+    .filter(Boolean);
+  await db.clearEvents('events_warm').catch(() => {});
+  await db.clearEvents('events_hot').catch(() => {});
+  if (warm.length) await db.addEvents(warm, 'events_warm');
+  if (hot.length) await db.addEvents(hot, 'events_hot');
+  const checkpoint = await writeLedgerCheckpoint(db, { ...built.checkpoint, repairedAt: Date.now(), repairReason: reason, repairedEvents: built.events.length });
+  try {
+    window.dispatchEvent(new CustomEvent('event-ledger:repaired', { detail: checkpoint }));
+  } catch {}
+  return { ok: true, checkpoint, events: built.events.length, warm: warm.length, hot: hot.length };
+};
+export const getLedgerHealth = async ({ db = defaultMetaDB, cloudMeta = null } = {}) => {
+  const [hot, warm, cp] = await Promise.all([db.getEvents('events_hot').catch(() => []), db.getEvents('events_warm').catch(() => []), readLedgerCheckpoint(db).catch(() => normalizeLedgerCheckpoint({}))]);
+  const all = normalizeEventList([...(warm || []), ...(hot || [])], { limit: 10000, sort: true, dedupeAchievementUnlocks: false });
+  const noHashCount = all.filter(e => !e.eventHash).length;
+  const seqs = all.map(e => n(e.deviceSeq)).filter(Boolean);
+  const maxSeqInEvents = Math.max(0, ...seqs);
+  const cloudHead = s(cloudMeta?.eventLedgerHead || '');
+  const cloudSeq = n(cloudMeta?.eventLedgerSeq);
+  const branchState = !cloudHead ? 'cloud_unknown' : cloudHead === cp.headHash ? 'same_head' : cloudSeq > cp.deviceSeq ? 'cloud_ahead_or_diverged' : 'local_ahead_or_diverged';
+  const warnings = [
+    !cp.headHash ? 'ledger checkpoint ещё не создан' : '',
+    noHashCount ? `legacy-событий без eventHash: ${noHashCount}` : '',
+    hot?.length ? `events_hot ожидают обработки: ${hot.length}` : '',
+    maxSeqInEvents > cp.deviceSeq ? 'в событиях seq выше checkpoint' : '',
+    cloudHead && cloudHead !== cp.headHash ? 'cloud ledger head отличается от локального' : ''
+  ].filter(Boolean);
+  return { checkpoint: cp, hotCount: hot?.length || 0, warmCount: warm?.length || 0, totalCount: all.length, noHashCount, maxSeqInEvents, branchState, cloudHead, cloudSeq, lastRepairAt: cp.repairedAt || 0, repairReason: cp.repairReason || '', repairedEvents: cp.repairedEvents || 0, warnings };
+};
+export default { LEDGER_CHECKPOINT_KEY, stableStringify, sha256Hex, normalizeLedgerCheckpoint, readLedgerCheckpoint, publishLedgerCheckpoint, writeLedgerCheckpoint, hashEvent, buildLedgerEvents, rebuildLedgerCheckpointFromEvents, adoptLedgerCheckpointFromEvents, getLedgerHealth };

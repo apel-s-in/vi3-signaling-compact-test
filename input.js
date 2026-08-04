@@ -1,644 +1,233 @@
-// scripts/app/friends/friends-block.js
-// UID.069/070 (Linked providers identity)_(Друзья получают identity сверху, без OAuth-токена)
-// UID.094 (No-paralysis rule)_(сбой Друзей не влияет на плеер/Game Center)
-// Тонкий адаптер: основное приложение -> внешний модуль /Friends/
-import { getSocialServerBackoffState, getSocialSession, invalidateSocialSession } from '../../core/social-session.js';
+import { createGameBridgeHost } from './bridge-host.js';
+
 const W = window;
-const D = document;
-const BASE_FRIENDS = 'https://vi3na1bita.website.yandexcloud.net/Friends';
-const FRIENDS_BUILD = '9.3.3';
-const FRIENDS_CORE_URL = `${BASE_FRIENDS}/friends-core.js?v=${FRIENDS_BUILD}`;
-const FRIENDS_UI_URL = `${BASE_FRIENDS}/friends-ui.js?v=${FRIENDS_BUILD}`;
-let _socialSessionRetryAt = 0;
-let _core = null;
-let _ui = null;
-let _container = null;
-let _bound = false;
-let _lastFriendId = '';
-let _pushTimer = 0;
-let _heartbeatTimer = 0;
-let _webPushReady = false;
-let _unread = {};
-let _pushBusy = false;
-let _pushFails = 0;
-let _heartbeatBusy = false;
-const FRIENDS_KEY = '__friends__';
-const _embeddedFriendsContexts = new Set();
-const isFriendsSectionActive = () => W.AlbumsManager?.getCurrentAlbum?.() === (W.APP_CONFIG?.SPECIAL_FRIENDS_KEY || FRIENDS_KEY);
-const isFriendsRuntimeActive = () => isFriendsSectionActive() || _embeddedFriendsContexts.size > 0;
-const stopFriendsBackgroundTasks = () => {
-  clearTimeout(_pushTimer);
-  clearInterval(_heartbeatTimer);
-  _pushTimer = 0;
-  _heartbeatTimer = 0;
-};
-const resumeFriendsBackgroundTasks = async () => {
-  if (D.hidden || !isFriendsRuntimeActive()) {
-    stopFriendsBackgroundTasks();
-    return false;
-  }
-  if (!_core?.isReady?.()) {
-    if (Date.now() < _socialSessionRetryAt) {
-      stopFriendsBackgroundTasks();
-      return false;
-    }
-    try {
-      await applyIdentity();
-    } catch {
-      stopFriendsBackgroundTasks();
-      return false;
-    }
-  }
-  if (!_core?.isReady?.()) {
-    stopFriendsBackgroundTasks();
-    return false;
-  }
-  startPresenceHeartbeat();
-  startPushPolling();
-  return true;
-};
-const friendsFeatureCards = () => `
-  <div class="friends-feature-grid">
-    <div class="friends-feature-card"><span>💬</span><div><b>Личные сообщения</b><small>Чаты, ответы, реакции и отметки доставки.</small></div></div>
-    <div class="friends-feature-card"><span>📞</span><div><b>Голосовые звонки</b><small>Прямое общение через WebRTC прямо в приложении.</small></div></div>
-    <div class="friends-feature-card"><span>🔔</span><div><b>Push-уведомления</b><small>Сообщения и звонки не потеряются, даже если приложение свёрнуто.</small></div></div>
-    <div class="friends-feature-card"><span>🎮</span><div><b>Игровые приглашения</b><small>Приглашайте друзей в «Войну Сердец» одним нажатием.</small></div></div>
-    <div class="friends-feature-card"><span>🔗</span><div><b>Добавление по ссылке</b><small>Отправьте защищённое приглашение через мессенджер или почту.</small></div></div>
-    <div class="friends-feature-card"><span>📍</span><div><b>Друг рядом</b><small>Добавляйте знакомых коротким временным кодом.</small></div></div>
-  </div>
-`;
-const renderUnauthorizedExperience = () => {
-  if (!_container) return;
-  _container.classList.add('is-unauth');
-  let box = _container.querySelector('.custom-ya-unauth');
-  if (!box) {
-    box = D.createElement('section');
-    box.className = 'custom-ya-unauth';
-    _container.appendChild(box);
-  }
-  box.innerHTML = `
-    <div class="friends-hero-icon">👥</div>
-    <div class="friends-hero-kicker">Витрина · социальный раздел</div>
-    <h3>Музыка становится ближе с друзьями</h3>
-    <p class="friends-hero-text">Общайтесь, получайте уведомления и приглашайте друзей играть вместе.</p>
-    ${friendsFeatureCards()}
-    <div class="friends-privacy-note">🔐 Вход выполняется через Яндекс. Пароль не передаётся приложению.</div>
-    <button class="yandex-auth-mainbtn friends-login-btn" type="button" data-friends-login>
-      <span class="friends-ya-letter">Я</span>
-      <span>Войти через Яндекс</span>
-    </button>
-    <small class="friends-login-note">Один Яндекс-аккаунт — один постоянный профиль друга.</small>
-  `;
-  box.querySelector('[data-friends-login]')?.addEventListener('click', () => W.YandexAuth?.login?.());
-};
-const renderFriendsServiceError = error => {
-  if (!_container) return;
-  _container.classList.add('is-unauth');
-  let box = _container.querySelector('.custom-ya-unauth');
-  if (!box) {
-    box = D.createElement('section');
-    box.className = 'custom-ya-unauth';
-    _container.appendChild(box);
-  }
-  const message = String(error?.message || 'social_service_unavailable');
-  box.innerHTML = `
-    <div class="friends-hero-icon">⚠️</div>
-    <div class="friends-hero-kicker">Временная ошибка соединения</div>
-    <h3>Раздел друзей сейчас недоступен</h3>
-    <p class="friends-hero-text">Не удалось создать защищённую социальную сессию. Музыка продолжает работать.</p>
-    <div class="friends-privacy-note">${W.Utils?.escapeHtml?.(message) || message}</div>
-    <button class="yandex-auth-mainbtn friends-login-btn" type="button" data-friends-retry>
-      <span>Повторить подключение</span>
-    </button>
-  `;
-  box.querySelector('[data-friends-retry]')?.addEventListener('click', async event => {
-    const button = event.currentTarget;
-    button.disabled = true;
-    button.textContent = 'Подключаемся...';
-    _socialSessionRetryAt = 0;
-    try {
-      await applyIdentity();
-    } catch (retryError) {
-      renderFriendsServiceError(retryError);
-    }
-  });
-};
-const renderAuthorizedExperience = () => {
-  if (!_container) return;
-  _container.classList.remove('is-unauth');
-  _container.querySelector('.custom-ya-unauth')?.remove();
-  // Панель авторизованного Friends теперь принадлежит
-  // каноническому /Friends/friends-ui.js.
-  _container.querySelector(':scope > .friends-authorized-guide')?.remove();
-};
-const loadUnread = () => {
-  try {
-    _unread = JSON.parse(localStorage.getItem('vf_unread') || '{}') || {};
-  } catch {
-    _unread = {};
-  }
-};
-const saveUnread = () => {
-  try {
-    localStorage.setItem('vf_unread', JSON.stringify(_unread));
-  } catch {}
-};
-const addUnread = (friendId, meta = {}) => {
-  if (!friendId) return;
-  const old = typeof _unread[friendId] === 'object' ? _unread[friendId] : { count: Number(_unread[friendId] || 0) };
-  _unread[friendId] = {
-    count: Number(old.count || 0) + 1,
-    name: String(meta.name || old.name || 'Друг').trim(),
-    text: String(meta.text || old.text || '')
-      .trim()
-      .slice(0, 180),
-    at: Date.now()
-  };
-  saveUnread();
-  _ui?.refresh?.();
-};
-const clearUnread = (friendId, { refresh = true } = {}) => {
-  if (!friendId || !_unread[friendId]) return;
-  delete _unread[friendId];
-  saveUnread();
-  try {
-    D.querySelectorAll(`[data-unread-chat="${CSS.escape(friendId)}"]`).forEach(node => {
-      const small = D.createElement('small');
-      small.textContent = 'не в сети';
-      node.replaceWith(small);
-    });
-  } catch {}
-  if (refresh && !D.querySelector('.vf-modal-ov')) _ui?.refresh?.();
-};
-const showMailOverlay = ({ friendId, name = 'Друг' } = {}) => {
-  if (!friendId || D.getElementById('vf-mail-ov')) return;
-  const ov = D.createElement('div');
-  ov.id = 'vf-mail-ov';
-  ov.className = 'vf-mail-ov';
-  ov.innerHTML = `
-    <div class="vf-mail-card" role="dialog" aria-modal="true">
-      <div class="vf-mail-icon">💌</div>
-      <div class="vf-mail-title">Новое сообщение</div>
-      <div class="vf-mail-from">${W.Utils?.escapeHtml?.(name) || name}</div>
-      <div class="vf-mail-text">Откройте чат, чтобы прочитать сообщение.</div>
-      <div class="vf-mail-actions">
-        <button class="vf-btn" type="button" data-vf-read>Прочитать</button>
-        <button class="vf-btn vf-sec" type="button" data-vf-later>Позже</button>
-      </div>
-    </div>
-  `;
-  D.body.appendChild(ov);
-  ov.querySelector('[data-vf-read]')?.addEventListener('click', async () => {
-    ov.remove();
-    await openFriendsChat(friendId);
-  });
-  ov.querySelector('[data-vf-later]')?.addEventListener('click', () => ov.remove());
-};
-const openFriendsVoiceCall = async (friendId, incoming = null) => {
-  if (!friendId) return false;
-  try {
-    const friendsKey = W.APP_CONFIG?.SPECIAL_FRIENDS_KEY || '__friends__';
-    if (W.AlbumsManager?.getCurrentAlbum?.() !== friendsKey) await W.AlbumsManager?.loadAlbum?.(friendsKey);
-    return !!(await _ui?.openVoiceCall?.(friendId, incoming));
-  } catch {
-    return false;
-  }
-};
-const openFriendsChat = async friendId => {
-  if (!friendId) return false;
-  try {
-    const friendsKey = W.APP_CONFIG?.SPECIAL_FRIENDS_KEY || '__friends__';
-    if (W.AlbumsManager?.getCurrentAlbum?.() !== friendsKey) await W.AlbumsManager?.loadAlbum?.(friendsKey);
-    return !!(await _ui?.openChat?.(friendId));
-  } catch {
-    return false;
-  }
-};
-const readYandexProfile = () => {
-  const ya = W.YandexAuth;
-  const active = ya?.getSessionStatus?.() === 'active' && ya?.isTokenAlive?.();
-  const p = active ? ya?.getProfile?.() || null : null;
-  return { active: !!active, yandexId: String(p?.yandexId || p?.id || '').trim(), displayName: String(p?.displayName || p?.realName || p?.login || 'Слушатель').trim(), avatar: String(p?.avatar || '').trim() };
-};
-const isStaleSessionPush = push => {
-  const t = Date.now();
-  const createdAt = Number(push.createdAt || 0);
-  const expiresAt = Number(push.expiresAt || 0);
-  const age = createdAt ? t - createdAt : 0;
-  if (expiresAt && expiresAt < t) return true;
-  if (push.kind === 'GAME_INVITE' && age > 120000) return true;
-  if (push.kind === 'VOICE_CALL' && age > 120000) return true;
-  return false;
-};
-const handlePushes = async items => {
-  for (const push of items) {
-    if (isStaleSessionPush(push)) continue;
-    if (push.kind === 'CHAT_MESSAGE') {
-      const activeChatId = _ui?.getActiveChatFriendId?.() || '';
-      if (activeChatId && activeChatId === push.fromFriendId && _ui?.pushIncomingChat?.(push)) {
-        await _core.markChatRead?.({ friendId: push.fromFriendId, msgId: push.msgId }).catch(() => null);
-        continue;
-      }
-      let name = 'Друг';
-      try {
-        const prof = await _core.getProfile(push.fromFriendId);
-        if (prof?.displayName) name = prof.displayName;
-      } catch {}
-      addUnread(push.fromFriendId, { name, text: 'Новое сообщение' });
-      showMailOverlay({ friendId: push.fromFriendId, name });
-      await _core.markChatDelivered?.({ friendId: push.fromFriendId, msgId: push.msgId }).catch(() => null);
-      W.NotificationSystem?.info?.(`💬 ${name}: новое сообщение`, 5000);
-      continue;
-    }
-    if (push.kind === 'VOICE_CALL') {
-      let name = 'Друг';
-      try {
-        const prof = await _core.getProfile(push.fromFriendId);
-        if (prof?.displayName) name = prof.displayName;
-      } catch {}
-      W.Modals?.choice?.({
-        title: '📞 Входящий звонок',
-        textHtml: `<b>${W.Utils?.escapeHtml?.(name) || name}</b> звонит вам.<br><br>Открыть голосовой чат?`,
-        actions: [
-          {
-            key: 'answer',
-            text: 'Ответить',
-            primary: true,
-            onClick: async () => {
-              const room = await _core.getRoom(push.roomId, push.roomSecret).catch(() => null);
-              if (!room?.room || room.room.status === 'closed') {
-                W.NotificationSystem?.warning?.('Звонок уже завершён');
-                return;
-              }
-              return openFriendsVoiceCall(push.fromFriendId, { callId: push.callId || push.pushId || '', roomId: push.roomId, roomSecret: push.roomSecret });
-            }
-          },
-          { key: 'reject', text: 'Отклонить', onClick: () => {} }
-        ]
-      });
-      continue;
-    }
-    if (push.kind === 'GAME_INVITE') {
-      let name = 'Друг';
-      try {
-        const prof = await _core.getProfile(push.fromFriendId);
-        if (prof?.displayName) name = prof.displayName;
-      } catch {}
-      W.Modals?.choice?.({
-        title: '🎮 Вызов на дуэль',
-        textHtml: `<b>${W.Utils?.escapeHtml?.(name) || name}</b> приглашает вас в игру <b>Война Сердец</b>.<br><br>Принять вызов?`,
-        actions: [
-          {
-            key: 'accept',
-            text: 'Принять',
-            primary: true,
-            onClick: async () => {
-              if (!push.joinToken) {
-                W.NotificationSystem?.warning?.('Игровое приглашение уже устарело');
-                return;
-              }
-              const u = new URL(W.location.href);
-              u.searchParams.set('gcGame', push.gameId);
-              u.searchParams.set('join', push.joinToken);
-              W.history.pushState(null, '', u.toString());
-              W.AlbumsManager?.loadAlbum?.(W.APP_CONFIG?.SPECIAL_GAMES_KEY || '__games__');
-              W.NotificationSystem?.success?.('Подключаемся к бою...');
-            }
-          },
-          { key: 'reject', text: 'Позже', onClick: () => {} }
-        ]
-      });
-    }
-  }
-};
-const startPresenceHeartbeat = () => {
-  clearInterval(_heartbeatTimer);
-  _heartbeatTimer = 0;
-  if (D.hidden || !isFriendsRuntimeActive() || !_core?.isReady?.() || _heartbeatBusy) return;
-  _heartbeatBusy = true;
-  _core.heartbeat({ gameId: '', roomId: '' }).catch(() => null).finally(() => {
-    _heartbeatBusy = false;
-  });
-};
-const syncWebPushIfAllowed = async () => {
-  if (!_core?.isReady?.() || !('Notification' in W) || W.Notification.permission !== 'granted') return;
-  try {
-    const mod = await import('../push/web-push.js');
-    const previous = _webPushReady;
-    const result = await mod.refreshExistingWebPushLease();
-    _webPushReady = result?.ok === true && result?.reason !== 'subscription_missing';
-    if (previous !== _webPushReady) {
-      _ui?.refresh?.();
-      if (isFriendsRuntimeActive()) startPushPolling();
-    }
-  } catch {}
-};
-const recoverPendingPushes = async () => {
-  if (D.hidden || !isFriendsRuntimeActive() || !_core?.isReady?.() || _pushBusy) return false;
-  _pushBusy = true;
-  try {
-    const items = await _core.getPushes();
-    _pushFails = 0;
-    if (items.length) {
-      await handlePushes(items);
-      await _core.ackPushes(items.map(item => item.pushId).filter(Boolean));
-    }
-    return true;
-  } catch {
-    _pushFails++;
-    return false;
-  } finally {
-    _pushBusy = false;
-  }
-};
-const startPushPolling = () => {
-  clearTimeout(_pushTimer);
-  const loop = async () => {
-    if (D.hidden || !isFriendsRuntimeActive() || !_core?.isReady?.()) {
-      stopFriendsBackgroundTasks();
-      return;
-    }
-    await recoverPendingPushes();
-    clearTimeout(_pushTimer);
-    const delay = _webPushReady ? 10 * 60 * 1000 : Math.min(90000, 60000 + _pushFails * 15000);
-    _pushTimer = setTimeout(loop, delay);
-  };
-  loop();
-};
-export const issueSocialSession = async ({ force = false } = {}) => {
-  const result = await getSocialSession({ force });
-  _socialSessionRetryAt = 0;
-  return result;
-};
-const applyIdentity = async () => {
-  if (!_core) return;
-  const prof = readYandexProfile();
-  const url = new URL(W.location.href);
-  const addId = url.searchParams.get('addFriend') || W.sessionStorage.getItem('pending_friend_id');
-  const addKey = url.searchParams.get('key') || W.sessionStorage.getItem('pending_friend_key');
-  if (!prof.active || !prof.yandexId) {
-    _core.setIdentity({ friendId: '', yandexLinked: false });
-    W.__vfIdentity = null;
-    _lastFriendId = '';
-    stopFriendsBackgroundTasks();
-    _ui?.refresh?.();
-    renderUnauthorizedExperience();
-    // Если есть инвайт, но юзер не авторизован - показываем окно и ждём входа
-    if (addId && addKey && !W.sessionStorage.getItem('pending_friend_id')) {
-      try {
-        const info = await _core.getInviteInfo(addId, addKey);
-        const inviterName = info?.fromProfile?.displayName || 'Пользователь';
-        W.Modals?.choice?.({
-          title: '👋 Заявка в друзья',
-          textHtml: `<b>${W.Utils?.escapeHtml?.(inviterName)}</b> приглашает вас в друзья.<br><br>Авторизуйтесь через Яндекс Аккаунт, чтобы принять заявку.`,
-          actions: [
-            {
-              key: 'login',
-              text: 'Войти через Яндекс',
-              primary: true,
-              onClick: () => {
-                W.sessionStorage.setItem('pending_friend_id', addId);
-                W.sessionStorage.setItem('pending_friend_key', addKey);
-                W.YandexAuth?.login?.();
-              }
-            },
-            { key: 'cancel', text: 'Отмена', onClick: () => {} }
-          ]
-        });
-      } catch (e) {
-        W.NotificationSystem?.warning?.('Приглашение устарело или недействительно');
-      }
-      url.searchParams.delete('addFriend');
-      url.searchParams.delete('key');
-      W.history.replaceState(null, '', url.toString());
-    }
-    return;
-  }
-  let session;
-  try {
-    session = await issueSocialSession();
-  } catch (error) {
-    const message = String(error?.message || '');
-    const status = Number(error?.status || 0);
-    const authFailed = status === 401 || /oauth|required|expired|bad_social_session|account_changed/i.test(message);
-    if (authFailed) {
-      invalidateSocialSession();
-    }
-    const backoff = getSocialServerBackoffState();
-    _socialSessionRetryAt = backoff.active ? backoff.retryAt : Date.now() + 30000;
-    _core.setIdentity({ friendId: '', yandexLinked: false });
-    W.__vfIdentity = null;
-    stopFriendsBackgroundTasks();
-    console.error('[Friends] social session failed:', error);
-    renderFriendsServiceError(error);
-    return false;
-  }
-  const id = _core.setIdentity({
-    friendId: session.friendId,
-    displayName: session.profile?.displayName || prof.displayName,
-    avatar: session.profile?.avatarUrl || prof.avatar,
-    yandexLinked: true,
-    socialSession: session.socialSession,
-    sessionExpiresAt: session.expiresAt,
-    deviceStableId: localStorage.getItem('deviceStableId') || ''
-  });
-  W.__vfIdentity = { friendId: id.friendId, displayName: id.displayName, avatar: id.avatar, yandexLinked: true };
-  renderAuthorizedExperience();
-  if (id?.friendId && id.friendId !== _lastFriendId) {
-    try {
-      await _core.register();
-      _lastFriendId = id.friendId;
-    } catch (error) {
-      const message = String(error?.message || 'crypto_register_failed');
-      console.error('[Friends] registration failed:', error);
-      W.NotificationSystem?.warning?.(message.includes('chat_e2ee_disabled') ? 'Защищённый чат временно отключён на сервере' : 'Не удалось зарегистрировать устройство шифрования. Повторим при следующем открытии Friends');
-    }
-    // Если есть отложенный или URL инвайт — принимаем
-    if (addId && addKey) {
-      try {
-        await _core.acceptInvite({ inviteId: addId, secret: addKey });
-        W.NotificationSystem?.success?.('Друг успешно добавлен! 🤝');
-      } catch (e) {
-        const msg = e.message === 'self_friend_forbidden' ? 'Нельзя добавить в друзья самого себя' : 'Приглашение устарело или недействительно';
-        W.NotificationSystem?.warning?.(msg);
-      }
-      W.sessionStorage.removeItem('pending_friend_id');
-      W.sessionStorage.removeItem('pending_friend_key');
-      url.searchParams.delete('addFriend');
-      url.searchParams.delete('key');
-      W.history.replaceState(null, '', url.toString());
-    }
-    _ui?.refresh?.({ force: true });
-    resumeFriendsBackgroundTasks();
-    syncWebPushIfAllowed();
-    W.Vi3WebPush = { enable: () => import('../push/web-push.js').then(m => m.enableWebPush(_core)) };
-  } else {
-    _ui?.refresh?.();
-  }
-};
-const enableWebPushFromUi = async () => {
-  if (!_core?.isReady?.()) {
-    W.NotificationSystem?.warning?.('Сначала войдите через Яндекс');
-    return { ok: false, reason: 'friends_not_ready' };
-  }
-  try {
-    const mod = await import('../push/web-push.js');
-    const res = await mod.enableWebPush(_core);
-    _webPushReady = !!res?.ok;
-    _ui?.refresh?.({ force: true });
-    return res;
-  } catch (err) {
-    return { ok: false, reason: err?.message || 'enable_failed' };
-  }
-};
-const onGameInvite = async ({ friendId, gameId }) => {
-  D.querySelector('.vf-modal-ov')?.remove();
-  const u = new URL(W.location.href);
-  u.searchParams.set('gcGame', gameId);
-  u.searchParams.set('inviteFriend', friendId);
-  W.history.pushState(null, '', u.toString());
-  W.AlbumsManager?.loadAlbum?.(W.APP_CONFIG?.SPECIAL_GAMES_KEY || '__games__');
-  W.NotificationSystem?.success?.('Запускаем игру...');
-};
-export const getFriendsWebPushEnabled = () => !!_webPushReady;
-export const enableFriendsWebPush = () => enableWebPushFromUi();
-export const setFriendsEmbeddedActive = async ({ contextId = '', active = false } = {}) => {
-  const id = String(contextId || '').trim();
-  if (!id) throw new Error('friends_embed_context_required');
-  if (active) {
-    _embeddedFriendsContexts.add(id);
-    await resumeFriendsBackgroundTasks();
-  } else {
-    _embeddedFriendsContexts.delete(id);
-    if (!isFriendsRuntimeActive()) {
-      stopFriendsBackgroundTasks();
-    }
-  }
-  return { ok: true, active: _embeddedFriendsContexts.has(id), contexts: _embeddedFriendsContexts.size };
-};
-export const getFriendsCoreService = async () => {
-  if (!_core) {
-    const { FriendsCore } = await import(FRIENDS_CORE_URL);
-    _core = new FriendsCore();
-  }
-  if (!_core.isReady()) {
-    await applyIdentity();
-  }
-  if (!_core.isReady()) {
-    throw new Error('friends_identity_required');
-  }
-  if (_core.identity?.friendId && _core.identity.friendId !== _lastFriendId) {
-    await _core.register();
-    _lastFriendId = _core.identity.friendId;
-  }
-  return _core;
-};
-const publishVoiceActivity = detail => {
-  const state = {
-    active: detail?.active === true,
-    state: String(detail?.state || ''),
-    friendId: String(detail?.friendId || ''),
-    callId: String(detail?.callId || ''),
-    updatedAt: Number(detail?.updatedAt || Date.now())
-  };
-  W.__friendsVoiceActive = state.active;
-  W.dispatchEvent(new CustomEvent('friends:voice-activity', { detail: state }));
+const esc = s => W.Utils?.escapeHtml?.(String(s || '')) || String(s || '');
+
+const fallbackConfig = {
+  status: 'off',
+  enterEnabled: false,
+  title: 'Зал Витрины',
+  eyebrow: 'Game Center',
+  message: 'Раздел временно недоступен.',
+  disabledReason: 'Вход закрыт.',
+  buttonText: 'Войти',
+  roomUrl: './Games/index.html',
+  revision: 'fallback',
+  bridgeVersion: 1
 };
 
-export const mountFriendsBlock = async ({ container } = {}) => {
-  if (!container) return false;
-  _container = container;
-  const [{ FriendsCore }, { mountFriendsUI }] = await Promise.all([import(FRIENDS_CORE_URL), import(FRIENDS_UI_URL)]);
-  _core = _core || new FriendsCore();
-  loadUnread();
-  _ui = mountFriendsUI(container, _core, {
-    onGameInvite,
-    onEnableWebPush: enableWebPushFromUi,
-    getWebPushEnabled: () => _webPushReady,
-    getUnread: friendId => {
-      const v = _unread[friendId];
-      return Number(typeof v === 'object' ? v.count : v || 0);
-    },
-    onUnreadClick: friendId => openFriendsChat(friendId),
-    onChatOpened: async friendId => {
-      await _core.markChatRead?.({ friendId }).catch(() => null);
-      clearUnread(friendId, { refresh: false });
-    },
-    onVoiceStateChange: publishVoiceActivity
-  });
-  await applyIdentity();
+const GAME_URL_PARAMS = Object.freeze([
+  'gcGame',
+  'game',
+  'inviteFriend',
+  'join',
+  'room',
+  'key',
+  'secret'
+]);
+
+const clearGameUrlParams = ({
+  replace = true
+} = {}) => {
   const url = new URL(W.location.href);
-  const chatWith = url.searchParams.get('chatWith');
-  const voiceWith = url.searchParams.get('voiceWith');
-  if (chatWith && _core?.isReady?.()) {
-    setTimeout(() => openFriendsChat(chatWith), 350);
-    url.searchParams.delete('chatWith');
-    url.searchParams.delete('openFriends');
+  let changed = false;
+
+  GAME_URL_PARAMS.forEach(key => {
+    if (!url.searchParams.has(key)) return;
+    url.searchParams.delete(key);
+    changed = true;
+  });
+
+  if (changed && replace) {
     W.history.replaceState(null, '', url.toString());
   }
-  if (voiceWith && _core?.isReady?.()) {
-    resumeFriendsBackgroundTasks();
-    ['voiceWith', 'callId', 'openFriends'].forEach(key => url.searchParams.delete(key));
-    W.history.replaceState(null, '', url.toString());
+
+  return changed;
+};
+
+const loadConfig = async () => {
+  try {
+    const m = await import(`./config.js?gc-hard=${Date.now()}`);
+    return m.normalizeGameCenterSwitch?.(m.GAME_CENTER_SWITCH || m.default) || m.default || fallbackConfig;
+  } catch {
+    return fallbackConfig;
   }
-  if (!_bound) {
-    _bound = true;
-    W.addEventListener('yandex:auth:changed', () => {
-      applyIdentity().catch(() => {});
+};
+
+const getInviteParams = () => {
+  const params = new URLSearchParams(W.location.search);
+  const gcGame =
+    params.get('gcGame') ||
+    params.get('game') ||
+    '';
+  const joinToken = params.get('join') || '';
+  const inviteFriend = params.get('inviteFriend') || '';
+
+  return {
+    hasInvite:
+      gcGame === 'war_hearts' &&
+      !!joinToken,
+    isSendingInvite:
+      gcGame === 'war_hearts' &&
+      !!inviteFriend,
+    gcGame,
+    joinToken,
+    inviteFriend
+  };
+};
+
+const makeRoomUrl = cfg => {
+  const url = new URL(String(cfg.roomUrl || './Games/index.html'), W.location.href);
+  const invite = getInviteParams();
+
+  url.searchParams.set('bridge', '1');
+  url.searchParams.set('rev', cfg.revision || 'dev');
+
+  if (invite.hasInvite) {
+    url.searchParams.set('gcGame', invite.gcGame);
+    url.searchParams.set('join', invite.joinToken);
+  } else if (invite.isSendingInvite) {
+    url.searchParams.set('gcGame', invite.gcGame);
+    url.searchParams.set('inviteFriend', invite.inviteFriend);
+  }
+
+  return url.toString();
+};
+
+  const render = ({ cfg, mounted = false } = {}) => {
+    const canEnter = cfg.status === 'on' && cfg.enterEnabled;
+    const invite = getInviteParams();
+    const buttonText = invite.hasInvite ? 'Принять приглашение' : (invite.isSendingInvite ? 'Запустить и пригласить' : esc(cfg.buttonText));
+    const message = invite.hasInvite
+      ? 'Вас пригласили в сетевую игру. Можно войти как гость или авторизоваться, чтобы позже сохранять прогресс.'
+      : (invite.isSendingInvite ? 'Запустите игру, чтобы отправить вызов.' : esc(cfg.message));
+
+    return `<section class="gc-host" data-gc-status="${esc(cfg.status)}">
+      <div class="gc-panel">
+        <div class="gc-panel-kicker">${esc(cfg.eyebrow)}</div>
+        <div class="gc-panel-title">${esc(cfg.title)}</div>
+        <div class="gc-panel-text">${message}</div>
+        ${!canEnter ? `<div class="gc-panel-note">${esc(cfg.disabledReason)}</div>` : ''}
+        <button class="gc-enter-btn" type="button" data-gc-enter ${canEnter ? '' : 'disabled'}>${mounted ? 'Комната открыта' : buttonText}</button>
+        ${invite.hasInvite && !mounted ? `<button class="gc-enter-btn" type="button" data-gc-decline style="background:transparent; border:1px solid rgba(255,49,89,0.4); color:#ff3159; box-shadow:none; margin-top:8px;">Отклонить</button>` : ''}
+        <div class="gc-devline">rev: ${esc(cfg.revision)} · bridge v${Number(cfg.bridgeVersion || 1)}</div>
+      </div>
+      <div class="gc-frame-wrap" id="gc-frame-wrap" hidden></div>
+    </section>`;
+  };
+
+  export const renderGameCenterHost = async ({ container } = {}) => {
+    if (!container) return false;
+    const cfg = await loadConfig();
+
+    try {
+      const { shardWallet } = await import('../shards/wallet-service.js');
+      await shardWallet.refresh();
+    } catch {}
+
+    let bridge = null;
+    container.innerHTML = render({ cfg });
+
+    const btn = container.querySelector('[data-gc-enter]');
+    const declineBtn = container.querySelector('[data-gc-decline]');
+    const frameWrap = container.querySelector('#gc-frame-wrap');
+
+    declineBtn?.addEventListener('click', () => {
+      clearGameUrlParams();
+      renderGameCenterHost({ container });
     });
-    D.addEventListener('visibilitychange', () => {
-      if (D.hidden) {
-        stopFriendsBackgroundTasks();
-        return;
+
+    const mountGameCenter = () => {
+      if (btn?.disabled || !frameWrap) return;
+      const host = container.querySelector('.gc-host');
+      const panel = container.querySelector('.gc-panel');
+      const invite = getInviteParams();
+
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Открываем...';
       }
-      if (isFriendsRuntimeActive() && _core?.isReady?.()) {
-        resumeFriendsBackgroundTasks();
-        _ui?.refresh?.();
+
+      host?.classList.add('is-mounted');
+      W.__gameActivity = {
+        active: true,
+        state: 'active',
+        gameId: invite.gcGame || 'game_center',
+        updatedAt: Date.now()
+      };
+      W.dispatchEvent(new CustomEvent('game:activity', {
+        detail: { ...W.__gameActivity }
+      }));
+      if (panel) panel.hidden = true;
+
+      frameWrap.hidden = false;
+      frameWrap.innerHTML = `
+        <div class="gc-launch-cover">
+          <div class="gc-launch-logo">💔</div>
+          <b>${invite.hasInvite ? 'Подключаемся к вызову' : invite.isSendingInvite ? 'Готовим приглашение' : 'Открываем Зал Витрины'}</b>
+          <span>Соединение будет настроено автоматически...</span>
+        </div>
+        <iframe class="gc-frame" title="Game Center" src="${esc(makeRoomUrl(cfg))}" sandbox="allow-scripts allow-forms allow-popups" allow="fullscreen" allowfullscreen referrerpolicy="no-referrer"></iframe>
+      `;
+      const iframe = frameWrap.querySelector('iframe');
+
+      // Сразу стираем параметр из родительского URL, чтобы при обновлении страницы (F5) не отправить дубль-вызов
+      if (invite.hasInvite || invite.isSendingInvite) {
+        clearGameUrlParams();
       }
-    });
-    W.addEventListener('album:changed', event => {
-      const friendsKey = W.APP_CONFIG?.SPECIAL_FRIENDS_KEY || FRIENDS_KEY;
-      if (event.detail?.key !== friendsKey && !_embeddedFriendsContexts.size) {
-        stopFriendsBackgroundTasks();
-        _core?.invalidateFriendsSnapshot?.('friends_screen_closed');
-        return;
-      }
-      resumeFriendsBackgroundTasks();
-      if (event.detail?.key === friendsKey) {
-        _ui?.refresh?.();
-      }
-    });
-    const onSwPushClick = async event => {
-      const data = event.data || {};
-      if (data.type === 'PUSH_NOTIFICATION_RECEIVED') {
-        if (['FRIENDS_CHANGED', 'FRIEND_ADDED', 'FRIEND_REMOVED'].includes(String(data.kind || ''))) {
-          _core?.invalidateFriendsSnapshot?.(`webpush:${data.kind}`);
-          if (isFriendsRuntimeActive()) _ui?.refresh?.({ force: true });
-        }
-        if (isFriendsRuntimeActive()) recoverPendingPushes().catch(() => null);
-        return;
-      }
-      if (data.type !== 'PUSH_NOTIFICATION_CLICK') return;
-      try {
-        const url = new URL(data.url || W.location.href, W.location.href);
-        const kind = String(data.kind || '');
-        if (kind === 'CHAT_MESSAGE') {
-          const friendId = url.searchParams.get('chatWith') || data.fromFriendId || '';
-          if (friendId) await openFriendsChat(friendId);
-          return;
-        }
-        if (kind === 'VOICE_CALL' || kind === 'GAME_INVITE') {
-          const friendsKey = W.APP_CONFIG?.SPECIAL_FRIENDS_KEY || FRIENDS_KEY;
-          if (!isFriendsSectionActive()) {
-            await W.AlbumsManager?.loadAlbum?.(friendsKey);
+
+      iframe?.addEventListener('load', () => {
+        frameWrap.querySelector('.gc-launch-cover')?.remove();
+      }, { once: true });
+
+      bridge?.destroy?.();
+    bridge = createGameBridgeHost({
+      iframe,
+      config: cfg,
+      onState: st => {
+        if (st?.state === 'closed_by_game') {
+          bridge?.destroy?.();
+          bridge = null;
+          try {
+            clearGameUrlParams();
+          } catch {}
+
+          try {
+            W.eventLogger?.log?.('FEATURE_USED', 'global', { feature: 'game_center_exit', revision: cfg.revision });
+            W.dispatchEvent(new CustomEvent('analytics:forceFlush'));
+          } catch {}
+
+            frameWrap.hidden = true;
+            frameWrap.innerHTML = '';
+            host?.classList.remove('is-mounted');
+            if (panel) panel.hidden = false;
+            btn.disabled = false;
+            btn.textContent = getInviteParams().hasInvite ? 'Принять приглашение' : esc(cfg.buttonText);
+
+            // Если хост был перенесен в body при сворачивании, удаляем его
+            if (host && host.parentElement === document.body) {
+              host.remove();
+            }
           }
-          await resumeFriendsBackgroundTasks();
         }
-      } catch {}
+    });
+
+    try {
+      W.eventLogger?.log?.('FEATURE_USED', 'global', { feature: 'game_center_enter', revision: cfg.revision });
+      W.dispatchEvent(new CustomEvent('analytics:forceFlush'));
+    } catch {}
+
+    if (btn) btn.textContent = 'Комната открыта';
     };
-    navigator.serviceWorker?.addEventListener?.('message', onSwPushClick);
-    W.addEventListener('message', onSwPushClick);
-  }
+
+    btn?.addEventListener('click', mountGameCenter);
+
+    const invite = getInviteParams();
+    if (invite.hasInvite || invite.isSendingInvite) {
+      setTimeout(mountGameCenter, 80);
+    }
+
   return true;
 };
-export default { mountFriendsBlock };
+
+export default { renderGameCenterHost };

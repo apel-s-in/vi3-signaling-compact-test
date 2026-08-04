@@ -1,79 +1,92 @@
-// UID.094_(No-paralysis rule)_(ошибка рендера иконок не влияет на playback)_(renderer создаёт только HTML навигации)
-// UID.096_(Helper-first anti-duplication policy)_(HTML и source resolution иконок вынесены из AlbumsManager)_(albums.js остаётся владельцем навигации)
+// UID.001_(Playback safety invariant)_(обычный album click запускает трек только по явному действию пользователя)_(никаких pause/stop побочных эффектов)
+// UID.002_(UID-first core)_(действия строки адресуются через uid и albumKey)_(индекс используется только для UI)
+// UID.096_(Helper-first anti-duplication policy)_(⭐, F-конфликт и запуск трека вынесены из AlbumsManager)
 
-const isSpecialKey = key => String(key || '').startsWith('__');
+import { setFavoriteStarState } from '../../ui/icon-utils.js';
+import {
+  makeFavoritesOnlyAfterPlay,
+  playWithFavoritesOnlyResolution
+} from '../player/favorites-only-actions.js';
+import { getAlbumPlaybackTracks } from './album-playback-builder.js';
 
-const resolveIconSources = ({ icon, mobile, logo }) => {
-  const source = String(icon || logo);
-  if (!source.includes('icon_album') || source.includes('Fav_logo')) {
-    return { src: source, src2x: source };
-  }
+const W = window;
+const FAV = W.SPECIAL_FAVORITES_KEY || '__favorites__';
+const safe = value => String(value == null ? '' : value).trim();
 
-  const src = mobile
-    ? source.replace(/icon_album\/(.+)\.png$/, 'icon_album/mobile/$1@1x.jpg')
-    : source.replace(/\.png$/, '@1x.png');
-
-  return {
-    src,
-    src2x: mobile
-      ? src.replace(/@1x\.jpg$/, '@2x.jpg')
-      : src.replace(/@1x\.png$/, '@2x.png')
-  };
-};
-
-export const getRenderableAlbumIcons = ({ config = {}, albumsIndex = [] } = {}) => {
-  const albumKeys = new Set((Array.isArray(albumsIndex) ? albumsIndex : []).map(item => String(item?.key || '')));
-  const authorized =
-    window.YandexAuth?.getSessionStatus?.() === 'active' &&
-    window.YandexAuth?.isTokenAlive?.();
-
-  const items = (config.ICON_ALBUMS_ORDER || []).filter(item =>
-    item?.key &&
-    (!item.authOnly || authorized) &&
-    (isSpecialKey(item.key) || albumKeys.has(String(item.key)))
-  );
-
-  return {
-    albums: items.filter(item => item.row === 'albums' || (!item.row && !isSpecialKey(item.key))),
-    navigation: items.filter(item => item.row === 'nav' || (!item.row && isSpecialKey(item.key)))
-  };
-};
-
-export const renderAlbumIcon = ({
-  item,
-  mobile = false,
-  logo = 'img/logo.png',
-  escapeHtml = value => String(value || '')
+export const bindAlbumTrackActions = ({
+  root,
+  getCurrentAlbum,
+  getAlbum,
+  getCover,
+  setPlayingAlbum,
+  highlightCurrentTrack,
+  logo = 'img/logo.png'
 } = {}) => {
-  if (!item?.key) return '';
+  if (!root || root._albumTrackActionsBound) return false;
+  root._albumTrackActionsBound = true;
 
-  const key = escapeHtml(item.key);
-  const title = escapeHtml(item.title);
+  root.addEventListener('click', event => {
+    W.playerCore?.prepareContext?.();
 
-  const { src, src2x } = resolveIconSources({ icon: item.icon, mobile, logo });
-  return `<div class="album-icon" data-album="${key}" data-akey="${key}" title="${title}"><img src="${escapeHtml(src)}" srcset="${escapeHtml(src2x)} 2x" alt="${title}" draggable="false" loading="lazy" width="60" height="60"></div>`;
-};
+    if (getCurrentAlbum?.() === FAV || event.target.closest('.offline-ind')) return;
 
-export const renderAlbumIconRows = ({
-  config = {},
-  albumsIndex = [],
-  mobile = false,
-  logo = 'img/logo.png',
-  escapeHtml
-} = {}) => {
-  const { albums, navigation } = getRenderableAlbumIcons({ config, albumsIndex });
-  const render = item => renderAlbumIcon({
-    item,
-    mobile,
-    logo,
-    escapeHtml
+    const row = event.target.closest('.track');
+    if (!row || !root.contains(row)) return;
+
+    const albumKey = safe(row.dataset.album);
+    const uid = safe(row.dataset.uid);
+    const player = W.playerCore;
+
+    if (!albumKey || albumKey.startsWith('__') || !uid || !player) return;
+
+    const star = event.target.closest('.like-star');
+    if (star) {
+      event.preventDefault();
+      event.stopPropagation();
+
+      setFavoriteStarState(star, !player.isFavorite(uid));
+      star.classList.add('animating');
+      setTimeout(() => star.classList.remove('animating'), 320);
+      player.toggleFavorite(uid, { fromAlbum: true, albumKey });
+      return;
+    }
+
+    const album = getAlbum?.(albumKey);
+    if (!album) return;
+
+    setPlayingAlbum?.(albumKey);
+
+    const playlist = getAlbumPlaybackTracks({
+      albumKey,
+      album,
+      cover: getCover?.(albumKey),
+      logo
+    });
+
+    const index = playlist.findIndex(track => track.uid === uid);
+    if (index < 0) return;
+
+    const afterPlay = makeFavoritesOnlyAfterPlay({
+      highlight: (trackIndex, meta) => highlightCurrentTrack?.(trackIndex, meta),
+      ensureBlock: (trackIndex, options) =>
+        W.PlayerUI?.ensurePlayerBlock?.(trackIndex, options)
+    });
+
+    return playWithFavoritesOnlyResolution({
+      list: playlist,
+      uid,
+      albumKey,
+      track: playlist[index],
+      play: (list, trackUid) =>
+        player.playExactFromPlaylist?.(list, trackUid, { dir: 1 }),
+      addFavorite: trackUid =>
+        player.toggleFavorite(trackUid, { fromAlbum: true, albumKey }),
+      disableMode: () => localStorage.setItem('favoritesOnlyMode', '0'),
+      afterPlay: () => afterPlay({ index, uid, albumKey })
+    });
   });
 
-  return `<div class="album-icons-row album-icons-row--albums" id="album-icons-albums">${albums.map(render).join('')}</div><div class="album-icons-row album-icons-row--nav" id="album-icons-nav">${navigation.map(render).join('')}</div>`;
+  return true;
 };
 
-export default {
-  getRenderableAlbumIcons,
-  renderAlbumIcon,
-  renderAlbumIconRows
-};
+export default { bindAlbumTrackActions };

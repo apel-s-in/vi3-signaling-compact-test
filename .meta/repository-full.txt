@@ -33,7 +33,7 @@ vi3-signaling-compact-test/
 ├── generate-context.js
 └── package.json
 
-Сгенерировано: 2026-08-04T08:44:35.146Z
+Сгенерировано: 2026-08-04T08:47:06.435Z
 
 //=================================================
 // FILE: /.gitattributes

@@ -1,549 +1,154 @@
-// Компактная статистическая проекция immutable event range.
-// Rollup является локальным rebuildable-кэшем и создаётся только
-// после успешной проверки hash-chain исходного range.
-import { isV7SyncEvent } from './event-contract.js';
-import { temporalPartsFromListenEvent } from './temporal-buckets.js';
-import { buildStatsV4, emptyStatsV4, mergeStatsV4, normalizeStatsV4 } from './stats-v4-projection.js';
-
-export const STATS_SHARD_VERSION = 5;
-const safe = value => String(value == null ? '' : value).trim();
-const safeRangeId = value => safe(value).replace(/[^A-Za-z0-9._-]/g, '').slice(0, 160);
-const buildRangeKey = ({ deviceId = '', chainId = '', branchId = '', fromSeq = 0, toSeq = 0, hash = '' } = {}) =>
-  `${safeRangeId(deviceId)}:${safeRangeId(chainId || branchId)}:${Math.max(0, Math.floor(Number(fromSeq) || 0))}:${Math.max(0, Math.floor(Number(toSeq) || 0))}:${safeRangeId(hash).slice(0, 64)}`;
-const num = value => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
-const fixed = (raw, length) => Array.from({ length }, (_, index) => Math.max(0, Math.floor(num(raw?.[index]))));
-const countMap = raw => Object.fromEntries(Object.entries(raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}).map(([key, value]) => [safe(key), num(value)]).filter(([key, value]) => key && value > 0));
-const dayList = raw => [...new Set((Array.isArray(raw) ? raw : []).map(safe).filter(value => /^\d{4}-\d{2}-\d{2}$/.test(value)))].sort();
-const minPositive = (...values) => {
-  const rows = values.map(num).filter(value => value > 0);
-  return rows.length ? Math.min(...rows) : 0;
+/* GENERATED_FROM=input.js SOURCE_SHA256=79cc15b8e5cecd5364572c78e2f27f64492fb3709ec8f40bae70835d2459a37e FORMAT=READABLE_COMPACT PRINT_WIDTH=320 BLANK_LINES=SAFE_REMOVE DO_NOT_EDIT */
+// UID.003_(Event log truth)_(оставить session-tracker строителем playback-session событий)_(session intelligence должна опираться на эти события, а не обходить их) UID.018_(Variant and quality stats)_(готовить future variant-aware session accounting)_(audio/minus/stems/clip session semantics должны развиваться здесь) UID.050_(Session profile)_(дать listener/intel слою корректную основу текущей сессии)_(session tracker остаётся truth-layer для session context, а не UI слой) UID.060_(Session-aware next-track strategy)_(подготовить основу для context-aware рекомендаций)_(future session recs должны читать session data отсюда, не вмешиваясь в трекинг) UID.084_(AI content analysis)_(не смешивать AI и session truth)_(AI может интерпретировать session patterns позже, но не заменяет этот слой) UID.094_(No-paralysis rule)_(session tracking должен быть независимым от intel availability)_(никакой intel failure не должен ломать LISTEN_* events)
+import { eventLogger } from './event-logger.js';
+import { getCreditedPlaybackDeltaMs } from './playback-validity.js';
+import { makePlaybackRuntimeSnapshot } from './playback-runtime.js';
+const uniqueCoverageSeconds = segments => {
+  const rows = (Array.isArray(segments) ? segments : [])
+    .map(segment => ({ from: Math.max(0, Number(segment?.fromPosition || 0)), to: Math.max(0, Number(segment?.toPosition || 0)) }))
+    .filter(segment => segment.to > segment.from)
+    .sort((left, right) => left.from - right.from || left.to - right.to);
+  const merged = [];
+  rows.forEach(segment => {
+    const last = merged[merged.length - 1];
+    if (!last || segment.from > last.to + 0.25) merged.push({ ...segment });
+    else last.to = Math.max(last.to, segment.to);
+  });
+  return merged.reduce((sum, segment) => sum + Math.max(0, segment.to - segment.from), 0);
 };
-const bump = (map, key, amount = 1) => {
-  const clean = safe(key);
-  const value = num(amount);
-  if (clean && value > 0) map[clean] = num(map[clean]) + value;
-};
-const sortObject = value => Array.isArray(value) ? value.map(sortObject) : !value || typeof value !== 'object' ? value : Object.keys(value).sort().reduce((output, key) => {
-  output[key] = sortObject(value[key]);
-  return output;
-}, {});
-const sha256Hex = async value => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(sortObject(value)))))]
-  .map(byte => byte.toString(16).padStart(2, '0'))
-  .join('');
-
-const localDayKey = event => {
-  const timestamp = Math.max(0, num(event?.data?.startedAt || event?.timestamp));
-  const offsetMs = Number(event?.data?.timezoneOffsetMin || 0) * 60000;
-  return timestamp ? new Date(timestamp - offsetMs).toISOString().slice(0, 10) : '';
-};
-
-const localMinute = event => {
-  const timestamp = Math.max(0, num(event?.data?.startedAt || event?.timestamp));
-  const offsetMs = Number(event?.data?.timezoneOffsetMin || 0) * 60000;
-  if (!timestamp) return -1;
-  const date = new Date(timestamp - offsetMs);
-  return date.getUTCHours() * 60 + date.getUTCMinutes();
-};
-
-export const emptyStatsProjection = () => ({
-  listenMs: 0,
-  uniqueCoveredMs: 0,
-  completionBasisPointsSum: 0,
-  analysisEligibleSessions: 0,
-  validPlays: 0,
-  fullPlays: 0,
-  starts: 0,
-  microSkips: 0,
-  earlySkips: 0,
-  validSkips: 0,
-  partialEnds: 0,
-  firstEventAt: 0,
-  lastEventAt: 0,
-  activeDays: [],
-  byHourMs: Array(24).fill(0),
-  byWeekdayMs: Array(7).fill(0),
-  tracks: {},
-  transitions: {},
-  globalFeatures: {},
-  v4: emptyStatsV4(),
-  dimensions: {
-    quality: {},
-    variant: {},
-    platform: {},
-    deviceClass: {},
-    deviceOs: {},
-    deviceBrowser: {},
-    pwa: {},
-    shuffle: {},
-    repeat: {},
-    favoritesOnly: {},
-    launchSource: {}
+export class SessionTracker {
+  constructor() {
+    this.s = null;
+    this._bindEvents();
   }
-});
-
-const ensureTrack = (projection, uid) => projection.tracks[uid] ||= {
-  listenMs: 0,
-  uniqueCoveredMs: 0,
-  completionBasisPointsSum: 0,
-  analysisEligibleSessions: 0,
-  validPlays: 0,
-  fullPlays: 0,
-  starts: 0,
-  microSkips: 0,
-  earlySkips: 0,
-  validSkips: 0,
-  partialEnds: 0,
-  firstPlayedAt: 0,
-  lastPlayedAt: 0,
-  byHourMs: Array(24).fill(0),
-  byWeekdayMs: Array(7).fill(0),
-  features: {}
-};
-
-const touchProjection = (projection, timestamp) => {
-  const at = Math.max(0, num(timestamp));
-  if (!at) return;
-  projection.firstEventAt = minPositive(projection.firstEventAt, at);
-  projection.lastEventAt = Math.max(projection.lastEventAt, at);
-};
-
-const touchTrack = (track, timestamp) => {
-  const at = Math.max(0, num(timestamp));
-  if (!at) return;
-  track.firstPlayedAt = minPositive(track.firstPlayedAt, at);
-  track.lastPlayedAt = Math.max(track.lastPlayedAt, at);
-};
-
-const applyFeature = (features, data = {}) => {
-  const feature = safe(data.feature);
-  if (!feature) return;
-  bump(features, feature);
-  if (['sleep_timer_set', 'sleep_timer_extend', 'sleep_timer_cancel', 'sleep_timer'].includes(feature)) {
-    bump(features, 'sleep_timer_minutes_total', Math.max(0, num(data.minutes)));
-    if (data.mode) bump(features, `sleep_timer_mode_${safe(data.mode).toLowerCase()}`);
+  _bindEvents() {
+    window.addEventListener('player:play', e => this._start(e.detail));
+    window.addEventListener('player:pause', () => this._pause());
+    window.addEventListener('player:tick', e => this._tick(e.detail));
+    window.addEventListener('player:ended', () => this._end(true, 'ended'));
+    window.addEventListener('player:stop', () => this._end(false, 'stop'));
+    window.addEventListener('player:trackChanged', event => {
+      const nextUid = String(event.detail?.uid || '').trim();
+      if (!this.s || !nextUid || this.s.uid === nextUid) return;
+      this._end(false, String(event.detail?.reason || 'track_changed'), { transitionToUid: nextUid });
+    });
+    window.addEventListener('account:data-switching', () => this._end(false));
+    window.addEventListener('account:data-switched', () => {
+      if (!window.playerCore?.isPlaying?.()) return;
+      this._start({ uid: window.playerCore.getCurrentTrackUid?.(), duration: window.playerCore.getDuration?.(), type: 'audio' });
+    });
   }
-};
-
-export const buildStatsProjection = events => {
-  const projection = emptyStatsProjection();
-  const rows = (Array.isArray(events) ? events : []).filter(isV7SyncEvent);
-  rows.forEach(event => {
-    const type = safe(event?.type);
-    const uid = safe(event?.uid);
-    const data = event?.data || {};
-    touchProjection(projection, event?.timestamp);
-
-    if (type === 'LISTEN_START') {
-      projection.starts++;
-      if (uid) {
-        const track = ensureTrack(projection, uid);
-        track.starts++;
-        touchTrack(track, event.timestamp);
-      }
-      bump(projection.dimensions.quality, data.quality || 'unknown');
-      bump(projection.dimensions.variant, data.variant || 'audio');
-      bump(projection.dimensions.platform, event.platform || 'web');
-      bump(projection.dimensions.deviceClass, event.deviceClass || 'unknown');
-      bump(projection.dimensions.deviceOs, event.deviceOs || 'unknown');
-      bump(projection.dimensions.deviceBrowser, event.deviceBrowser || 'unknown');
-      bump(projection.dimensions.pwa, event.devicePwa === true ? 'on' : 'off');
-      bump(projection.dimensions.shuffle, data.shuffle === true ? 'on' : 'off');
-      bump(projection.dimensions.repeat, data.repeat === true ? 'on' : 'off');
-      bump(projection.dimensions.favoritesOnly, data.favoritesOnly === true ? 'on' : 'off');
-      if (data.launchSource) bump(projection.dimensions.launchSource, data.launchSource);
+  _start({ uid, duration, type = 'audio' } = {}) {
+    if (!uid) return;
+    if (this.s?.uid === uid && this.s?.variant === type) {
+      this.s.lastUpdate = Date.now();
       return;
     }
-
-    if (type === 'FEATURE_USED') {
-      if (uid && uid !== 'global') {
-        const track = ensureTrack(projection, uid);
-        applyFeature(track.features, data);
-        touchTrack(track, event.timestamp);
-      } else {
-        applyFeature(projection.globalFeatures, data);
-      }
-      return;
-    }
-
-    if (type !== 'LISTEN_COMPLETE' || !uid) return;
-
-    const track = ensureTrack(projection, uid);
-    const listenMs = Math.max(0, Math.floor(num(data.listenedMs || num(data.listenedSeconds) * 1000)));
-    const uniqueCoveredMs = Math.max(0, Math.min(listenMs, Math.floor(num(data.uniqueCoveredMs || num(data.uniqueCoveredSeconds) * 1000))));
-    const completionBasisPoints = Math.max(0, Math.min(10000, Math.floor(num(data.completionBasisPoints || num(data.completionRatio) * 10000))));
-    const analysisEligible = data.analysisEligible === true || listenMs >= 3000;
-    const skipClass = safe(data.skipClass);
-    const playedAt = Math.max(0, num(data.startedAt || event.timestamp));
-
-    projection.listenMs += listenMs;
-    projection.uniqueCoveredMs += uniqueCoveredMs;
-    track.listenMs += listenMs;
-    track.uniqueCoveredMs += uniqueCoveredMs;
-    touchTrack(track, playedAt);
-
-    if (analysisEligible) {
-      projection.analysisEligibleSessions++;
-      projection.completionBasisPointsSum += completionBasisPoints;
-      track.analysisEligibleSessions++;
-      track.completionBasisPointsSum += completionBasisPoints;
-    }
-
-    if (skipClass === 'micro_skip') {
-      projection.microSkips++;
-      track.microSkips++;
-    } else if (skipClass === 'early_skip') {
-      projection.earlySkips++;
-      track.earlySkips++;
-    } else if (skipClass === 'valid_skip') {
-      projection.validSkips++;
-      track.validSkips++;
-    } else if (skipClass === 'partial_end') {
-      projection.partialEnds++;
-      track.partialEnds++;
-    }
-
-    const transitionToUid = safe(data.transitionToUid);
-    if (transitionToUid && transitionToUid !== uid) {
-      bump(projection.transitions, `${uid}>${transitionToUid}`);
-    }
-
-    if (data.isValidListen === true) {
-      projection.validPlays++;
-      track.validPlays++;
-      const day = localDayKey(event);
-      if (day) projection.activeDays.push(day);
-    }
-
-    const full = data.isFullListen === true && data.isValidListen === true && data.variant !== 'short';
-    if (full) {
-      projection.fullPlays++;
-      track.fullPlays++;
-      const minute = localMinute(event);
-      if (minute >= 120 && minute <= 270) bump(track.features, 'nightPlay');
-      if (minute >= 300 && minute <= 539) bump(track.features, 'earlyPlay');
-      if (data.quality === 'hi') bump(track.features, 'hiQuality');
-      if (data.shuffle === true) bump(track.features, 'shufflePlay');
-    }
-
-    temporalPartsFromListenEvent(event).forEach(part => {
-      const creditedMs = Math.floor(num(part.creditedMs));
-      projection.byHourMs[part.hour] += creditedMs;
-      projection.byWeekdayMs[part.weekday] += creditedMs;
-      track.byHourMs[part.hour] += creditedMs;
-      track.byWeekdayMs[part.weekday] += creditedMs;
-    });
-
-    bump(projection.dimensions.quality, data.quality || 'unknown');
-    bump(projection.dimensions.variant, data.variant || 'audio');
-    bump(projection.dimensions.platform, event.platform || 'web');
-    bump(projection.dimensions.deviceClass, event.deviceClass || 'unknown');
-    bump(projection.dimensions.deviceOs, event.deviceOs || 'unknown');
-    bump(projection.dimensions.deviceBrowser, event.deviceBrowser || 'unknown');
-    bump(projection.dimensions.pwa, event.devicePwa === true ? 'on' : 'off');
-    bump(projection.dimensions.shuffle, data.shuffle === true ? 'on' : 'off');
-    bump(projection.dimensions.repeat, data.repeat === true ? 'on' : 'off');
-    bump(projection.dimensions.favoritesOnly, data.favoritesOnly === true ? 'on' : 'off');
-    if (data.launchSource) bump(projection.dimensions.launchSource, data.launchSource);
-  });
-  projection.activeDays = dayList(projection.activeDays);
-  projection.v4 = buildStatsV4(rows);
-  return projection;
-};
-
-export const normalizeStatsProjection = raw => ({
-  listenMs: Math.floor(num(raw?.listenMs)),
-  uniqueCoveredMs: Math.floor(num(raw?.uniqueCoveredMs)),
-  completionBasisPointsSum: Math.floor(num(raw?.completionBasisPointsSum)),
-  analysisEligibleSessions: Math.floor(num(raw?.analysisEligibleSessions)),
-  validPlays: Math.floor(num(raw?.validPlays)),
-  fullPlays: Math.floor(num(raw?.fullPlays)),
-  starts: Math.floor(num(raw?.starts)),
-  microSkips: Math.floor(num(raw?.microSkips)),
-  earlySkips: Math.floor(num(raw?.earlySkips)),
-  validSkips: Math.floor(num(raw?.validSkips)),
-  partialEnds: Math.floor(num(raw?.partialEnds)),
-  firstEventAt: Math.floor(num(raw?.firstEventAt)),
-  lastEventAt: Math.floor(num(raw?.lastEventAt)),
-  activeDays: dayList(raw?.activeDays),
-  byHourMs: fixed(raw?.byHourMs, 24),
-  byWeekdayMs: fixed(raw?.byWeekdayMs, 7),
-  tracks: Object.fromEntries(Object.entries(raw?.tracks && typeof raw.tracks === 'object' ? raw.tracks : {}).map(([uid, row]) => [safe(uid), {
-    listenMs: Math.floor(num(row?.listenMs)),
-    uniqueCoveredMs: Math.floor(num(row?.uniqueCoveredMs)),
-    completionBasisPointsSum: Math.floor(num(row?.completionBasisPointsSum)),
-    analysisEligibleSessions: Math.floor(num(row?.analysisEligibleSessions)),
-    validPlays: Math.floor(num(row?.validPlays)),
-    fullPlays: Math.floor(num(row?.fullPlays)),
-    starts: Math.floor(num(row?.starts)),
-    microSkips: Math.floor(num(row?.microSkips)),
-    earlySkips: Math.floor(num(row?.earlySkips)),
-    validSkips: Math.floor(num(row?.validSkips)),
-    partialEnds: Math.floor(num(row?.partialEnds)),
-    firstPlayedAt: Math.floor(num(row?.firstPlayedAt)),
-    lastPlayedAt: Math.floor(num(row?.lastPlayedAt)),
-    byHourMs: fixed(row?.byHourMs, 24),
-    byWeekdayMs: fixed(row?.byWeekdayMs, 7),
-    features: countMap(row?.features)
-  }]).filter(([uid]) => uid)),
-  transitions: countMap(raw?.transitions),
-  globalFeatures: countMap(raw?.globalFeatures || raw?.features),
-  v4: normalizeStatsV4(raw?.v4),
-  dimensions: {
-    quality: countMap(raw?.dimensions?.quality),
-    variant: countMap(raw?.dimensions?.variant),
-    platform: countMap(raw?.dimensions?.platform),
-    deviceClass: countMap(raw?.dimensions?.deviceClass),
-    deviceOs: countMap(raw?.dimensions?.deviceOs),
-    deviceBrowser: countMap(raw?.dimensions?.deviceBrowser),
-    pwa: countMap(raw?.dimensions?.pwa),
-    shuffle: countMap(raw?.dimensions?.shuffle),
-    repeat: countMap(raw?.dimensions?.repeat),
-    favoritesOnly: countMap(raw?.dimensions?.favoritesOnly),
-    launchSource: countMap(raw?.dimensions?.launchSource)
-  }
-});
-
-export const buildStatsProjectionShard = async segment => {
-  const events = (Array.isArray(segment?.events) ? segment.events : []).filter(isV7SyncEvent);
-  const branchId = safeRangeId(segment?.branchId);
-  const deviceStableId = safeRangeId(segment?.deviceId || segment?.deviceStableId);
-  const chainId = safe(segment?.chainId);
-  const fromSeq = Math.floor(num(segment?.fromSeq));
-  const toSeq = Math.floor(num(segment?.toSeq));
-  const sourceHash = safe(segment?.hash);
-  const rangeKey = safe(segment?.rangeKey) || buildRangeKey({ deviceId: deviceStableId, chainId: chainId || branchId, fromSeq, toSeq, hash: sourceHash });
-  const projection = normalizeStatsProjection(buildStatsProjection(events));
-  const core = { version: STATS_SHARD_VERSION, rangeKey, sourceHash, projection };
-  const hash = await sha256Hex(core);
-  return { ...core, deviceStableId, branchId, chainId, chainSeq: [deviceStableId, chainId || branchId, fromSeq], fromSeq, toSeq, eventCount: events.length, hash, createdAt: Date.now() };
-};
-
-export const verifyStatsProjectionShard = async (shard, sourceRange = null) => {
-  if (Number(shard?.version) !== STATS_SHARD_VERSION) throw new Error('stats_shard_version_invalid');
-  if (!safe(shard?.rangeKey) || !safe(shard?.sourceHash)) throw new Error('stats_shard_identity_invalid');
-  if (sourceRange && (safe(shard.rangeKey) !== safe(sourceRange.rangeKey) || safe(shard.sourceHash) !== safe(sourceRange.hash))) {
-    throw new Error('stats_shard_source_mismatch');
-  }
-  const projection = normalizeStatsProjection(shard.projection);
-  const expectedHash = await sha256Hex({ version: STATS_SHARD_VERSION, rangeKey: safe(shard.rangeKey), sourceHash: safe(shard.sourceHash), projection });
-  if (safe(shard.hash) !== expectedHash) throw new Error('stats_shard_hash_mismatch');
-  return { ...shard, projection, hash: expectedHash };
-};
-
-export const mergeStatsProjectionInto = (targetRaw, sourceRaw) => {
-  const target = normalizeStatsProjection(targetRaw);
-  const source = normalizeStatsProjection(sourceRaw?.projection || sourceRaw);
-  target.listenMs += source.listenMs;
-  target.uniqueCoveredMs += source.uniqueCoveredMs;
-  target.completionBasisPointsSum += source.completionBasisPointsSum;
-  target.analysisEligibleSessions += source.analysisEligibleSessions;
-  target.validPlays += source.validPlays;
-  target.fullPlays += source.fullPlays;
-  target.starts += source.starts;
-  target.microSkips += source.microSkips;
-  target.earlySkips += source.earlySkips;
-  target.validSkips += source.validSkips;
-  target.partialEnds += source.partialEnds;
-  target.firstEventAt = minPositive(target.firstEventAt, source.firstEventAt);
-  target.lastEventAt = Math.max(target.lastEventAt, source.lastEventAt);
-  target.activeDays = dayList([...target.activeDays, ...source.activeDays]);
-  source.byHourMs.forEach((amount, index) => target.byHourMs[index] += amount);
-  source.byWeekdayMs.forEach((amount, index) => target.byWeekdayMs[index] += amount);
-  target.v4 = mergeStatsV4(target.v4, source.v4);
-  Object.entries(source.transitions).forEach(([key, amount]) => bump(target.transitions, key, amount));
-  Object.entries(source.globalFeatures).forEach(([key, amount]) => bump(target.globalFeatures, key, amount));
-  Object.entries(source.dimensions).forEach(([dimension, rows]) => Object.entries(rows).forEach(([key, amount]) => bump(target.dimensions[dimension], key, amount)));
-  Object.entries(source.tracks).forEach(([uid, row]) => {
-    const track = ensureTrack(target, uid);
-    track.listenMs += row.listenMs;
-    track.uniqueCoveredMs += row.uniqueCoveredMs;
-    track.completionBasisPointsSum += row.completionBasisPointsSum;
-    track.analysisEligibleSessions += row.analysisEligibleSessions;
-    track.validPlays += row.validPlays;
-    track.fullPlays += row.fullPlays;
-    track.starts += row.starts;
-    track.microSkips += row.microSkips;
-    track.earlySkips += row.earlySkips;
-    track.validSkips += row.validSkips;
-    track.partialEnds += row.partialEnds;
-    track.firstPlayedAt = minPositive(track.firstPlayedAt, row.firstPlayedAt);
-    track.lastPlayedAt = Math.max(track.lastPlayedAt, row.lastPlayedAt);
-    row.byHourMs.forEach((amount, index) => track.byHourMs[index] += amount);
-    row.byWeekdayMs.forEach((amount, index) => track.byWeekdayMs[index] += amount);
-    Object.entries(row.features).forEach(([key, amount]) => bump(track.features, key, amount));
-  });
-  return normalizeStatsProjection(target);
-};
-
-export const projectionToStatsRows = raw => {
-  const projection = normalizeStatsProjection(raw);
-  const rows = Object.entries(projection.tracks).map(([uid, track]) => ({
-    uid,
-    globalListenSeconds: track.listenMs / 1000,
-    uniqueCoveredSeconds: track.uniqueCoveredMs / 1000,
-    analysisEligibleSessions: track.analysisEligibleSessions,
-    averageCompletionRate: track.analysisEligibleSessions > 0 ? track.completionBasisPointsSum / track.analysisEligibleSessions / 10000 : 0,
-    microSkips: track.microSkips,
-    earlySkips: track.earlySkips,
-    validSkips: track.validSkips,
-    partialEnds: track.partialEnds,
-    globalValidListenCount: track.validPlays,
-    globalFullListenCount: track.fullPlays,
-    firstPlayedAt: track.firstPlayedAt,
-    lastPlayedAt: track.lastPlayedAt,
-    byHourMs: [...track.byHourMs],
-    byWeekdayMs: [...track.byWeekdayMs],
-    byHour: track.byHourMs.map(value => value / 1000),
-    byWeekday: track.byWeekdayMs.map(value => value / 1000),
-    temporalSchemaVersion: 3,
-    featuresUsed: { ...track.features }
-  }));
-  rows.push({
-    uid: 'global',
-    globalListenSeconds: 0,
-    globalValidListenCount: 0,
-    globalFullListenCount: 0,
-    firstPlayedAt: projection.firstEventAt,
-    lastPlayedAt: projection.lastEventAt,
-    featuresUsed: { ...projection.globalFeatures },
-    analyticsSchemaVersion: STATS_SHARD_VERSION,
-    statsV4: normalizeStatsV4(projection.v4),
-    sparseCube: { ...projection.v4.cube },
-    repeatRuns: { ...projection.v4.repeat },
-    transitions: { ...projection.transitions },
-    dimensions: structuredClone(projection.dimensions)
-  });
-  return rows;
-};
-const mergeCountMaps = (leftRaw, rightRaw) => {
-  const output = countMap(leftRaw);
-  Object.entries(countMap(rightRaw)).forEach(([key, amount]) => bump(output, key, amount));
-  return output;
-};
-
-const mergeFixedArrays = (leftRaw, rightRaw, length) => {
-  const left = fixed(leftRaw, length);
-  fixed(rightRaw, length).forEach((amount, index) => {
-    left[index] += amount;
-  });
-  return left;
-};
-
-export const mergeProjectedStatsRow = (leftRaw = {}, rightRaw = {}) => {
-  const uid = safe(rightRaw.uid || leftRaw.uid);
-  if (!uid) return null;
-
-  if (uid === 'global') {
-    const leftV4 = leftRaw.statsV4 || {
-      cube: leftRaw.sparseCube || {},
-      repeat: leftRaw.repeatRuns || {},
-      boundary: { chainKey: '', firstRun: null, lastRun: null, singleRun: false }
-    };
-    const rightV4 = rightRaw.statsV4 || {
-      cube: rightRaw.sparseCube || {},
-      repeat: rightRaw.repeatRuns || {},
-      boundary: { chainKey: '', firstRun: null, lastRun: null, singleRun: false }
-    };
-    const statsV4 = mergeStatsV4(leftV4, rightV4);
-    const dimensions = {};
-    const names = new Set([
-      ...Object.keys(leftRaw.dimensions || {}),
-      ...Object.keys(rightRaw.dimensions || {})
-    ]);
-    names.forEach(name => {
-      dimensions[name] = mergeCountMaps(leftRaw.dimensions?.[name], rightRaw.dimensions?.[name]);
-    });
-    return {
-      ...leftRaw,
-      ...rightRaw,
+    this._end(false);
+    const player = window.playerCore;
+    const startedAt = Date.now();
+    this.s = {
       uid,
-      globalListenSeconds: 0,
-      globalValidListenCount: 0,
-      globalFullListenCount: 0,
-      firstPlayedAt: minPositive(leftRaw.firstPlayedAt, rightRaw.firstPlayedAt),
-      lastPlayedAt: Math.max(num(leftRaw.lastPlayedAt), num(rightRaw.lastPlayedAt)),
-      featuresUsed: mergeCountMaps(leftRaw.featuresUsed, rightRaw.featuresUsed),
-      analyticsSchemaVersion: STATS_SHARD_VERSION,
-      statsV4,
-      sparseCube: { ...statsV4.cube },
-      repeatRuns: { ...statsV4.repeat },
-      transitions: mergeCountMaps(leftRaw.transitions, rightRaw.transitions),
-      dimensions
+      variant: type,
+      quality: player?.qMode || 'hi',
+      shuffle: !!player?.isShuffle?.(),
+      repeat: !!player?.isRepeat?.(),
+      launchSource: String(window.AlbumsManager?.getPlayingAlbum?.() || ''),
+      favoritesOnly: localStorage.getItem('favoritesOnlyMode') === '1',
+      favoriteAtStart: !!player?.isFavorite?.(uid),
+      timezoneOffsetMin: new Date().getTimezoneOffset(),
+      startedAt,
+      duration: Number(duration || 0),
+      accumulatedMs: 0,
+      creditedSegments: [],
+      lastPos: Number(player?.getPosition?.() || 0),
+      lastUpdate: startedAt
     };
+    eventLogger.log('LISTEN_START', uid, { variant: type, quality: this.s.quality, shuffle: this.s.shuffle, repeat: this.s.repeat, launchSource: this.s.launchSource, favoritesOnly: this.s.favoritesOnly, favoriteAtStart: this.s.favoriteAtStart, timezoneOffsetMin: this.s.timezoneOffsetMin });
   }
-
-  const leftSessions = Math.floor(num(leftRaw.analysisEligibleSessions));
-  const rightSessions = Math.floor(num(rightRaw.analysisEligibleSessions));
-  const totalSessions = leftSessions + rightSessions;
-  const completionSum =
-    num(leftRaw.averageCompletionRate) * leftSessions +
-    num(rightRaw.averageCompletionRate) * rightSessions;
-
-  const byHourMs = mergeFixedArrays(leftRaw.byHourMs, rightRaw.byHourMs, 24);
-  const byWeekdayMs = mergeFixedArrays(leftRaw.byWeekdayMs, rightRaw.byWeekdayMs, 7);
-
-  return {
-    ...leftRaw,
-    ...rightRaw,
-    uid,
-    globalListenSeconds: num(leftRaw.globalListenSeconds) + num(rightRaw.globalListenSeconds),
-    uniqueCoveredSeconds: num(leftRaw.uniqueCoveredSeconds) + num(rightRaw.uniqueCoveredSeconds),
-    analysisEligibleSessions: totalSessions,
-    averageCompletionRate: totalSessions > 0 ? completionSum / totalSessions : 0,
-    microSkips: Math.floor(num(leftRaw.microSkips) + num(rightRaw.microSkips)),
-    earlySkips: Math.floor(num(leftRaw.earlySkips) + num(rightRaw.earlySkips)),
-    validSkips: Math.floor(num(leftRaw.validSkips) + num(rightRaw.validSkips)),
-    partialEnds: Math.floor(num(leftRaw.partialEnds) + num(rightRaw.partialEnds)),
-    globalValidListenCount: Math.floor(num(leftRaw.globalValidListenCount) + num(rightRaw.globalValidListenCount)),
-    globalFullListenCount: Math.floor(num(leftRaw.globalFullListenCount) + num(rightRaw.globalFullListenCount)),
-    firstPlayedAt: minPositive(leftRaw.firstPlayedAt, rightRaw.firstPlayedAt),
-    lastPlayedAt: Math.max(num(leftRaw.lastPlayedAt), num(rightRaw.lastPlayedAt)),
-    byHourMs,
-    byWeekdayMs,
-    byHour: byHourMs.map(value => value / 1000),
-    byWeekday: byWeekdayMs.map(value => value / 1000),
-    temporalSchemaVersion: 3,
-    featuresUsed: mergeCountMaps(leftRaw.featuresUsed, rightRaw.featuresUsed)
-  };
-};
-
-export const projectionStreak = raw => {
-  const days = dayList(raw?.activeDays);
-  let longest = 0;
-  let run = 0;
-  let previous = 0;
-
-  days.forEach(value => {
-    const current = Date.parse(`${value}T00:00:00Z`);
-    run = previous && current - previous === 86400000 ? run + 1 : 1;
-    longest = Math.max(longest, run);
-    previous = current;
-  });
-
-  const localDateKey = timestamp => {
-    const date = new Date(timestamp);
-    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-  };
-  const today = localDateKey(Date.now());
-  const yesterday = localDateKey(Date.now() - 86400000);
-  const lastActiveDate = days[days.length - 1] || '';
-  const current = lastActiveDate === today || lastActiveDate === yesterday ? run : 0;
-
-  return { current, longest, lastActiveDate, activeDays: days };
-};
-
-export const mergeStatsProjections = shards => (Array.isArray(shards) ? shards : []).reduce((output, shard) => mergeStatsProjectionInto(output, shard), emptyStatsProjection());
-
-export default {
-  STATS_SHARD_VERSION,
-  emptyStatsProjection,
-  buildStatsProjection,
-  normalizeStatsProjection,
-  buildStatsProjectionShard,
-  verifyStatsProjectionShard,
-  mergeStatsProjectionInto,
-  mergeStatsProjections,
-  projectionToStatsRows,
-  mergeProjectedStatsRow,
-  projectionStreak
-};
+  _tick({ currentTime, volume, muted }) {
+    if (!this.s) return;
+    const rt = makePlaybackRuntimeSnapshot({ lastTickAt: this.s.lastUpdate, lastPos: this.s.lastPos, duration: this.s.duration, volume, muted, tick: { currentTime, volume, muted }, playerCore: window.playerCore });
+    this.s.lastUpdate = rt.now;
+    this.s.lastPos = rt.currentTime;
+    this.s.duration = this.s.duration > 0 ? this.s.duration : rt.duration;
+    const creditedMs = getCreditedPlaybackDeltaMs({ deltaMs: rt.deltaMs, prevTime: rt.prevPos, currentTime: rt.currentTime, volume: rt.volume, muted: rt.muted });
+    if (creditedMs > 0) {
+      this.s.accumulatedMs += creditedMs;
+      const last = this.s.creditedSegments[this.s.creditedSegments.length - 1];
+      const contiguous = last && Math.abs(Number(last.endedAt || 0) - Number(rt.prevTickAt || 0)) <= 1500 && Math.abs(Number(last.toPosition || 0) - Number(rt.prevPos || 0)) <= 1.5;
+      if (contiguous) {
+        last.endedAt = rt.now;
+        last.toPosition = rt.currentTime;
+        last.creditedMs += creditedMs;
+      } else {
+        this.s.creditedSegments.push({ startedAt: rt.prevTickAt, endedAt: rt.now, creditedMs, fromPosition: rt.prevPos, toPosition: rt.currentTime });
+      }
+      if (this.s.creditedSegments.length > 512) {
+        const first = this.s.creditedSegments.shift();
+        const next = this.s.creditedSegments[0];
+        if (first && next && Math.abs(Number(first.endedAt || 0) - Number(next.startedAt || 0)) <= 1500 && Math.abs(Number(first.toPosition || 0) - Number(next.fromPosition || 0)) <= 1.5) {
+          next.startedAt = first.startedAt;
+          next.fromPosition = first.fromPosition;
+          next.creditedMs += first.creditedMs;
+        }
+      }
+    }
+  }
+  _pause() {
+    if (this.s) {
+      this._tick({ currentTime: window.playerCore?.getPosition?.() || this.s.lastPos || 0, volume: window.playerCore?.getVolume?.() ?? 100, muted: window.playerCore?.isMuted?.() ?? false });
+      this.s.lastUpdate = Date.now();
+    }
+  }
+  _end(endedNaturally, completionReason = 'interrupted', extra = {}) {
+    if (!this.s) return;
+    const targetPosition = endedNaturally && this.s.duration > 0 ? this.s.duration : Number(window.playerCore?.getPosition?.() || this.s.lastPos || 0);
+    this._tick({ currentTime: targetPosition, volume: window.playerCore?.getVolume?.() ?? 100, muted: window.playerCore?.isMuted?.() ?? false });
+    const { uid, variant, quality, shuffle, repeat, launchSource, favoritesOnly, favoriteAtStart, timezoneOffsetMin, startedAt, accumulatedMs, creditedSegments, duration } = this.s;
+    this.s = null;
+    if (duration <= 0 && !endedNaturally) return;
+    const listenedSeconds = Math.max(0, accumulatedMs / 1000);
+    const uniqueCoveredSeconds = Math.min(Math.max(0, duration), uniqueCoverageSeconds(creditedSegments));
+    const completionRatio = duration > 0 ? Math.max(0, Math.min(1, uniqueCoveredSeconds / duration)) : 0;
+    const analysisEligible = listenedSeconds >= 3;
+    const valid = listenedSeconds >= 25;
+    const full = endedNaturally && completionRatio >= 0.9 && listenedSeconds >= Math.max(25, duration * 0.8);
+    const skipClass = endedNaturally ? (full ? 'full' : 'partial_end') : listenedSeconds < 3 ? 'micro_skip' : listenedSeconds < 25 ? 'early_skip' : 'valid_skip';
+    const startDate = new Date(startedAt || Date.now());
+    const startHour = startDate.getHours();
+    const startMinute = startDate.getMinutes();
+    if (valid && startHour === 11 && startMinute === 11) {
+      eventLogger.log('FEATURE_USED', 'global', { feature: 'play_11_11' });
+    }
+    if (valid && (startDate.getDay() === 0 || startDate.getDay() === 6)) {
+      eventLogger.log('FEATURE_USED', 'global', { feature: 'weekend_play' });
+    }
+    eventLogger.log('LISTEN_COMPLETE', uid, {
+      variant,
+      quality,
+      shuffle,
+      repeat,
+      launchSource,
+      favoritesOnly,
+      favoriteAtStart,
+      timezoneOffsetMin,
+      startedAt,
+      listenedSeconds: Math.floor(listenedSeconds),
+      listenedMs: Math.floor(accumulatedMs),
+      uniqueCoveredSeconds,
+      uniqueCoveredMs: Math.floor(uniqueCoveredSeconds * 1000),
+      creditedSegments,
+      temporalSchemaVersion: 3,
+      trackDuration: duration,
+      completionRatio,
+      completionBasisPoints: Math.round(completionRatio * 10000),
+      analysisEligible,
+      skipClass,
+      completionReason: String(completionReason || 'interrupted'),
+      transitionToUid: String(extra.transitionToUid || ''),
+      isFullListen: full,
+      isValidListen: valid
+    });
+  }
+}

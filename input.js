@@ -1,194 +1,114 @@
-// UID.003_(Event log truth)_(event ledger v2 добавляет проверяемую цепочку событий)_(deviceSeq/prevHash/eventHash/checkpoint)
-// UID.104_(Trust and eligibility state)_(ledger health — база будущего trust/prize слоя)_(локальный прогресс не блокируется, но подозрения видны)
-// UID.109_(Yandex Cloud Functions validation layer)_(будущая server validation сможет проверять hash-chain)_(сейчас локальный фундамент без backend-зависимости)
+// scripts/analytics/event-logger.js
+// UID.003_(Event log truth)_(оставить события источником правды)_(все долгоживущие user states должны выводиться отсюда или из кэша поверх этого слоя)
+// UID.104_(Trust and eligibility state)_(EventLogger пишет ledger fields перед сохранением)_(deviceSeq/prevHash/eventHash/checkpoint)
+// UID.094_(No-paralysis rule)_(event logging не должен влиять на playback)_(ошибка ledger только возвращает события в очередь)
 
-import { metaDB as defaultMetaDB } from './meta-db.js';
-import { normalizeEventList } from './backup-event-cleanup.js';
+import { metaDB } from './meta-db.js';
+import { normalizeEventEnvelope } from './event-contract.js';
+import { buildLedgerEvents, LEDGER_CHECKPOINT_KEY, publishLedgerCheckpoint, writeLedgerCheckpoint } from './event-integrity.js';
 
-export const LEDGER_CHECKPOINT_KEY = 'event_ledger_checkpoint';
-const CHAIN_ID_KEY = 'eventLedger:chainId:v1';
-const s = v => String(v == null ? '' : v).trim();
-const n = v => Number.isFinite(Number(v)) ? Number(v) : 0;
+const commitLedgerBatch = async ({ events, checkpoint }) => {
+  await metaDB.init();
+  return new Promise((resolve, reject) => {
+    const tx = metaDB.db.transaction(['events_hot', 'global'], 'readwrite');
+    const eventStore = tx.objectStore('events_hot');
+    const globalStore = tx.objectStore('global');
 
-export const sortObj = v => Array.isArray(v) ? v.map(sortObj) : (!v || typeof v !== 'object') ? v : Object.keys(v).sort().reduce((a, k) => (a[k] = sortObj(v[k]), a), {});
-export const stableStringify = v => JSON.stringify(sortObj(v));
-export const sha256Hex = async v => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(v || ''))))].map(b => b.toString(16).padStart(2, '0')).join('');
+    events.forEach(event => eventStore.put(event));
+    globalStore.put({ key: LEDGER_CHECKPOINT_KEY, value: checkpoint });
 
-const chainId = () => {
-  try {
-    let id = localStorage.getItem(CHAIN_ID_KEY);
-    if (!id) localStorage.setItem(CHAIN_ID_KEY, id = `chain_${crypto.randomUUID()}`);
-    return id;
-  } catch {
-    return `chain_${crypto.randomUUID()}`;
-  }
-};
-
-export const normalizeLedgerCheckpoint = raw => ({
-  version: 'ledger-v2',
-  chainId: s(raw?.chainId) || chainId(),
-  deviceSeq: Math.max(0, n(raw?.deviceSeq)),
-  headHash: s(raw?.headHash || ''),
-  deviceStableId: s(raw?.deviceStableId || localStorage.getItem('deviceStableId') || ''),
-  deviceHash: s(raw?.deviceHash || localStorage.getItem('deviceHash') || ''),
-  updatedAt: n(raw?.updatedAt) || 0,
-  repairedAt: n(raw?.repairedAt) || 0,
-  repairReason: s(raw?.repairReason || ''),
-  repairedEvents: Math.max(0, n(raw?.repairedEvents))
-});
-
-export const readLedgerCheckpoint = async (db = defaultMetaDB) =>
-  normalizeLedgerCheckpoint((await db.getGlobal(LEDGER_CHECKPOINT_KEY).catch(() => null))?.value || {});
-
-export const publishLedgerCheckpoint = cp => {
-  const row = normalizeLedgerCheckpoint(cp);
-  try {
-    if (row.chainId) localStorage.setItem(CHAIN_ID_KEY, row.chainId);
-  } catch {}
-  try {
-    window.dispatchEvent(new CustomEvent('event-ledger:checkpoint', { detail: row }));
-  } catch {}
-  return row;
-};
-
-export const writeLedgerCheckpoint = async (db = defaultMetaDB, cp = {}) => {
-  const row = normalizeLedgerCheckpoint(cp);
-  await db.setGlobal(LEDGER_CHECKPOINT_KEY, row);
-  return publishLedgerCheckpoint(row);
-};
-
-export const adoptLedgerCheckpointFromEvents = async ({ db = defaultMetaDB, deviceStableId = localStorage.getItem('deviceStableId') || '', reason = 'adopt_from_events' } = {}) => {
-  const [warmRaw, hotRaw] = await Promise.all([db.getEvents('events_warm').catch(() => []), db.getEvents('events_hot').catch(() => [])]);
-  const rows = normalizeEventList([...(warmRaw || []), ...(hotRaw || [])], { limit: 10000, sort: true, dedupeAchievementUnlocks: false, dropNoise: false })
-    .filter(e => s(e?.deviceStableId) === s(deviceStableId) && s(e?.chainId) && s(e?.eventHash) && n(e?.deviceSeq))
-    .sort((a, b) => n(a.timestamp) - n(b.timestamp) || n(a.deviceSeq) - n(b.deviceSeq));
-  const last = rows[rows.length - 1];
-  if (!last) return null;
-  return await writeLedgerCheckpoint(db, { chainId: last.chainId, deviceSeq: last.deviceSeq, headHash: last.eventHash, deviceStableId: last.deviceStableId, deviceHash: last.deviceHash || localStorage.getItem('deviceHash') || '', updatedAt: Date.now(), repairedAt: Date.now(), repairReason: reason, repairedEvents: rows.length });
-};
-
-const makeSourceClock = (ev, ts = Date.now()) => ev?.sourceClock && typeof ev.sourceClock === 'object' ? ev.sourceClock : {
-  clientTs: n(ev?.timestamp || ts) || ts,
-  timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
-  offsetMin: new Date(n(ev?.timestamp || ts) || ts).getTimezoneOffset()
-};
-
-const ownerHash = async () => {
-  const id = s(window.YandexAuth?.getProfile?.()?.yandexId || '');
-  return id ? await sha256Hex(`ya:${id}`) : '';
-};
-
-export const hashEvent = async ev => {
-  const { eventHash, ...rest } = ev || {};
-  return await sha256Hex(stableStringify(rest));
-};
-
-export const buildLedgerEvents = async (events = [], { db = defaultMetaDB, checkpoint = null } = {}) => {
-  let cp = normalizeLedgerCheckpoint(checkpoint || await readLedgerCheckpoint(db));
-  const out = [], ownerYandexIdHash = await ownerHash().catch(() => '');
-  for (const raw of Array.isArray(events) ? events : []) {
-    if (!raw?.eventId) continue;
-    const deviceSeq = cp.deviceSeq + 1;
-    const ev = {
-      ...raw,
-      sourceClock: makeSourceClock(raw, raw.timestamp),
-      chainId: cp.chainId,
-      deviceSeq,
-      prevHash: cp.headHash || '',
-      ownerYandexIdHash: raw.ownerYandexIdHash || ownerYandexIdHash
-    };
-    ev.eventHash = await hashEvent(ev);
-    cp = normalizeLedgerCheckpoint({
-      ...cp,
-      deviceSeq,
-      headHash: ev.eventHash,
-      deviceStableId: ev.deviceStableId || cp.deviceStableId,
-      deviceHash: ev.deviceHash || cp.deviceHash,
-      updatedAt: Date.now()
-    });
-    out.push(ev);
-  }
-  return { events: out, checkpoint: cp };
-};
-
-export const rebuildLedgerCheckpointFromEvents = async ({ db = defaultMetaDB, reason = 'manual_repair' } = {}) => {
-  const [warmRaw, hotRaw, oldCp] = await Promise.all([
-    db.getEvents('events_warm').catch(() => []),
-    db.getEvents('events_hot').catch(() => []),
-    readLedgerCheckpoint(db).catch(() => normalizeLedgerCheckpoint({}))
-  ]);
-  const warmIds = new Set((warmRaw || []).map(e => e?.eventId).filter(Boolean));
-  const hotIds = new Set((hotRaw || []).map(e => e?.eventId).filter(Boolean));
-  const merged = normalizeEventList([...(warmRaw || []), ...(hotRaw || [])], { limit: 10000, sort: true, dedupeAchievementUnlocks: false });
-  const base = normalizeLedgerCheckpoint({ ...oldCp, deviceSeq: 0, headHash: '', updatedAt: 0 });
-  const built = await buildLedgerEvents(merged, { db, checkpoint: base });
-  const byId = new Map(built.events.map(e => [e.eventId, e]));
-  const warm = [...warmIds].map(id => byId.get(id)).filter(Boolean);
-  const hot = [...hotIds].filter(id => !warmIds.has(id)).map(id => byId.get(id)).filter(Boolean);
-
-  await db.clearEvents('events_warm').catch(() => {});
-  await db.clearEvents('events_hot').catch(() => {});
-  if (warm.length) await db.addEvents(warm, 'events_warm');
-  if (hot.length) await db.addEvents(hot, 'events_hot');
-
-  const checkpoint = await writeLedgerCheckpoint(db, {
-    ...built.checkpoint,
-    repairedAt: Date.now(),
-    repairReason: reason,
-    repairedEvents: built.events.length
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('event_ledger_commit_aborted'));
   });
-  try { window.dispatchEvent(new CustomEvent('event-ledger:repaired', { detail: checkpoint })); } catch {}
-  return { ok: true, checkpoint, events: built.events.length, warm: warm.length, hot: hot.length };
 };
 
-export const getLedgerHealth = async ({ db = defaultMetaDB, cloudMeta = null } = {}) => {
-  const [hot, warm, cp] = await Promise.all([
-    db.getEvents('events_hot').catch(() => []),
-    db.getEvents('events_warm').catch(() => []),
-    readLedgerCheckpoint(db).catch(() => normalizeLedgerCheckpoint({}))
-  ]);
-  const all = normalizeEventList([...(warm || []), ...(hot || [])], { limit: 10000, sort: true, dedupeAchievementUnlocks: false });
-  const noHashCount = all.filter(e => !e.eventHash).length;
-  const seqs = all.map(e => n(e.deviceSeq)).filter(Boolean);
-  const maxSeqInEvents = Math.max(0, ...seqs);
-  const cloudHead = s(cloudMeta?.eventLedgerHead || '');
-  const cloudSeq = n(cloudMeta?.eventLedgerSeq);
-  const branchState = !cloudHead ? 'cloud_unknown' : (cloudHead === cp.headHash ? 'same_head' : (cloudSeq > cp.deviceSeq ? 'cloud_ahead_or_diverged' : 'local_ahead_or_diverged'));
-  const warnings = [
-    !cp.headHash ? 'ledger checkpoint ещё не создан' : '',
-    noHashCount ? `legacy-событий без eventHash: ${noHashCount}` : '',
-    hot?.length ? `events_hot ожидают обработки: ${hot.length}` : '',
-    maxSeqInEvents > cp.deviceSeq ? 'в событиях seq выше checkpoint' : '',
-    cloudHead && cloudHead !== cp.headHash ? 'cloud ledger head отличается от локального' : ''
-  ].filter(Boolean);
-  return {
-    checkpoint: cp,
-    hotCount: hot?.length || 0,
-    warmCount: warm?.length || 0,
-    totalCount: all.length,
-    noHashCount,
-    maxSeqInEvents,
-    branchState,
-    cloudHead,
-    cloudSeq,
-    lastRepairAt: cp.repairedAt || 0,
-    repairReason: cp.repairReason || '',
-    repairedEvents: cp.repairedEvents || 0,
-    warnings
-  };
-};
+class EventLogger {
+  constructor() {
+    this.queue = []; this.sessionId = crypto.randomUUID(); this.deviceHash = localStorage.getItem('deviceHash') || ('tmp_' + crypto.randomUUID()); this.deviceStableId = localStorage.getItem('deviceStableId') || ''; this._flushPromise = null; this._rerun = false;
+  }
+  async init() {
+    await metaDB.init();
+    try { const { getOrCreateDeviceHash, getOrCreateDeviceStableId } = await import('../core/device-identity.js'); this.deviceHash = await getOrCreateDeviceHash(); this.deviceStableId = await getOrCreateDeviceStableId(); }
+    catch { if (!localStorage.getItem('deviceHash')) localStorage.setItem('deviceHash', this.deviceHash = 'dv_' + crypto.randomUUID().replace(/-/g, '').slice(0, 16)); else this.deviceHash = localStorage.getItem('deviceHash'); this.deviceStableId = localStorage.getItem('deviceStableId') || ''; }
+    ['visibilitychange', 'beforeunload'].forEach(e => window.addEventListener(e, () => document.hidden !== false && this.flush()));
+    window.addEventListener('analytics:forceFlush', () => this.flush());
+    setInterval(() => this.flush(), 15000);
+  }
+  _deviceMeta() {
+    try {
+      const ua = navigator.userAgent || '';
+      const pf = window.Utils?.getPlatform?.() || {};
+      const platform = pf.isIOS ? 'ios' : pf.isAndroid ? 'android' : 'web';
+      const deviceClass = pf.isIOS ? (/iPad/i.test(ua) ? 'iPad' : 'iPhone') : pf.isAndroid ? 'Android' : 'Desktop';
+      const deviceBrowser = /YaBrowser/i.test(ua) ? 'Яндекс Браузер' : /Edg\//i.test(ua) ? 'Edge' : /Chrome\//i.test(ua) ? 'Chrome' : /Safari\//i.test(ua) ? 'Safari' : /Firefox\//i.test(ua) ? 'Firefox' : 'Browser';
+      const deviceOs = /iPhone/i.test(ua) ? 'iPhone' : /iPad/i.test(ua) ? 'iPad' : /Android/i.test(ua) ? 'Android' : /Windows/i.test(ua) ? 'Windows' : /Mac/i.test(ua) ? 'macOS' : /Linux/i.test(ua) ? 'Linux' : '';
+      const fallbackLabel = platform === 'ios' ? `Мой ${deviceClass}` : platform === 'android' ? 'Моё Android устройство' : 'Мой компьютер';
+      return {
+        deviceLabel: localStorage.getItem('yandex:onboarding:device_label') || fallbackLabel,
+        deviceClass,
+        devicePwa: pf.isPWA === true,
+        deviceOs,
+        deviceBrowser,
+        deviceLang: navigator.language || '',
+        deviceTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+        deviceScreen: `${screen.width || 0}×${screen.height || 0}`,
+        platform
+      };
+    } catch {
+      return { deviceLabel: '', deviceClass: '', devicePwa: false };
+    }
+  }
+  log(type, uid, data = {}) {
+    if (window._isRestoring) return null;
+    const dm = this._deviceMeta(), ev = normalizeEventEnvelope({ sessionId: this.sessionId, deviceHash: this.deviceHash, deviceStableId: this.deviceStableId, ...dm, platform: window.Utils?.getPlatform()?.isIOS ? 'ios' : (window.Utils?.getPlatform()?.isAndroid ? 'android' : 'web'), type, uid, data });
+    this.queue.push(ev);
+    window.dispatchEvent(new CustomEvent('analytics:eventQueued', { detail: { eventId: ev.eventId, domain: ev.domain, type: ev.type } }));
+    if (this.queue.length > 20) this.flush();
+    return ev;
+  }
+  async rotateChain({ chainId = `chain_v71_${crypto.randomUUID()}`, reason = 'backup_v71' } = {}) {
+    await this.flush();
+    await window.statsAggregator?.waitForIdle?.().catch(() => null);
 
-export default {
-  LEDGER_CHECKPOINT_KEY,
-  stableStringify,
-  sha256Hex,
-  normalizeLedgerCheckpoint,
-  readLedgerCheckpoint,
-  publishLedgerCheckpoint,
-  writeLedgerCheckpoint,
-  hashEvent,
-  buildLedgerEvents,
-  rebuildLedgerCheckpointFromEvents,
-  adoptLedgerCheckpointFromEvents,
-  getLedgerHealth
-};
+    const checkpoint = await writeLedgerCheckpoint(metaDB, {
+      chainId,
+      deviceSeq: 0,
+      headHash: '',
+      deviceStableId: this.deviceStableId || localStorage.getItem('deviceStableId') || '',
+      deviceHash: this.deviceHash || localStorage.getItem('deviceHash') || '',
+      updatedAt: Date.now(),
+      repairedAt: 0,
+      repairReason: reason,
+      repairedEvents: 0
+    });
+
+    this.sessionId = crypto.randomUUID();
+    window.dispatchEvent(new CustomEvent('event-ledger:rotated', { detail: checkpoint }));
+    return checkpoint;
+  }
+  flush() {
+    if (this._flushPromise) { this._rerun = true; return this._flushPromise; }
+    this._flushPromise = (async () => {
+      do {
+        this._rerun = false;
+        if (!this.queue.length) break;
+        const raw = this.queue.splice(0);
+        try {
+          const built = await buildLedgerEvents(raw, { db: metaDB });
+          await commitLedgerBatch(built);
+          publishLedgerCheckpoint(built.checkpoint);
+          window.dispatchEvent(new CustomEvent('analytics:logUpdated', { detail: { count: built.events.length, domains: [...new Set(built.events.map(item => item.domain).filter(Boolean))] } }));
+        } catch {
+          this.queue.unshift(...raw);
+          break;
+        }
+      } while (this._rerun || this.queue.length);
+      return true;
+    })().finally(() => { this._flushPromise = null; });
+    return this._flushPromise;
+  }
+}
+
+export const eventLogger = new EventLogger();
+window.eventLogger = eventLogger;

@@ -1,233 +1,214 @@
-import { createGameBridgeHost } from './bridge-host.js';
+// UID.003_(Event log truth)_(achievement state должен быть merge-safe и rebuildable)_(unlock provenance восстанавливается из ACHIEVEMENT_UNLOCK events)
+// UID.004_(Stats as cache)_(progress projection выводится из stats/event log)_(unlock/RPG/streak snapshot — компактный индекс поверх событий)
+// UID.099_(Multi-device sync model)_(achievements merge без дублей XP и потерь unlock)_(earliest unlock, max XP/level, max streak, device provenance)
 
-const W = window;
-const esc = s => W.Utils?.escapeHtml?.(String(s || '')) || String(s || '');
+export const ACHIEVEMENT_STATE_VERSION = '1.1';
 
-const fallbackConfig = {
-  status: 'off',
-  enterEnabled: false,
-  title: 'Зал Витрины',
-  eyebrow: 'Game Center',
-  message: 'Раздел временно недоступен.',
-  disabledReason: 'Вход закрыт.',
-  buttonText: 'Войти',
-  roomUrl: './Games/index.html',
-  revision: 'fallback',
-  bridgeVersion: 1
-};
+const n = v => Number.isFinite(Number(v)) ? Number(v) : 0;
+const s = v => String(v == null ? '' : v).trim();
+const isObj = v => !!v && typeof v === 'object' && !Array.isArray(v);
 
-const GAME_URL_PARAMS = Object.freeze([
-  'gcGame',
-  'game',
-  'inviteFriend',
-  'join',
-  'room',
-  'key',
-  'secret'
-]);
+export const normalizeUnlockedAchievements = raw =>
+  Object.fromEntries(Object.entries(isObj(raw) ? raw : {}).map(([k, v]) => {
+    const ts = n(isObj(v) ? (v.unlockedAt || v.timestamp || v.ts) : v);
+    return [s(k), ts || Date.now()];
+  }).filter(([k]) => k));
 
-const clearGameUrlParams = ({
-  replace = true
-} = {}) => {
-  const url = new URL(W.location.href);
-  let changed = false;
+export const normalizeAchievementProfile = raw => ({
+  xp: Math.max(0, n(raw?.xp)),
+  level: Math.max(1, n(raw?.level || 1))
+});
 
-  GAME_URL_PARAMS.forEach(key => {
-    if (!url.searchParams.has(key)) return;
-    url.searchParams.delete(key);
-    changed = true;
+export const normalizeAchievementStreaks = raw => ({
+  ...(isObj(raw) ? raw : {}),
+  current: Math.max(0, n(raw?.current)),
+  longest: Math.max(0, n(raw?.longest)),
+  lastActiveDate: s(raw?.lastActiveDate || '')
+});
+
+export const normalizeAchievementUnlockMetaRow = (id, raw = {}, fallbackTs = 0) => ({
+  id: s(raw?.id || id),
+  unlockedAt: n(raw?.unlockedAt || raw?.timestamp || raw?.ts || fallbackTs) || 0,
+  eventId: s(raw?.eventId || ''),
+  sessionId: s(raw?.sessionId || ''),
+  deviceStableId: s(raw?.deviceStableId || ''),
+  deviceHash: s(raw?.deviceHash || ''),
+  deviceLabel: s(raw?.deviceLabel || ''),
+  deviceClass: s(raw?.deviceClass || ''),
+  devicePwa: !!raw?.devicePwa,
+  platform: s(raw?.platform || ''),
+  source: s(raw?.source || 'achievement_unlock')
+});
+
+export const normalizeAchievementUnlockMeta = (raw = {}, unlocked = {}) => {
+  const out = {};
+  Object.entries(isObj(raw) ? raw : {}).forEach(([id, row]) => {
+    const r = normalizeAchievementUnlockMetaRow(id, row, n(unlocked?.[id]));
+    if (r.id && r.unlockedAt > 0) out[r.id] = r;
   });
-
-  if (changed && replace) {
-    W.history.replaceState(null, '', url.toString());
-  }
-
-  return changed;
+  Object.entries(unlocked || {}).forEach(([id, ts]) => {
+    const k = s(id);
+    if (k && !out[k]) out[k] = normalizeAchievementUnlockMetaRow(k, { source: 'unlocked_map' }, n(ts));
+  });
+  return out;
 };
 
-const loadConfig = async () => {
-  try {
-    const m = await import(`./config.js?gc-hard=${Date.now()}`);
-    return m.normalizeGameCenterSwitch?.(m.GAME_CENTER_SWITCH || m.default) || m.default || fallbackConfig;
-  } catch {
-    return fallbackConfig;
-  }
+export const deriveAchievementUnlockMetaFromEvents = events => {
+  const out = {};
+  (Array.isArray(events) ? events : []).forEach(ev => {
+    if (s(ev?.type) !== 'ACHIEVEMENT_UNLOCK') return;
+    const id = s(ev?.data?.id);
+    if (!id) return;
+    const row = normalizeAchievementUnlockMetaRow(id, {
+      unlockedAt: n(ev?.timestamp),
+      eventId: ev?.eventId,
+      sessionId: ev?.sessionId,
+      deviceStableId: ev?.deviceStableId,
+      deviceHash: ev?.deviceHash,
+      deviceLabel: ev?.deviceLabel,
+      deviceClass: ev?.deviceClass,
+      devicePwa: ev?.devicePwa,
+      platform: ev?.platform,
+      source: 'event_log'
+    });
+    if (!row.unlockedAt) return;
+    const prev = out[id];
+    if (!prev || row.unlockedAt < prev.unlockedAt) out[id] = row;
+  });
+  return out;
 };
 
-const getInviteParams = () => {
-  const params = new URLSearchParams(W.location.search);
-  const gcGame =
-    params.get('gcGame') ||
-    params.get('game') ||
-    '';
-  const joinToken = params.get('join') || '';
-  const inviteFriend = params.get('inviteFriend') || '';
-
+export const normalizeAchievementState = raw => {
+  const unlocked = normalizeUnlockedAchievements(raw?.unlocked || raw?.achievements || {});
+  const unlockMeta = normalizeAchievementUnlockMeta(raw?.unlockMeta || raw?.unlockedMeta || {}, unlocked);
+  Object.entries(unlockMeta).forEach(([id, row]) => {
+    if (!unlocked[id] || row.unlockedAt < unlocked[id]) unlocked[id] = row.unlockedAt;
+  });
   return {
-    hasInvite:
-      gcGame === 'war_hearts' &&
-      !!joinToken,
-    isSendingInvite:
-      gcGame === 'war_hearts' &&
-      !!inviteFriend,
-    gcGame,
-    joinToken,
-    inviteFriend
+    version: s(raw?.version || ACHIEVEMENT_STATE_VERSION) || ACHIEVEMENT_STATE_VERSION,
+    updatedAt: n(raw?.updatedAt) || Date.now(),
+    unlocked,
+    unlockMeta,
+    profileRpg: normalizeAchievementProfile(raw?.profileRpg || raw?.userProfileRpg || {}),
+    streaks: normalizeAchievementStreaks(raw?.streaks || {})
   };
 };
 
-const makeRoomUrl = cfg => {
-  const url = new URL(String(cfg.roomUrl || './Games/index.html'), W.location.href);
-  const invite = getInviteParams();
-
-  url.searchParams.set('bridge', '1');
-  url.searchParams.set('rev', cfg.revision || 'dev');
-
-  if (invite.hasInvite) {
-    url.searchParams.set('gcGame', invite.gcGame);
-    url.searchParams.set('join', invite.joinToken);
-  } else if (invite.isSendingInvite) {
-    url.searchParams.set('gcGame', invite.gcGame);
-    url.searchParams.set('inviteFriend', invite.inviteFriend);
-  }
-
-  return url.toString();
+export const buildAchievementBackupState = ({ unlocked = {}, unlockMeta = {}, profileRpg = {}, streaks = {}, events = [] } = {}) => {
+  const fromEvents = deriveAchievementUnlockMetaFromEvents(events);
+  return normalizeAchievementState({
+    unlocked,
+    unlockMeta: { ...unlockMeta, ...fromEvents },
+    profileRpg,
+    streaks,
+    updatedAt: Date.now()
+  });
 };
 
-  const render = ({ cfg, mounted = false } = {}) => {
-    const canEnter = cfg.status === 'on' && cfg.enterEnabled;
-    const invite = getInviteParams();
-    const buttonText = invite.hasInvite ? 'Принять приглашение' : (invite.isSendingInvite ? 'Запустить и пригласить' : esc(cfg.buttonText));
-    const message = invite.hasInvite
-      ? 'Вас пригласили в сетевую игру. Можно войти как гость или авторизоваться, чтобы позже сохранять прогресс.'
-      : (invite.isSendingInvite ? 'Запустите игру, чтобы отправить вызов.' : esc(cfg.message));
+const pickEarlierMeta = (a, b, id) => {
+  const aa = normalizeAchievementUnlockMetaRow(id, a), bb = normalizeAchievementUnlockMetaRow(id, b);
+  if (!aa.unlockedAt) return bb;
+  if (!bb.unlockedAt) return aa;
+  if (bb.unlockedAt < aa.unlockedAt) return bb;
+  if (aa.unlockedAt < bb.unlockedAt) return aa;
+  return aa.deviceLabel || aa.eventId ? aa : bb;
+};
 
-    return `<section class="gc-host" data-gc-status="${esc(cfg.status)}">
-      <div class="gc-panel">
-        <div class="gc-panel-kicker">${esc(cfg.eyebrow)}</div>
-        <div class="gc-panel-title">${esc(cfg.title)}</div>
-        <div class="gc-panel-text">${message}</div>
-        ${!canEnter ? `<div class="gc-panel-note">${esc(cfg.disabledReason)}</div>` : ''}
-        <button class="gc-enter-btn" type="button" data-gc-enter ${canEnter ? '' : 'disabled'}>${mounted ? 'Комната открыта' : buttonText}</button>
-        ${invite.hasInvite && !mounted ? `<button class="gc-enter-btn" type="button" data-gc-decline style="background:transparent; border:1px solid rgba(255,49,89,0.4); color:#ff3159; box-shadow:none; margin-top:8px;">Отклонить</button>` : ''}
-        <div class="gc-devline">rev: ${esc(cfg.revision)} · bridge v${Number(cfg.bridgeVersion || 1)}</div>
-      </div>
-      <div class="gc-frame-wrap" id="gc-frame-wrap" hidden></div>
-    </section>`;
-  };
-
-  export const renderGameCenterHost = async ({ container } = {}) => {
-    if (!container) return false;
-    const cfg = await loadConfig();
-
-    try {
-      const { shardWallet } = await import('../shards/wallet-service.js');
-      await shardWallet.refresh();
-    } catch {}
-
-    let bridge = null;
-    container.innerHTML = render({ cfg });
-
-    const btn = container.querySelector('[data-gc-enter]');
-    const declineBtn = container.querySelector('[data-gc-decline]');
-    const frameWrap = container.querySelector('#gc-frame-wrap');
-
-    declineBtn?.addEventListener('click', () => {
-      clearGameUrlParams();
-      renderGameCenterHost({ container });
-    });
-
-    const mountGameCenter = () => {
-      if (btn?.disabled || !frameWrap) return;
-      const host = container.querySelector('.gc-host');
-      const panel = container.querySelector('.gc-panel');
-      const invite = getInviteParams();
-
-      if (btn) {
-        btn.disabled = true;
-        btn.textContent = 'Открываем...';
-      }
-
-      host?.classList.add('is-mounted');
-      W.__gameActivity = {
-        active: true,
-        state: 'active',
-        gameId: invite.gcGame || 'game_center',
-        updatedAt: Date.now()
-      };
-      W.dispatchEvent(new CustomEvent('game:activity', {
-        detail: { ...W.__gameActivity }
-      }));
-      if (panel) panel.hidden = true;
-
-      frameWrap.hidden = false;
-      frameWrap.innerHTML = `
-        <div class="gc-launch-cover">
-          <div class="gc-launch-logo">💔</div>
-          <b>${invite.hasInvite ? 'Подключаемся к вызову' : invite.isSendingInvite ? 'Готовим приглашение' : 'Открываем Зал Витрины'}</b>
-          <span>Соединение будет настроено автоматически...</span>
-        </div>
-        <iframe class="gc-frame" title="Game Center" src="${esc(makeRoomUrl(cfg))}" sandbox="allow-scripts allow-forms allow-popups" allow="fullscreen" allowfullscreen referrerpolicy="no-referrer"></iframe>
-      `;
-      const iframe = frameWrap.querySelector('iframe');
-
-      // Сразу стираем параметр из родительского URL, чтобы при обновлении страницы (F5) не отправить дубль-вызов
-      if (invite.hasInvite || invite.isSendingInvite) {
-        clearGameUrlParams();
-      }
-
-      iframe?.addEventListener('load', () => {
-        frameWrap.querySelector('.gc-launch-cover')?.remove();
-      }, { once: true });
-
-      bridge?.destroy?.();
-    bridge = createGameBridgeHost({
-      iframe,
-      config: cfg,
-      onState: st => {
-        if (st?.state === 'closed_by_game') {
-          bridge?.destroy?.();
-          bridge = null;
-          try {
-            clearGameUrlParams();
-          } catch {}
-
-          try {
-            W.eventLogger?.log?.('FEATURE_USED', 'global', { feature: 'game_center_exit', revision: cfg.revision });
-            W.dispatchEvent(new CustomEvent('analytics:forceFlush'));
-          } catch {}
-
-            frameWrap.hidden = true;
-            frameWrap.innerHTML = '';
-            host?.classList.remove('is-mounted');
-            if (panel) panel.hidden = false;
-            btn.disabled = false;
-            btn.textContent = getInviteParams().hasInvite ? 'Принять приглашение' : esc(cfg.buttonText);
-
-            // Если хост был перенесен в body при сворачивании, удаляем его
-            if (host && host.parentElement === document.body) {
-              host.remove();
-            }
-          }
-        }
-    });
-
-    try {
-      W.eventLogger?.log?.('FEATURE_USED', 'global', { feature: 'game_center_enter', revision: cfg.revision });
-      W.dispatchEvent(new CustomEvent('analytics:forceFlush'));
-    } catch {}
-
-    if (btn) btn.textContent = 'Комната открыта';
-    };
-
-    btn?.addEventListener('click', mountGameCenter);
-
-    const invite = getInviteParams();
-    if (invite.hasInvite || invite.isSendingInvite) {
-      setTimeout(mountGameCenter, 80);
+export const mergeAchievementStates = (localRaw = {}, remoteRaw = {}) => {
+  const l = normalizeAchievementState(localRaw), r = normalizeAchievementState(remoteRaw);
+  const unlocked = { ...l.unlocked };
+  Object.entries(r.unlocked).forEach(([id, ts]) => {
+    const a = n(unlocked[id]), b = n(ts);
+    unlocked[id] = a > 0 && b > 0 ? Math.min(a, b) : (b || a || Date.now());
+  });
+  const unlockMeta = { ...l.unlockMeta };
+  Object.keys({ ...l.unlockMeta, ...r.unlockMeta, ...unlocked }).forEach(id => {
+    unlockMeta[id] = pickEarlierMeta(l.unlockMeta[id], r.unlockMeta[id], id);
+    if (!unlockMeta[id]?.unlockedAt && unlocked[id]) unlockMeta[id] = normalizeAchievementUnlockMetaRow(id, { source: 'merged_unlocked_map' }, unlocked[id]);
+    if (unlockMeta[id]?.unlockedAt && (!unlocked[id] || unlockMeta[id].unlockedAt < unlocked[id])) unlocked[id] = unlockMeta[id].unlockedAt;
+  });
+  return normalizeAchievementState({
+    updatedAt: Math.max(n(l.updatedAt), n(r.updatedAt), Date.now()),
+    unlocked,
+    unlockMeta,
+    profileRpg: {
+      xp: Math.max(n(l.profileRpg.xp), n(r.profileRpg.xp)),
+      level: Math.max(1, n(l.profileRpg.level), n(r.profileRpg.level))
+    },
+    streaks: {
+      ...l.streaks,
+      ...r.streaks,
+      current: Math.max(n(l.streaks.current), n(r.streaks.current)),
+      longest: Math.max(n(l.streaks.longest), n(r.streaks.longest)),
+      lastActiveDate: [s(l.streaks.lastActiveDate), s(r.streaks.lastActiveDate)].sort().pop() || ''
     }
+  });
+};
+
+export const applyAchievementStateToMetaDB = async (metaDB, stateRaw) => {
+  const st = normalizeAchievementState(stateRaw);
+  await Promise.all([
+    metaDB.setGlobal('unlocked_achievements', st.unlocked),
+    metaDB.setGlobal('achievement_unlock_meta', st.unlockMeta),
+    metaDB.setGlobal('user_profile_rpg', st.profileRpg),
+    metaDB.setGlobal('global_streak', st.streaks)
+  ]);
+  return st;
+};
+
+export const refreshAchievementEngineFromDb = async ({ metaDB, reason = 'achievement_state_refresh', forceCheck = true, silent = true } = {}) => {
+  const eng = window.achievementEngine;
+  if (!eng || !metaDB) return false;
+  const [u, m, r, st, warm] = await Promise.all([
+    metaDB.getGlobal('unlocked_achievements').catch(() => null),
+    metaDB.getGlobal('achievement_unlock_meta').catch(() => null),
+    metaDB.getGlobal('user_profile_rpg').catch(() => null),
+    metaDB.getGlobal('global_streak').catch(() => null),
+    Promise.all([metaDB.getEvents('events_warm').catch(() => []), metaDB.getEvents('events_hot').catch(() => [])]).then(([w, h]) => [...(w || []), ...(h || [])])
+  ]);
+  const fromEvents = deriveAchievementUnlockMetaFromEvents(warm);
+  const merged = mergeAchievementStates(
+    { unlocked: u?.value || {}, unlockMeta: m?.value || {}, profileRpg: r?.value || { xp: 0, level: 1 }, streaks: st?.value || {} },
+    { unlocked: Object.fromEntries(Object.entries(fromEvents).map(([id, x]) => [id, x.unlockedAt])), unlockMeta: fromEvents }
+  );
+  await applyAchievementStateToMetaDB(metaDB, merged);
+  eng.unlocked = merged.unlocked;
+  eng.unlockMeta = merged.unlockMeta;
+  eng.profile = merged.profileRpg;
+  if (forceCheck && typeof eng.check === 'function') {
+    const old = !!eng._silentNotify;
+    eng._silentNotify = !!silent;
+
+    try {
+      await eng.check({ force: true, reason });
+    } finally {
+      eng._silentNotify = old;
+    }
+  } else {
+    eng.achievements =
+      eng._buildUIArray?.() ||
+      eng.achievements ||
+      [];
+    eng.broadcast?.(
+      n(st?.value?.current),
+      { reason }
+    );
+  }
 
   return true;
 };
 
-export default { renderGameCenterHost };
+export default {
+  ACHIEVEMENT_STATE_VERSION,
+  normalizeUnlockedAchievements,
+  normalizeAchievementProfile,
+  normalizeAchievementStreaks,
+  normalizeAchievementUnlockMetaRow,
+  normalizeAchievementUnlockMeta,
+  deriveAchievementUnlockMetaFromEvents,
+  normalizeAchievementState,
+  buildAchievementBackupState,
+  mergeAchievementStates,
+  applyAchievementStateToMetaDB,
+  refreshAchievementEngineFromDb
+};
